@@ -198,6 +198,19 @@ func LoadServerConfig(filename string) (ServerConfig, error) {
 	return finalizeServerConfig(cfg)
 }
 
+// DefaultServerConfig returns a ServerConfig with all defaults applied.
+// Exported so an embedder (e.g. the public server bridge) can build a
+// configuration in memory instead of loading a file.
+func DefaultServerConfig() ServerConfig {
+	return defaultServerConfig()
+}
+
+// FinalizeServerConfig validates and finalizes a config assembled in memory,
+// applying the same normalization that the file/JSON loaders use.
+func FinalizeServerConfig(cfg ServerConfig) (ServerConfig, error) {
+	return finalizeServerConfig(cfg)
+}
+
 func loadServerConfigFile(filename string) (ServerConfig, error) {
 	cfg := defaultServerConfig()
 	path, format, err := resolveConfigPathWithJSONFallback(filename)
