@@ -70,6 +70,7 @@ type ServerConfig struct {
 	SupportedDownloadCompressionTypes []int    `toml:"SUPPORTED_DOWNLOAD_COMPRESSION_TYPES"`
 	DataEncryptionMethod              int      `toml:"DATA_ENCRYPTION_METHOD"`
 	EncryptionKeyFile                 string   `toml:"ENCRYPTION_KEY_FILE"`
+	NodeSecret                        string   `toml:"NODE_SECRET"`
 	LogLevel                          string   `toml:"LOG_LEVEL"`
 	ARQWindowSize                     int      `toml:"ARQ_WINDOW_SIZE"`
 	ARQInitialRTOSeconds              float64  `toml:"ARQ_INITIAL_RTO_SECONDS"`

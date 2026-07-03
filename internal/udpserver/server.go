@@ -42,6 +42,7 @@ type Server struct {
 	cfg                      config.ServerConfig
 	log                      *logger.Logger
 	codec                    *security.Codec
+	users                    *userRegistry
 	domainMatcher            *domainMatcher.Matcher
 	sessions                 *sessionStore
 	deferredDNSSession       *deferredSessionProcessor
@@ -123,6 +124,7 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 		cfg:                    cfg,
 		log:                    log,
 		codec:                  codec,
+		users:                  newUserRegistry([]byte(cfg.NodeSecret)),
 		domainMatcher:          domainMatcher.New(cfg.Domain, cfg.MinVPNLabelLength),
 		sessions:               sessions,
 		deferredDNSSession:     newDeferredSessionProcessor(dnsDeferredWorkers, dnsDeferredQueue, log),
