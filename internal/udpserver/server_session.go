@@ -682,16 +682,41 @@ func buildPreSessionPacketTypes() [256]bool {
 }
 
 func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domainMatcher.Decision, vpnPacket VpnProto.Packet) []byte {
-	if vpnPacket.SessionID != 0 || len(vpnPacket.Payload) != sessionInitDataSize {
+	if vpnPacket.SessionID != 0 {
 		return nil
 	}
 
-	requestedUpload, requestedDownload := compression.SplitPair(vpnPacket.Payload[1])
+	// Multi-user auth. The 10-byte session signature is unchanged; an 8-byte
+	// user token may follow it. When the node has registered users, a valid
+	// token is required; a standalone node (no users) accepts the legacy
+	// 10-byte form so existing single-key deployments keep working.
+	var account *userAccount
+	switch len(vpnPacket.Payload) {
+	case sessionInitDataSize:
+		if s.users != nil && s.users.count() > 0 {
+			return nil // token required but missing -> reject
+		}
+	case sessionInitDataSize + UserTokenLen:
+		if s.users == nil {
+			return nil
+		}
+		var tok UserToken
+		copy(tok[:], vpnPacket.Payload[sessionInitDataSize:sessionInitDataSize+UserTokenLen])
+		if account = s.users.lookup(tok); account == nil {
+			return nil // unknown / revoked user -> reject
+		}
+	default:
+		return nil
+	}
+	// findOrCreate keys sessions on the 10-byte signature only.
+	initSignature := vpnPacket.Payload[:sessionInitDataSize]
+
+	requestedUpload, requestedDownload := compression.SplitPair(initSignature[1])
 	resolvedUpload := resolveCompressionType(requestedUpload, s.uploadCompressionMask)
 	resolvedDownload := resolveCompressionType(requestedDownload, s.downloadCompressionMask)
 
 	record, reused, err := s.sessions.findOrCreate(
-		vpnPacket.Payload,
+		initSignature,
 		resolvedUpload,
 		resolvedDownload,
 		s.cfg.EffectiveMaxPacketsPerBatch(),
@@ -706,12 +731,15 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 					decision.RequestName,
 				)
 			}
-			return s.buildSessionBusyResponse(questionPacket, decision.RequestName, vpnPacket.Payload[0], vpnPacket.Payload[6:10])
+			return s.buildSessionBusyResponse(questionPacket, decision.RequestName, initSignature[0], initSignature[6:10])
 		}
 		return nil
 	}
 	if record == nil {
 		return nil
+	}
+	if account != nil && !reused {
+		record.user = account // attach owner for per-user accounting
 	}
 	record.streamCleanup = s.cleanupStreamArtifacts
 

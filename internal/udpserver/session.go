@@ -48,6 +48,7 @@ type sessionRecord struct {
 	DownloadMTUBytes                    int
 	VerifyCode                          [4]byte
 	Signature                           [sessionInitDataSize]byte
+	user                                *userAccount // multi-user: owning V2board account (nil = standalone)
 	MaxPackedBlocks                     int
 	StreamReadBufferSize                int
 	CreatedAt                           time.Time
