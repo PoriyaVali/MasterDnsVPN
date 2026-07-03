@@ -202,6 +202,7 @@ func (s *Server) processDeferredStreamSyn(ctx context.Context, vpnPacket VpnProt
 		return
 	}
 
+	upstreamConn = wrapUserCounting(upstreamConn, record.user) // per-user metering
 	if record.isClosed() || !stream.attachUpstreamConn(upstreamConn, s.cfg.ForwardIP, uint16(s.cfg.ForwardPort), "CONNECTED") {
 		_ = upstreamConn.Close()
 		s.finalizeDeferredConnectStream(vpnPacket.SessionID, vpnPacket.StreamID, "stream", "attach-rejected")
@@ -414,6 +415,7 @@ func (s *Server) processDeferredSOCKS5Syn(ctx context.Context, vpnPacket VpnProt
 		return
 	}
 
+	upstreamConn = wrapUserCounting(upstreamConn, record.user) // per-user metering
 	if record.isClosed() || !stream.attachUpstreamConn(upstreamConn, target.Host, target.Port, "CONNECTED") {
 		_ = upstreamConn.Close()
 		s.finalizeStreamArtifacts(vpnPacket.SessionID, vpnPacket.StreamID)

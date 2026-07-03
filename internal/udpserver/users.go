@@ -12,6 +12,7 @@ package udpserver
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"net"
 	"sync"
 	"sync/atomic"
 )
@@ -122,6 +123,41 @@ func (r *userRegistry) sample(reset bool) []UserBytes {
 		}
 	}
 	return out
+}
+
+// countingConn wraps the per-stream upstream connection and meters the tunnel
+// payload for its owning user. Read pulls destination bytes heading DOWN to the
+// client; Write pushes client bytes UP to the destination. DNS/transport
+// overhead is deliberately excluded so metering matches the other cores.
+type countingConn struct {
+	net.Conn
+	user *userAccount
+}
+
+// wrapUserCounting returns conn unchanged for standalone streams (user == nil),
+// otherwise a metering wrapper tied to the account. The wrapper is still a
+// net.Conn (LocalAddr/Deadlines delegate to the inner connection).
+func wrapUserCounting(conn net.Conn, user *userAccount) net.Conn {
+	if user == nil || conn == nil {
+		return conn
+	}
+	return &countingConn{Conn: conn, user: user}
+}
+
+func (c *countingConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.user.down.Add(int64(n))
+	}
+	return n, err
+}
+
+func (c *countingConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.user.up.Add(int64(n))
+	}
+	return n, err
 }
 
 // ---- Server public API (embeddable library surface) ----
