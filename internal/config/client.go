@@ -58,6 +58,8 @@ type ClientConfig struct {
 	CompressionMinSize                    int               `toml:"COMPRESSION_MIN_SIZE"`
 	DataEncryptionMethod                  int               `toml:"DATA_ENCRYPTION_METHOD"`
 	EncryptionKey                         string            `toml:"ENCRYPTION_KEY"`
+	Uuid                                  string            `toml:"UUID"`
+	NodeSecret                            string            `toml:"NODE_SECRET"`
 	MinUploadMTU                          int               `toml:"MIN_UPLOAD_MTU"`
 	MinDownloadMTU                        int               `toml:"MIN_DOWNLOAD_MTU"`
 	MaxUploadMTU                          int               `toml:"MAX_UPLOAD_MTU"`

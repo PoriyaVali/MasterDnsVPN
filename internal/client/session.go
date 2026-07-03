@@ -22,6 +22,7 @@ import (
 	Enums "masterdnsvpn-go/internal/enums"
 	fragmentStore "masterdnsvpn-go/internal/fragmentstore"
 	"masterdnsvpn-go/internal/mlq"
+	"masterdnsvpn-go/internal/usertoken"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
@@ -365,6 +366,15 @@ func (c *Client) buildSessionInitPayload() ([]byte, bool, [4]byte, error) {
 	binary.BigEndian.PutUint16(payload[2:4], uint16(c.syncedUploadMTU))
 	binary.BigEndian.PutUint16(payload[4:6], uint16(c.syncedDownloadMTU))
 	copy(payload[6:10], verifyCode[:])
+
+	// Multi-user: when a UUID + node secret are configured, append the 8-byte
+	// identity token so the node can authenticate and meter this user. Nodes
+	// without registered users still accept the bare 10-byte form.
+	if c.cfg.Uuid != "" && c.cfg.NodeSecret != "" {
+		tok := usertoken.Derive([]byte(c.cfg.NodeSecret), c.cfg.Uuid)
+		payload = append(payload, tok[:]...)
+	}
+
 	return payload, payload[0] == mtuProbeBase64Reply, verifyCode, nil
 }
 

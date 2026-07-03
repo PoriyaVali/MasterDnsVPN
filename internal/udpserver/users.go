@@ -10,20 +10,20 @@
 package udpserver
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
 	"net"
 	"sync"
 	"sync/atomic"
+
+	"masterdnsvpn-go/internal/usertoken"
 )
 
 // UserTokenLen is the number of HMAC bytes carried in the handshake to identify
 // a user. 8 bytes = 64 bits: negligible collision risk across a node's users,
 // tiny wire overhead.
-const UserTokenLen = 8
+const UserTokenLen = usertoken.Len
 
 // UserToken is the fixed-size identity a client presents at SESSION_INIT.
-type UserToken [UserTokenLen]byte
+type UserToken = usertoken.Token
 
 // UserBytes is a per-user traffic sample returned by Traffic().
 type UserBytes struct {
@@ -57,12 +57,7 @@ func newUserRegistry(secret []byte) *userRegistry {
 // DeriveUserToken computes the handshake token for a UUID under a node secret.
 // Exported so clients (and tests) derive the exact same value.
 func DeriveUserToken(secret []byte, uuid string) UserToken {
-	mac := hmac.New(sha256.New, secret)
-	mac.Write([]byte(uuid))
-	sum := mac.Sum(nil)
-	var t UserToken
-	copy(t[:], sum[:UserTokenLen])
-	return t
+	return usertoken.Derive(secret, uuid)
 }
 
 func (r *userRegistry) add(uuid string) UserToken {
