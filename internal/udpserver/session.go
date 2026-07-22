@@ -521,6 +521,59 @@ func (s *sessionStore) Cleanup(now time.Time, idleTimeout time.Duration, closedR
 	return expired
 }
 
+// CloseUserSessions tears down every session owned by one account and returns
+// them for the same post-processing an idle expiry gets.
+//
+// A session proves who it belongs to once, at SESSION_INIT, and carries that
+// account for the rest of its life; nothing on the data path looks the user up
+// again. So removing a user from the registry only turns away the NEXT
+// handshake - traffic already flowing keeps flowing, and because the idle timer
+// is reset by activity, a session in active use never times out on its own. A
+// customer whose credit ran out therefore kept full service for as long as they
+// kept using it.
+//
+// The removal below is deliberately identical to Cleanup's, including the
+// recentClosed entry: a client whose session vanishes will retry on the same
+// signature, and that record is what tells it the session is gone instead of
+// leaving it to guess. Sessions are held in a fixed 256-slot array, so scanning
+// them all costs nothing and needs no second index to drift out of step.
+func (s *sessionStore) CloseUserSessions(user *userAccount, now time.Time, closedRetention time.Duration) []closedSessionCleanup {
+	if s == nil || user == nil {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	closed := make([]closedSessionCleanup, 0, 4)
+	for sessionID := 1; sessionID <= maxServerSessionID; sessionID++ {
+		record := s.byID[sessionID]
+		if record == nil || record.user != user {
+			continue
+		}
+
+		delete(s.bySig, record.Signature)
+		s.byID[sessionID] = nil
+		if s.activeCount > 0 {
+			s.activeCount--
+		}
+		if closedRetention > 0 {
+			s.recentClosed[uint8(sessionID)] = closedSessionRecord{
+				Cookie:       record.Cookie,
+				ResponseMode: record.ResponseMode,
+				ExpiresAt:    now.Add(closedRetention),
+			}
+		}
+		record.markClosed()
+		closed = append(closed, closedSessionCleanup{
+			ID:     uint8(sessionID),
+			record: record,
+		})
+	}
+
+	return closed
+}
+
 func (s *sessionStore) SweepTerminalStreams(now time.Time, retention time.Duration) {
 	s.mu.RLock()
 	records := make([]*sessionRecord, 0, len(s.byID))
