@@ -13,6 +13,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"masterdnsvpn-go/internal/usertoken"
 )
@@ -71,13 +72,21 @@ func (r *userRegistry) add(uuid string) UserToken {
 	return tok
 }
 
-func (r *userRegistry) del(uuid string) {
+// del removes a user and returns the account that was removed, or nil if the
+// user was not registered. The caller needs the account to find the sessions it
+// still owns: revoking a user has to reach the traffic already flowing, not
+// only the next handshake.
+func (r *userRegistry) del(uuid string) *userAccount {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if tok, ok := r.byUUID[uuid]; ok {
-		delete(r.byTok, tok)
-		delete(r.byUUID, uuid)
+	tok, ok := r.byUUID[uuid]
+	if !ok {
+		return nil
 	}
+	account := r.byTok[tok]
+	delete(r.byTok, tok)
+	delete(r.byUUID, uuid)
+	return account
 }
 
 // lookup returns the account for a presented token, or nil if unknown (= reject).
@@ -165,12 +174,36 @@ func (s *Server) AddUser(uuid string) {
 	s.users.add(uuid)
 }
 
-// DelUser removes a user; new sessions with its token are rejected.
+// DelUser removes a user: their next handshake is rejected AND the sessions
+// they still have open are torn down.
+//
+// Closing the live sessions is the part that makes revocation mean anything.
+// Without it the panel can revoke a user - expired, out of data, out of credit -
+// and they keep the service they are no longer paying for, indefinitely, because
+// an active session refreshes its own idle timer.
 func (s *Server) DelUser(uuid string) {
-	if s.users == nil {
+	if s == nil || s.users == nil {
 		return
 	}
-	s.users.del(uuid)
+	account := s.users.del(uuid)
+	if account == nil || s.sessions == nil {
+		return
+	}
+
+	// CloseUserSessions returns with the store lock released, so the per-session
+	// cleanup below runs outside it - the same order sessionCleanupLoop uses.
+	// Doing this work while holding the lock would stall every session on the
+	// node, and cleanup reaches for locks of its own.
+	closed := s.sessions.CloseUserSessions(account, time.Now(), s.cfg.ClosedSessionRetention())
+	for _, session := range closed {
+		s.cleanupClosedSession(session.ID, session.record)
+	}
+	if len(closed) > 0 && s.log != nil {
+		s.log.Infof(
+			"\U0001F512 <yellow>Revoked user, closed <cyan>%d</cyan> live session(s)</yellow>",
+			len(closed),
+		)
+	}
 }
 
 // UserCount reports how many users are currently registered.
