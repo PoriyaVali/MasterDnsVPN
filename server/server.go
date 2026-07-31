@@ -134,6 +134,13 @@ func (s *Server) SetUserSpeedLimit(uuid string, bytesPerSecond int64) {
 	s.inner.SetUserSpeedLimit(uuid, bytesPerSecond)
 }
 
+// OnlineIPTraffic reports bytes carried per user, per live address, since the
+// last reset - what a panel needs to tell a real device from one address out of
+// a carrier's rotating pool before enforcing a device limit.
+func (s *Server) OnlineIPTraffic(reset bool) map[string]map[string]int64 {
+	return s.inner.OnlineIPTraffic(reset)
+}
+
 // OnlineIPs reports the source addresses each user has recently been seen from,
 // keyed by UUID, so a panel can count devices on this node. Users with no live
 // address are omitted.

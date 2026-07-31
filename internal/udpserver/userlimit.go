@@ -75,16 +75,29 @@ func (b *tokenBucket) wait(n int) {
 	}
 }
 
-// onlineAddrs remembers which source addresses a user has been seen from, with
-// the time of the last sighting, so the panel can count devices.
+// onlineAddrs remembers which source addresses a user has been seen from - when
+// each was last seen and how much it has carried - so the panel can count
+// devices and tell a real one from an artefact.
 //
-// Bounded and self-pruning: a carrier that hands out a different egress address
-// per connection would otherwise grow this without limit. Entries older than the
-// TTL are dropped on every read, and the map is capped - past the cap the oldest
-// entry is evicted, so a pathological client costs memory once, not forever.
+// The byte count is the part that keeps this honest. A carrier that hands a
+// phone a different egress address per query makes one device look like dozens,
+// and a device limit then locks the customer out of the service they paid for -
+// this is not hypothetical, it was measured at 22 "devices" for a single phone.
+// Recording traffic per address lets the caller drop the addresses that carried
+// almost nothing and keep the one or two doing real work.
+//
+// Bounded and self-pruning: entries older than the TTL are dropped on every
+// read, and the map is capped - past the cap the address that has carried the
+// least is evicted, so a pathological client costs memory once, not forever,
+// and evicting never throws away the device that is actually in use.
 type onlineAddrs struct {
 	mu   sync.Mutex
-	seen map[string]time.Time
+	seen map[string]*addrUse
+}
+
+type addrUse struct {
+	last  time.Time
+	bytes int64
 }
 
 const (
@@ -92,25 +105,36 @@ const (
 	onlineAddrCap = 64
 )
 
-func (o *onlineAddrs) note(ip string, now time.Time) {
+// note records a sighting of ip carrying n bytes. n may be zero for a sighting
+// with no payload of its own (a handshake).
+func (o *onlineAddrs) note(ip string, now time.Time, n int64) {
 	if o == nil || ip == "" {
 		return
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.seen == nil {
-		o.seen = make(map[string]time.Time, 4)
+		o.seen = make(map[string]*addrUse, 4)
 	}
-	if _, known := o.seen[ip]; !known && len(o.seen) >= onlineAddrCap {
-		oldestIP, oldestAt := "", now
-		for k, t := range o.seen {
-			if t.Before(oldestAt) || oldestIP == "" {
-				oldestIP, oldestAt = k, t
+	if use, known := o.seen[ip]; known {
+		use.last = now
+		use.bytes += n
+		return
+	}
+	if len(o.seen) >= onlineAddrCap {
+		// Evict the least-used address rather than the oldest: under per-query
+		// address rotation the oldest entry can easily be the one real device,
+		// simply because it has been there longest.
+		var victim string
+		var least int64
+		for k, u := range o.seen {
+			if victim == "" || u.bytes < least {
+				victim, least = k, u.bytes
 			}
 		}
-		delete(o.seen, oldestIP)
+		delete(o.seen, victim)
 	}
-	o.seen[ip] = now
+	o.seen[ip] = &addrUse{last: now, bytes: n}
 }
 
 // list returns the addresses seen within the TTL, pruning the rest.
@@ -124,12 +148,41 @@ func (o *onlineAddrs) list(now time.Time) []string {
 		return nil
 	}
 	out := make([]string, 0, len(o.seen))
-	for ip, at := range o.seen {
-		if now.Sub(at) > onlineAddrTTL {
+	for ip, use := range o.seen {
+		if now.Sub(use.last) > onlineAddrTTL {
 			delete(o.seen, ip)
 			continue
 		}
 		out = append(out, ip)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// traffic returns bytes carried per live address, clearing the counters when
+// reset is true so each report covers one interval - the same contract the
+// per-user counters use, and what the caller's threshold assumes.
+func (o *onlineAddrs) traffic(now time.Time, reset bool) map[string]int64 {
+	if o == nil {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if len(o.seen) == 0 {
+		return nil
+	}
+	out := make(map[string]int64, len(o.seen))
+	for ip, use := range o.seen {
+		if now.Sub(use.last) > onlineAddrTTL {
+			delete(o.seen, ip)
+			continue
+		}
+		out[ip] = use.bytes
+		if reset {
+			use.bytes = 0
+		}
 	}
 	if len(out) == 0 {
 		return nil

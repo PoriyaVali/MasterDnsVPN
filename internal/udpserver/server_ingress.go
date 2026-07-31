@@ -74,7 +74,19 @@ func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacke
 			return s.buildNoDataResponseLiteLogged(packet, parsed, fmt.Sprintf("post-session-unhandled-%s", Enums.PacketTypeName(vpnPacket.PacketType)))
 		}
 
-		return s.serveQueuedOrPong(packet, decision.RequestName, validation.record, time.Now())
+		now := time.Now()
+		response := s.serveQueuedOrPong(packet, decision.RequestName, validation.record, now)
+
+		// Every authenticated data packet re-notes the address, not just the
+		// handshake. Recording it only at SESSION_INIT left the sighting to age
+		// out of its TTL while the session was still busy, so a user connected
+		// for an hour reported no devices at all after the first two minutes.
+		// The byte count is what lets the caller separate a real device from one
+		// address out of a carrier's rotating pool.
+		if validation.record != nil {
+			validation.record.user.noteAddr(clientIP, now, int64(len(packet)+len(response)))
+		}
+		return response
 	}
 
 	switch vpnPacket.PacketType {

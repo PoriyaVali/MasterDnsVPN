@@ -709,7 +709,7 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 		// subscriber are both known, so it is the only place a device can be
 		// counted. Recorded after the token check, so an unauthenticated packet
 		// cannot inflate someone's device count by claiming their address.
-		account.addrs.note(clientIP, time.Now())
+		account.noteAddr(clientIP, time.Now(), 0)
 	default:
 		return nil
 	}

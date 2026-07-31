@@ -149,6 +149,10 @@ func getEffectivePriority(packetType uint8, basePriority int) int {
 }
 
 type sessionRuntimeView struct {
+	// user is the account this session belongs to (nil for a standalone
+	// session). Carried on the view so the packet path can meter the client's
+	// address without reaching back into the record and taking its lock.
+	user                *userAccount
 	ID                  uint8
 	Cookie              uint8
 	ResponseMode        uint8
@@ -769,6 +773,7 @@ func clampSessionInitAllowedMTU(value int) uint16 {
 
 func (r *sessionRecord) runtimeView() sessionRuntimeView {
 	return sessionRuntimeView{
+		user:                r.user,
 		ID:                  r.ID,
 		Cookie:              r.Cookie,
 		ResponseMode:        r.ResponseMode,

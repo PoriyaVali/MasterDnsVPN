@@ -58,6 +58,16 @@ func (a *userAccount) setSpeedLimit(bytesPerSecond int64) {
 	a.limitMu.Unlock()
 }
 
+// noteAddr records a sighting of the client's address. Nil-safe on the account
+// so the hot packet path can call it without first checking whether the session
+// belongs to a user - a standalone session simply has none.
+func (a *userAccount) noteAddr(ip string, now time.Time, n int64) {
+	if a == nil {
+		return
+	}
+	a.addrs.note(ip, now, n)
+}
+
 func (a *userAccount) limiter() *tokenBucket {
 	if a == nil {
 		return nil
@@ -164,6 +174,32 @@ func (r *userRegistry) onlineIPs(now time.Time) map[string][]string {
 	for _, a := range accounts {
 		if ips := a.addrs.list(now); len(ips) > 0 {
 			out[a.uuid] = ips
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// onlineTraffic collects, per user, the bytes each of their live addresses has
+// carried since the last reset.
+func (r *userRegistry) onlineTraffic(now time.Time, reset bool) map[string]map[string]int64 {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	accounts := make([]*userAccount, 0, len(r.byTok))
+	for _, a := range r.byTok {
+		accounts = append(accounts, a)
+	}
+	r.mu.RUnlock()
+
+	// Built outside the registry lock, for the reason onlineIPs gives.
+	out := make(map[string]map[string]int64, len(accounts))
+	for _, a := range accounts {
+		if t := a.addrs.traffic(now, reset); len(t) > 0 {
+			out[a.uuid] = t
 		}
 	}
 	if len(out) == 0 {
@@ -318,4 +354,19 @@ func (s *Server) OnlineIPs() map[string][]string {
 		return nil
 	}
 	return s.users.onlineIPs(time.Now())
+}
+
+// OnlineIPTraffic reports, per user and per live address, the bytes carried
+// since the last reset - the evidence a caller needs to tell a real device from
+// one address out of a carrier's rotating pool.
+//
+// Without it the only available test is "did this user move any data", which
+// passes for every address the user was seen from at once. That is what turned
+// one phone behind a NAT pool into a crowd of devices and locked the customer
+// out of their own account on the other protocols.
+func (s *Server) OnlineIPTraffic(reset bool) map[string]map[string]int64 {
+	if s == nil || s.users == nil {
+		return nil
+	}
+	return s.users.onlineTraffic(time.Now(), reset)
 }
