@@ -217,7 +217,14 @@ func (s *Server) dnsWorker(ctx context.Context, conn *net.UDPConn, reqCh <-chan 
 				return
 			}
 
-			response := s.safeHandlePacket(req.buf[:req.size])
+			// The client's address is known only here, where the packet was read;
+			// everything below used to receive the bytes alone, which is why an
+			// mdns node could not report a single online device.
+			var clientIP string
+			if req.addr != nil {
+				clientIP = req.addr.IP.String()
+			}
+			response := s.safeHandlePacket(req.buf[:req.size], clientIP)
 			if len(response) != 0 {
 				writeConn := conn
 				if req.conn != nil {
@@ -238,7 +245,7 @@ func (s *Server) dnsWorker(ctx context.Context, conn *net.UDPConn, reqCh <-chan 
 	}
 }
 
-func (s *Server) safeHandlePacket(packet []byte) (response []byte) {
+func (s *Server) safeHandlePacket(packet []byte, clientIP string) (response []byte) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			if s.log != nil {
@@ -251,7 +258,7 @@ func (s *Server) safeHandlePacket(packet []byte) (response []byte) {
 		}
 	}()
 
-	return s.handlePacket(packet)
+	return s.handlePacket(packet, clientIP)
 }
 
 func (s *Server) onDrop(addr *net.UDPAddr, queueLen int, queueCap int) {

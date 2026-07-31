@@ -126,3 +126,15 @@ func (s *Server) UserCount() int { return s.inner.UserCount() }
 
 // Traffic returns per-user byte counters, resetting them when reset is true.
 func (s *Server) Traffic(reset bool) []UserBytes { return s.inner.Traffic(reset) }
+
+// SetUserSpeedLimit paces a user to bytesPerSecond across both directions;
+// zero or negative removes the limit. Unknown users are ignored, so a caller can
+// push a whole panel list without checking membership first.
+func (s *Server) SetUserSpeedLimit(uuid string, bytesPerSecond int64) {
+	s.inner.SetUserSpeedLimit(uuid, bytesPerSecond)
+}
+
+// OnlineIPs reports the source addresses each user has recently been seen from,
+// keyed by UUID, so a panel can count devices on this node. Users with no live
+// address are omitted.
+func (s *Server) OnlineIPs() map[string][]string { return s.inner.OnlineIPs() }

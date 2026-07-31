@@ -101,7 +101,7 @@ func TestHandleSessionInitRequestIncludesServerClientPolicy(t *testing.T) {
 		SessionID:  0,
 		PacketType: Enums.PACKET_SESSION_INIT,
 		Payload:    initPayload,
-	})
+	}, "")
 	if response == nil {
 		t.Fatal("expected session accept response")
 	}

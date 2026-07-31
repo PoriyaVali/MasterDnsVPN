@@ -37,6 +37,35 @@ type userAccount struct {
 	uuid string
 	up   atomic.Int64
 	down atomic.Int64
+
+	// Speed limit and the addresses this user is currently reachable from.
+	// Both are per-account rather than per-session on purpose: a limit is a
+	// property of the subscriber, and one subscriber may hold several sessions
+	// at once - pacing each session separately would multiply their allowance by
+	// however many they opened.
+	limitMu sync.Mutex
+	bucket  *tokenBucket
+	addrs   onlineAddrs
+}
+
+// setSpeedLimit replaces the account's pacing. bytesPerSecond <= 0 removes it.
+func (a *userAccount) setSpeedLimit(bytesPerSecond int64) {
+	if a == nil {
+		return
+	}
+	a.limitMu.Lock()
+	a.bucket = newTokenBucket(bytesPerSecond)
+	a.limitMu.Unlock()
+}
+
+func (a *userAccount) limiter() *tokenBucket {
+	if a == nil {
+		return nil
+	}
+	a.limitMu.Lock()
+	b := a.bucket
+	a.limitMu.Unlock()
+	return b
 }
 
 // userRegistry maps handshake tokens to accounts. Safe for concurrent use.
@@ -102,6 +131,47 @@ func (r *userRegistry) count() int {
 	return len(r.byTok)
 }
 
+// byUUIDAccount returns the account for a UUID, or nil when unregistered.
+func (r *userRegistry) byUUIDAccount(uuid string) *userAccount {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	tok, ok := r.byUUID[uuid]
+	if !ok {
+		return nil
+	}
+	return r.byTok[tok]
+}
+
+// onlineIPs collects every user's recently-seen addresses.
+func (r *userRegistry) onlineIPs(now time.Time) map[string][]string {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	accounts := make([]*userAccount, 0, len(r.byTok))
+	for _, a := range r.byTok {
+		accounts = append(accounts, a)
+	}
+	r.mu.RUnlock()
+
+	// Built outside the registry lock: pruning touches each account's own lock,
+	// and holding the registry lock across all of them would block every
+	// handshake on the node for the duration of a report.
+	out := make(map[string][]string, len(accounts))
+	for _, a := range accounts {
+		if ips := a.addrs.list(now); len(ips) > 0 {
+			out[a.uuid] = ips
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // sample reads every user's counters, optionally resetting them (for the
 // panel report cycle). Only users with non-zero traffic are returned.
 func (r *userRegistry) sample(reset bool) []UserBytes {
@@ -148,10 +218,14 @@ func wrapUserCounting(conn net.Conn, user *userAccount) net.Conn {
 	return &countingConn{Conn: conn, user: user}
 }
 
+// Both directions are charged to the same bucket, so a subscriber's limit is
+// their total throughput rather than that much in each direction. Charged after
+// the transfer, like the counters, so the byte count is the real one.
 func (c *countingConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
 		c.user.down.Add(int64(n))
+		c.user.limiter().wait(n)
 	}
 	return n, err
 }
@@ -160,6 +234,7 @@ func (c *countingConn) Write(p []byte) (int, error) {
 	n, err := c.Conn.Write(p)
 	if n > 0 {
 		c.user.up.Add(int64(n))
+		c.user.limiter().wait(n)
 	}
 	return n, err
 }
@@ -220,4 +295,27 @@ func (s *Server) Traffic(reset bool) []UserBytes {
 		return nil
 	}
 	return s.users.sample(reset)
+}
+
+// SetUserSpeedLimit paces a user to bytesPerSecond across both directions.
+// Zero or negative removes the limit. Unknown users are ignored, so the caller
+// can push the panel's whole list without checking membership first.
+func (s *Server) SetUserSpeedLimit(uuid string, bytesPerSecond int64) {
+	if s == nil || s.users == nil || uuid == "" {
+		return
+	}
+	s.users.byUUIDAccount(uuid).setSpeedLimit(bytesPerSecond)
+}
+
+// OnlineIPs reports the source addresses each user has been seen from recently,
+// keyed by UUID. Only users with at least one live address appear.
+//
+// This is what lets a panel count devices on an mdns node. Until it existed the
+// node reported no addresses at all, so a device limit could not be enforced
+// here while every other protocol in the fleet enforced one.
+func (s *Server) OnlineIPs() map[string][]string {
+	if s == nil || s.users == nil {
+		return nil
+	}
+	return s.users.onlineIPs(time.Now())
 }

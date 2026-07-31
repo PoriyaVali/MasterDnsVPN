@@ -681,7 +681,7 @@ func buildPreSessionPacketTypes() [256]bool {
 	return values
 }
 
-func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domainMatcher.Decision, vpnPacket VpnProto.Packet) []byte {
+func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domainMatcher.Decision, vpnPacket VpnProto.Packet, clientIP string) []byte {
 	if vpnPacket.SessionID != 0 {
 		return nil
 	}
@@ -705,6 +705,11 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 		if account = s.users.lookup(tok); account == nil {
 			return nil // unknown / revoked user -> reject
 		}
+		// Authenticated: this is the only point where a source address and a
+		// subscriber are both known, so it is the only place a device can be
+		// counted. Recorded after the token check, so an unauthenticated packet
+		// cannot inflate someone's device count by claiming their address.
+		account.addrs.note(clientIP, time.Now())
 	default:
 		return nil
 	}

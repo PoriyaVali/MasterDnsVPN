@@ -18,7 +18,7 @@ import (
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
-func (s *Server) handlePacket(packet []byte) []byte {
+func (s *Server) handlePacket(packet []byte, clientIP string) []byte {
 	parsed, err := DnsParser.ParseDNSRequestLite(packet)
 	if err != nil {
 		if errors.Is(err, DnsParser.ErrNotDNSRequest) || errors.Is(err, DnsParser.ErrPacketTooShort) {
@@ -35,7 +35,7 @@ func (s *Server) handlePacket(packet []byte) []byte {
 	decision := s.domainMatcher.Match(parsed)
 	switch decision.Action {
 	case domainMatcher.ActionProcess:
-		response := s.handleTunnelCandidate(packet, parsed, decision)
+		response := s.handleTunnelCandidate(packet, parsed, decision, clientIP)
 		if response != nil {
 			return response
 		}
@@ -53,7 +53,7 @@ func (s *Server) handlePacket(packet []byte) []byte {
 	}
 }
 
-func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacket, decision domainMatcher.Decision) []byte {
+func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacket, decision domainMatcher.Decision, clientIP string) []byte {
 	vpnPacket, err := VpnProto.ParseInflatedFromLabels(decision.Labels, s.codec)
 	if err != nil {
 		return s.buildNoDataResponseLiteLogged(packet, parsed, "vpn-proto-parse-failed")
@@ -83,7 +83,7 @@ func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacke
 	case Enums.PACKET_MTU_DOWN_REQ:
 		return s.handleMTUDownRequest(packet, parsed, decision, vpnPacket)
 	case Enums.PACKET_SESSION_INIT:
-		return s.handleSessionInitRequest(packet, decision, vpnPacket)
+		return s.handleSessionInitRequest(packet, decision, vpnPacket, clientIP)
 	default:
 		return s.buildNoDataResponseLiteLogged(packet, parsed, fmt.Sprintf("pre-session-unhandled-%s", Enums.PacketTypeName(vpnPacket.PacketType)))
 	}

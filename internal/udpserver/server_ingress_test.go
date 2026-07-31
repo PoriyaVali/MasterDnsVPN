@@ -14,7 +14,7 @@ func TestHandlePacketRejectsUnauthorizedDomainAsNXDOMAIN(t *testing.T) {
 	}
 	request := buildTestDNSQuery(0x4242, "example.org", Enums.DNS_RECORD_TYPE_A)
 
-	response := server.handlePacket(request)
+	response := server.handlePacket(request, "")
 	if response == nil {
 		t.Fatal("expected DNS response, got nil")
 	}
@@ -46,7 +46,7 @@ func TestHandlePacketRejectsMatcherFormatErrorAsFORMERR(t *testing.T) {
 	}
 	request := buildTestDNSQuery(0x5151, ".", Enums.DNS_RECORD_TYPE_TXT)
 
-	response := server.handlePacket(request)
+	response := server.handlePacket(request, "")
 	if response == nil {
 		t.Fatal("expected DNS response, got nil")
 	}
@@ -63,7 +63,7 @@ func TestHandlePacketKeepsUnsupportedAllowedAQueryAsNoData(t *testing.T) {
 	}
 	request := buildTestDNSQuery(0x6161, "probe.vpn.example.com", Enums.DNS_RECORD_TYPE_A)
 
-	response := server.handlePacket(request)
+	response := server.handlePacket(request, "")
 	if response == nil {
 		t.Fatal("expected DNS response, got nil")
 	}
