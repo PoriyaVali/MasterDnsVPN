@@ -202,3 +202,56 @@ func TestNoteAddrIsSafeWithoutAnAccount(t *testing.T) {
 	var missing *userAccount
 	missing.noteAddr("1.2.3.4", time.Now(), 100)
 }
+
+// A refused session must leave no trace. If it recorded the address anyway, the
+// online report would keep listing a device the subscriber was never allowed to
+// use, pinning their count and locking them out for good.
+func TestRefusedSessionRecordsNoDevice(t *testing.T) {
+	s := &Server{users: newUserRegistry([]byte("secret"))}
+	s.users.add("u1")
+	s.SetSessionAuthorizer(func(string, string) bool { return false })
+
+	if s.authorizeSession("u1", "9.9.9.9") {
+		t.Fatal("the authorizer said no; the server admitted anyway")
+	}
+	if ips := s.users.byUUIDAccount("u1").addrs.list(time.Now()); len(ips) != 0 {
+		t.Errorf("a refused session left an address behind: %v", ips)
+	}
+}
+
+// 🔴 An address already counted for the user is the same device coming back.
+// Session re-init is routine, so treating it as new would refuse a subscriber
+// whose one allowed device is the one already holding the slot.
+func TestKnownAddressIsNotANewDevice(t *testing.T) {
+	var o onlineAddrs
+	now := time.Now()
+	o.note("5.127.0.1", now, 1000)
+
+	if !o.has("5.127.0.1", now) {
+		t.Error("an address just recorded was not recognised as known")
+	}
+	if o.has("5.127.0.2", now) {
+		t.Error("an address never seen was reported as known")
+	}
+	if o.has("5.127.0.1", now.Add(onlineAddrTTL+time.Second)) {
+		t.Error("an expired address is still treated as a live device")
+	}
+}
+
+// No authorizer must mean no change: a node that never installs one has to keep
+// admitting every authenticated user exactly as before.
+func TestNoAuthorizerAdmitsEveryone(t *testing.T) {
+	var s *Server
+	if !s.authorizeSession("u1", "1.2.3.4") {
+		t.Error("a nil server refused a session")
+	}
+	s = &Server{}
+	if !s.authorizeSession("u1", "1.2.3.4") {
+		t.Error("a server with no authorizer refused a session")
+	}
+	s.SetSessionAuthorizer(func(string, string) bool { return false })
+	s.SetSessionAuthorizer(nil) // removing it must restore admit-all
+	if !s.authorizeSession("u1", "1.2.3.4") {
+		t.Error("removing the authorizer did not restore admit-all")
+	}
+}

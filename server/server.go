@@ -134,6 +134,22 @@ func (s *Server) SetUserSpeedLimit(uuid string, bytesPerSecond int64) {
 	s.inner.SetUserSpeedLimit(uuid, bytesPerSecond)
 }
 
+// SessionAuthorizer decides whether an authenticated user may open a session
+// from a given address.
+type SessionAuthorizer = udp.SessionAuthorizer
+
+// SetSessionAuthorizer installs an authorisation hook, called once per
+// handshake after the user's token has been verified. Returning false rejects
+// the session; nil (the default) admits everyone.
+//
+// This is how a device limit is enforced here. The tunnel deliberately does not
+// hold that policy: a limit is a property of the subscription and is counted
+// across every node the subscriber might be on, which only the panel-facing
+// side knows.
+func (s *Server) SetSessionAuthorizer(fn SessionAuthorizer) {
+	s.inner.SetSessionAuthorizer(fn)
+}
+
 // OnlineIPTraffic reports bytes carried per user, per live address, since the
 // last reset - what a panel needs to tell a real device from one address out of
 // a carrier's rotating pool before enforcing a device limit.

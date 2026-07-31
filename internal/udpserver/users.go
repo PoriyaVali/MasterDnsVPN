@@ -333,6 +333,40 @@ func (s *Server) Traffic(reset bool) []UserBytes {
 	return s.users.sample(reset)
 }
 
+// SessionAuthorizer decides whether an authenticated user may open a session
+// from ip. Returning false rejects the handshake.
+//
+// The policy lives with the embedder, not here: a device limit is a property of
+// the subscription, counted across every node the subscriber might be on, and
+// only the panel-facing side knows that. This tunnel knows one node.
+type SessionAuthorizer func(uuid, ip string) bool
+
+// SetSessionAuthorizer installs the authorisation hook. Passing nil removes it,
+// which admits every authenticated user - the behaviour before one was set.
+func (s *Server) SetSessionAuthorizer(fn SessionAuthorizer) {
+	if s == nil {
+		return
+	}
+	s.authorizerMu.Lock()
+	s.authorizer = fn
+	s.authorizerMu.Unlock()
+}
+
+// authorizeSession applies the hook, admitting when none is installed. A node
+// with no authorizer must keep working exactly as it did.
+func (s *Server) authorizeSession(uuid, ip string) bool {
+	if s == nil {
+		return true
+	}
+	s.authorizerMu.RLock()
+	fn := s.authorizer
+	s.authorizerMu.RUnlock()
+	if fn == nil {
+		return true
+	}
+	return fn(uuid, ip)
+}
+
 // SetUserSpeedLimit paces a user to bytesPerSecond across both directions.
 // Zero or negative removes the limit. Unknown users are ignored, so the caller
 // can push the panel's whole list without checking membership first.

@@ -43,6 +43,8 @@ type Server struct {
 	log                      *logger.Logger
 	codec                    *security.Codec
 	users                    *userRegistry
+	authorizerMu             sync.RWMutex
+	authorizer               SessionAuthorizer
 	domainMatcher            *domainMatcher.Matcher
 	sessions                 *sessionStore
 	deferredDNSSession       *deferredSessionProcessor

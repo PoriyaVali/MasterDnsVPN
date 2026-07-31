@@ -705,11 +705,24 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 		if account = s.users.lookup(tok); account == nil {
 			return nil // unknown / revoked user -> reject
 		}
+		// Authorisation is separate from authentication: the token proves who the
+		// subscriber is, the embedder decides whether this device may open a
+		// session. Only a NEW address is put to the hook - an address already
+		// counted for this user is the same device coming back, and a session
+		// re-init is routine, so asking again would refuse a subscriber whose
+		// single allowed device is the one already holding the slot.
+		//
+		// Asked before the address is recorded, so a refused session never leaves
+		// a sighting behind to be reported as a device that is not really there.
+		now := time.Now()
+		if !account.addrs.has(clientIP, now) && !s.authorizeSession(account.uuid, clientIP) {
+			return nil
+		}
 		// Authenticated: this is the only point where a source address and a
 		// subscriber are both known, so it is the only place a device can be
 		// counted. Recorded after the token check, so an unauthenticated packet
 		// cannot inflate someone's device count by claiming their address.
-		account.noteAddr(clientIP, time.Now(), 0)
+		account.noteAddr(clientIP, now, 0)
 	default:
 		return nil
 	}

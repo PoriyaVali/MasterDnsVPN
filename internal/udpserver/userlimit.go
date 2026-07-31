@@ -137,6 +137,17 @@ func (o *onlineAddrs) note(ip string, now time.Time, n int64) {
 	o.seen[ip] = &addrUse{last: now, bytes: n}
 }
 
+// has reports whether ip is already a live address for this user.
+func (o *onlineAddrs) has(ip string, now time.Time) bool {
+	if o == nil || ip == "" {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	use, ok := o.seen[ip]
+	return ok && now.Sub(use.last) <= onlineAddrTTL
+}
+
 // list returns the addresses seen within the TTL, pruning the rest.
 func (o *onlineAddrs) list(now time.Time) []string {
 	if o == nil {
