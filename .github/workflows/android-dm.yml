@@ -1,0 +1,63 @@
+name: Android client (Doctor Mobile)
+
+# Builds the mdns client (cmd/client) as an android executable (libmdns.so) for
+# the arches the Doctor Mobile app ships, and on an -android tag publishes a
+# Release with the per-abi binaries the app downloads. arm64 is pure-Go; armv7
+# and x86_64 need the NDK for cgo linking.
+on:
+  push:
+    tags: ['android-*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { abi: arm64-v8a,   goarch: arm64, cgo: '0' }
+          - { abi: armeabi-v7a, goarch: arm, goarm: '7', cgo: '1', cc: armv7a-linux-androideabi21-clang }
+          - { abi: x86_64,      goarch: amd64, cgo: '1', cc: x86_64-linux-android21-clang }
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.25' }
+      - name: Setup Android NDK
+        if: matrix.cgo == '1'
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with: { ndk-version: r28, add-to-path: false }
+      - name: Build libmdns.so
+        run: |
+          VER="${{ github.ref_name }}"
+          export GOOS=android GOARCH=${{ matrix.goarch }} GOARM=${{ matrix.goarm }} CGO_ENABLED=${{ matrix.cgo }}
+          if [ "${{ matrix.cgo }}" = "1" ]; then
+            export CC="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.cc }}"
+          fi
+          go build -trimpath \
+            -ldflags "-X 'masterdnsvpn-go/internal/version.BuildVersion=$VER' -s -w" \
+            -o "libmdns-${{ matrix.abi }}.so" ./cmd/client
+          ls -la "libmdns-${{ matrix.abi }}.so"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libmdns-${{ matrix.abi }}
+          path: libmdns-${{ matrix.abi }}.so
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - run: ls -la artifacts/
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: artifacts/libmdns-*.so
