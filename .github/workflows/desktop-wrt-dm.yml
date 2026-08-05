@@ -1,0 +1,57 @@
+name: Desktop + OpenWRT client (Doctor Mobile)
+
+# Builds the mdns client (cmd/client) for the desktop (Windows) and router
+# (OpenWRT/Linux) targets, so a future Windows or OpenWRT edition has its core
+# ready. Pure-Go (CGO off); publishes to the same android-* release.
+on:
+  push:
+    tags: ['android-*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-amd64,          goos: windows, goarch: amd64, ext: '.exe' }
+          - { name: windows-arm64,          goos: windows, goarch: arm64, ext: '.exe' }
+          - { name: linux-amd64,            goos: linux,   goarch: amd64 }
+          - { name: linux-arm64,            goos: linux,   goarch: arm64 }
+          - { name: linux-armv7,            goos: linux,   goarch: arm,    goarm: '7' }
+          - { name: linux-mipsle-softfloat, goos: linux,   goarch: mipsle, gomips: softfloat }
+          - { name: linux-mips-softfloat,   goos: linux,   goarch: mips,   gomips: softfloat }
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.25' }
+      - name: Build mdns client (${{ matrix.name }})
+        run: |
+          VER="${{ github.ref_name }}"
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            GOARM=${{ matrix.goarm }} GOMIPS=${{ matrix.gomips }} \
+            go build -trimpath \
+            -ldflags "-X 'masterdnsvpn-go/internal/version.BuildVersion=$VER' -s -w" \
+            -o "mdns-${{ matrix.name }}${{ matrix.ext }}" ./cmd/client
+          ls -la "mdns-${{ matrix.name }}${{ matrix.ext }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mdns-${{ matrix.name }}
+          path: mdns-${{ matrix.name }}${{ matrix.ext }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, merge-multiple: true }
+      - run: ls -la artifacts/
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: artifacts/mdns-*
