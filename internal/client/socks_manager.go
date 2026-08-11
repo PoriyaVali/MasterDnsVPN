@@ -678,8 +678,19 @@ func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, cli
 		})
 
 		if !isHit {
-			c.log.Debugf("🧳 <yellow>SOCKS5 DNS Miss or Pending - Closing association to trigger client retry.</yellow>")
-			return
+			// Not an answer yet: the query has gone into the tunnel and the
+			// reply will land in the DNS cache, where the client's retry picks
+			// it up. That retry is the client's own business - a resolver that
+			// does not answer is the ordinary case DNS is built for.
+			//
+			// This used to return here, which tore down the whole UDP
+			// association. One name still being looked up would cut off every
+			// other lookup sharing it, and the client had to set the
+			// association up again before it could ask anything at all. On a
+			// page pulling in a dozen hosts at once that is a dozen chances to
+			// lose the others, and on a slow link the setup is not free.
+			c.log.Debugf("🧳 <yellow>SOCKS5 DNS pending in tunnel; awaiting the client's retry.</yellow>")
+			continue
 		}
 	}
 }

@@ -16,6 +16,7 @@ import (
 	"net"
 	"time"
 
+	"masterdnsvpn-go/internal/netutil"
 	"masterdnsvpn-go/internal/arq"
 	"masterdnsvpn-go/internal/client/handlers"
 	DnsParser "masterdnsvpn-go/internal/dnsparser"
@@ -313,7 +314,18 @@ func (c *Client) StartAsyncRuntime(parentCtx context.Context) error {
 	// 3. Open dedicated UDP sockets for each RX/TX worker.
 	conns := make([]*net.UDPConn, 0, c.tunnelRX_TX_Workers)
 	for i := 0; i < c.tunnelRX_TX_Workers; i++ {
-		conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		// Protected before bind: these carry our queries to the resolvers, and
+		// the TUN we are feeding would otherwise capture them.
+		lc := net.ListenConfig{Control: netutil.Control(c.cfg.ProtectPath)}
+		pc, err := lc.ListenPacket(context.Background(), "udp", ":0")
+		var conn *net.UDPConn
+		if err == nil {
+			conn, _ = pc.(*net.UDPConn)
+			if conn == nil {
+				_ = pc.Close()
+				err = fmt.Errorf("unexpected packet conn type %T", pc)
+			}
+		}
 		if err != nil {
 			for _, opened := range conns {
 				_ = opened.Close()

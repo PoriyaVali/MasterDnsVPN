@@ -36,6 +36,10 @@ type ClientConfig struct {
 	SOCKS5Auth                            bool              `toml:"SOCKS5_AUTH"`
 	SOCKS5User                            string            `toml:"SOCKS5_USER"`
 	SOCKS5Pass                            string            `toml:"SOCKS5_PASS"`
+	// Abstract unix socket the VPN app listens on to protect our sockets, so
+	// our packets to the resolvers are not captured by the tunnel we feed.
+	// Empty on desktop/router builds, where nothing is capturing them.
+	ProtectPath                           string            `toml:"PROTECT_PATH"`
 	LocalDNSEnabled                       bool              `toml:"LOCAL_DNS_ENABLED"`
 	LocalDNSIP                            string            `toml:"LOCAL_DNS_IP"`
 	LocalDNSPort                          int               `toml:"LOCAL_DNS_PORT"`
@@ -140,6 +144,7 @@ func defaultClientConfig() ClientConfig {
 		SOCKS5Auth:                            false,
 		SOCKS5User:                            "master_dns_vpn",
 		SOCKS5Pass:                            "master_dns_vpn",
+		ProtectPath:                           "",
 		LocalDNSEnabled:                       false,
 		LocalDNSIP:                            "127.0.0.1",
 		LocalDNSPort:                          53,

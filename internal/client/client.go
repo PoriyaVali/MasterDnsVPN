@@ -239,6 +239,10 @@ func BootstrapLoadedConfig(cfg config.ClientConfig, logPath string) (*Client, er
 }
 
 func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Client {
+	// Before any socket exists, so every resolver dial can ask the app to keep
+	// itself off the tunnel this client is about to provide.
+	SetProtectPath(cfg.ProtectPath)
+
 	var responseMode uint8
 	if cfg.BaseEncodeData {
 		responseMode = mtuProbeBase64Reply
@@ -288,6 +292,8 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		writerQueueSpaceSignal:  make(chan struct{}, 1),
 
 		// DNS Management
+		// Recorded before any socket is made, so every resolver dial can ask
+		// the app to keep itself off the tunnel we are about to provide.
 		localDNSCache: dnsCache.New(
 			cfg.LocalDNSCacheMaxRecords,
 			time.Duration(cfg.LocalDNSCacheTTLSeconds)*time.Second,

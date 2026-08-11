@@ -14,9 +14,11 @@ package client
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"time"
 
+	"masterdnsvpn-go/internal/netutil"
 	"masterdnsvpn-go/internal/dnsparser"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
@@ -235,13 +237,34 @@ func (c *Client) putRuntimeUDPBuffer(buf []byte) {
 	c.udpBufferPool.Put(buf[:RuntimeUDPReadBufferSize])
 }
 
+// protectPath is set once at startup from the config. dialUDPResolver is a
+// free function with no client to ask, and threading the path through every
+// caller would spread an Android detail across code that has no other reason
+// to know about it.
+var protectPath string
+
+// SetProtectPath records where the VPN app listens to protect our sockets.
+func SetProtectPath(p string) { protectPath = p }
+
 // dialUDPResolver resolves the resolver address and establishes a new UDP connection.
 func dialUDPResolver(resolverLabel string) (*net.UDPConn, error) {
 	addr, err := net.ResolveUDPAddr("udp", resolverLabel)
 	if err != nil {
 		return nil, err
 	}
-	return net.DialUDP("udp", nil, addr)
+	// Same reason as the listeners in async_runtime: this is our own path out
+	// to a resolver and must not go through the tunnel we are providing.
+	d := net.Dialer{Control: netutil.Control(protectPath)}
+	conn, err := d.Dial("udp", addr.String())
+	if err != nil {
+		return nil, err
+	}
+	udpConn, ok := conn.(*net.UDPConn)
+	if !ok {
+		_ = conn.Close()
+		return nil, fmt.Errorf("unexpected conn type %T", conn)
+	}
+	return udpConn, nil
 }
 
 // normalizeTimeout ensures the timeout is positive, falling back to a default if necessary.
