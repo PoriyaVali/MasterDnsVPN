@@ -10,7 +10,9 @@ package udpserver
 import (
 	"errors"
 	"net"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"masterdnsvpn-go/internal/dnscache"
@@ -20,6 +22,53 @@ import (
 )
 
 var ErrInvalidDNSUpstream = errors.New("invalid dns upstream")
+
+// Where the host itself sends its own lookups, used only when every configured
+// upstream has failed. Read once - resolv.conf does not change under a running
+// server often enough to be worth re-reading per query.
+var (
+	systemResolversOnce sync.Once
+	systemResolvers     []string
+)
+
+// systemDNSUpstreams returns the nameservers from /etc/resolv.conf, in the form
+// queryOneUpstream expects.
+//
+// 🔑 Why this exists. DNS_UPSTREAM_SERVERS defaults to 1.1.1.1, and a server on
+// a network that cannot reach it answers SERVFAIL to every tunnelled lookup -
+// while resolving names perfectly well for its own SOCKS5 CONNECT path, because
+// that goes through the host resolver instead. Measured exactly that way from a
+// phone: TCP through the tunnel returned http 200 while DNS returned nothing at
+// all. One path worked and the other did not, on the same healthy tunnel.
+//
+// So: keep the configured upstreams as the intent, and fall back to what the
+// host itself can reach rather than failing when the two disagree. Raw DNS is
+// forwarded either way - reading the nameservers rather than using net.Resolver
+// means no response has to be synthesised from parsed results.
+func systemDNSUpstreams() []string {
+	systemResolversOnce.Do(func() {
+		raw, err := os.ReadFile("/etc/resolv.conf")
+		if err != nil {
+			return
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) < 2 || fields[0] != "nameserver" {
+				continue
+			}
+			addr := fields[1]
+			if net.ParseIP(addr) == nil {
+				continue
+			}
+			systemResolvers = append(systemResolvers, net.JoinHostPort(addr, "53"))
+		}
+	})
+	return systemResolvers
+}
 
 type dnsFragmentKey struct {
 	sessionID   uint8
@@ -151,12 +200,19 @@ func (s *Server) buildDNSQueryResponsePayload(rawQuery []byte, sessionID uint8, 
 	s.dnsResolveInflight.Resolve(cacheKey, resolved)
 	if err != nil || len(resolved) == 0 {
 		if s.log != nil {
-			s.log.Debugf(
-				"⚠️ <yellow>Tunnel DNS Upstream Failed</yellow> <magenta>|</magenta> <blue>Domain</blue>: <cyan>%s</cyan> <magenta>|</magenta> <blue>Type</blue>: <yellow>%s</yellow> <magenta>|</magenta> <blue>Session</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Seq</blue>: <cyan>%d</cyan>",
+			// ⚠️ Warn, not Debug. A server that cannot reach its upstreams
+			// answers SERVFAIL to every lookup - which to a user is "the
+			// internet does not work through this tunnel" - and at Debug that
+			// is invisible on a production log level. This is the single line
+			// that would have explained it, so it has to be visible without
+			// anyone having to reproduce the fault at debug first.
+			s.log.Warnf(
+				"⚠️ <yellow>Tunnel DNS Upstream Failed</yellow> <magenta>|</magenta> <blue>Domain</blue>: <cyan>%s</cyan> <magenta>|</magenta> <blue>Type</blue>: <yellow>%s</yellow> <magenta>|</magenta> <blue>Session</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Seq</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Upstreams</blue>: <cyan>%s</cyan>",
 				parsed.FirstQuestion.Name,
 				Enums.DNSRecordTypeName(parsed.FirstQuestion.Type),
 				sessionID,
 				sequenceNum,
+				strings.Join(s.dnsUpstreamServers, ", "),
 			)
 		}
 		response, responseErr := DnsParser.BuildServerFailureResponseFromLite(rawQuery, parsed)
@@ -253,7 +309,38 @@ func (s *Server) resolveDNSUpstream(rawQuery []byte) ([]byte, error) {
 	if s != nil && s.resolveDNSQueryFn != nil {
 		return s.resolveDNSQueryFn(rawQuery)
 	}
-	if len(rawQuery) == 0 || len(s.dnsUpstreamServers) == 0 {
+	if len(rawQuery) == 0 {
+		return nil, ErrInvalidDNSUpstream
+	}
+	resolved, err := s.resolveVia(s.dnsUpstreamServers, rawQuery)
+	if err == nil && len(resolved) > 0 {
+		return resolved, nil
+	}
+
+	// Every configured upstream is unreachable from here. Before giving the
+	// client a SERVFAIL, try what the host itself uses - see systemDNSUpstreams
+	// for why these two can differ, and why that difference is silent.
+	fallback := systemDNSUpstreams()
+	if len(fallback) == 0 {
+		return nil, ErrInvalidDNSUpstream
+	}
+	resolved, err = s.resolveVia(fallback, rawQuery)
+	if err != nil || len(resolved) == 0 {
+		return nil, ErrInvalidDNSUpstream
+	}
+	if s.log != nil {
+		s.log.Warnf(
+			"🩹 <yellow>Tunnel DNS answered by the host resolver</yellow> <magenta>|</magenta> configured upstreams unreachable: <cyan>%s</cyan>",
+			strings.Join(s.dnsUpstreamServers, ", "),
+		)
+	}
+	return resolved, nil
+}
+
+// resolveVia forwards the raw query to the first of `upstreams` that answers,
+// hedging across them so one slow server does not set the pace.
+func (s *Server) resolveVia(upstreams []string, rawQuery []byte) ([]byte, error) {
+	if len(upstreams) == 0 {
 		return nil, ErrInvalidDNSUpstream
 	}
 
@@ -263,15 +350,15 @@ func (s *Server) resolveDNSUpstream(rawQuery []byte) ([]byte, error) {
 	}
 
 	// Fast path: single upstream, no need for hedged requests.
-	if len(s.dnsUpstreamServers) == 1 {
-		resp, err := s.queryOneUpstream(s.dnsUpstreamServers[0], rawQuery, timeout)
+	if len(upstreams) == 1 {
+		resp, err := s.queryOneUpstream(upstreams[0], rawQuery, timeout)
 		if err != nil || len(resp) == 0 {
 			return nil, ErrInvalidDNSUpstream
 		}
 		return resp, nil
 	}
 
-	resultCh := make(chan []byte, len(s.dnsUpstreamServers))
+	resultCh := make(chan []byte, len(upstreams))
 	launch := func(upstream string) {
 		go func(addr string) {
 			resp, err := s.queryOneUpstream(addr, rawQuery, timeout)
@@ -283,7 +370,7 @@ func (s *Server) resolveDNSUpstream(rawQuery []byte) ([]byte, error) {
 		}(upstream)
 	}
 
-	launch(s.dnsUpstreamServers[0])
+	launch(upstreams[0])
 
 	hedgeDelay := dnsUpstreamHedgeDelay(timeout)
 	hedgeTimer := time.NewTimer(hedgeDelay)
@@ -301,7 +388,7 @@ func (s *Server) resolveDNSUpstream(rawQuery []byte) ([]byte, error) {
 			return
 		}
 		hedged = true
-		for _, upstream := range s.dnsUpstreamServers[1:] {
+		for _, upstream := range upstreams[1:] {
 			launch(upstream)
 			launched++
 		}

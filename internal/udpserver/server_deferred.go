@@ -48,13 +48,29 @@ func (s *Server) processDeferredDNSQuery(ctx context.Context, sessionID uint8, s
 		return
 	}
 
+	// ⚠️ Both of the returns below drop a query the client is still waiting on,
+	// and both used to do it in complete silence. From the outside that is
+	// indistinguishable from a dead tunnel - the client waits out its timeout
+	// and the server has nothing to say about why. Say it.
 	rawResponse := s.buildDNSQueryResponsePayload(assembledQuery, sessionID, sequenceNum)
 	if len(rawResponse) == 0 {
+		if s.log != nil {
+			s.log.Warnf(
+				"🕳 <yellow>Tunnel DNS dropped: nothing to answer with</yellow> <magenta>|</magenta> <blue>Session</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Seq</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Query</blue>: <cyan>%d bytes</cyan>",
+				sessionID, sequenceNum, len(assembledQuery),
+			)
+		}
 		return
 	}
 
 	fragments := s.fragmentDNSResponsePayload(rawResponse, downloadMTUBytes)
 	if len(fragments) == 0 {
+		if s.log != nil {
+			s.log.Warnf(
+				"🕳 <yellow>Tunnel DNS dropped: response would not fragment</yellow> <magenta>|</magenta> <blue>Session</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Seq</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Response</blue>: <cyan>%d bytes</cyan> <magenta>|</magenta> <blue>DownMTU</blue>: <cyan>%d</cyan>",
+				sessionID, sequenceNum, len(rawResponse), downloadMTUBytes,
+			)
+		}
 		return
 	}
 
