@@ -28,6 +28,100 @@ type dnsFragmentKey struct {
 	SequenceNum uint16
 }
 
+// How long a caller is kept waiting for an answer still in the tunnel.
+//
+// Long enough to beat a resolver's own patience - Android gives a server
+// several seconds before moving on - and short enough that a name the tunnel
+// never answers does not pin memory. Past it the waiter is dropped and the
+// caller falls back to exactly the old behaviour: silence, then its own retry.
+const dnsWaitTimeout = 6 * time.Second
+
+// Someone waiting on a name whose answer has not come back yet.
+//
+// `query` is kept because the response has to be patched to the transaction ID
+// *this* caller used - two lookups of the same name from different sockets are
+// the same cache entry but not the same DNS message.
+type dnsWaiter struct {
+	query    []byte
+	respond  func([]byte)
+	deadline time.Time
+}
+
+// waitForDNSAnswer parks a caller until the tunnel answers `key`, or until the
+// timeout gives up on it.
+//
+// 🔑 This is what turns "fire and forget" into a forwarder. The core already
+// sent the query and already stores the reply; it simply had nobody to hand it
+// to, so the first lookup of every name resolved to silence and the client had
+// to time out and ask again. On a page pulling in a dozen hosts that is a dozen
+// resolver timeouts, which is why browsers looked broken while Telegram and
+// WhatsApp - which dial fixed IPs and never resolve anything - were fine.
+func (c *Client) waitForDNSAnswer(key string, query []byte, respond func([]byte)) {
+	if respond == nil || key == "" {
+		return
+	}
+	now := time.Now()
+	c.dnsWaitersMu.Lock()
+	defer c.dnsWaitersMu.Unlock()
+	if c.dnsWaiters == nil {
+		c.dnsWaiters = make(map[string][]dnsWaiter)
+	}
+	// Sweep here rather than on a ticker: the map only holds names currently in
+	// flight, so it is tiny, and registering is the only thing that grows it.
+	// ⚠️ The cache's own flush loop would have been the obvious place, but it
+	// returns immediately unless the cache persists to disk - and the Android
+	// app deliberately turns persistence off, so nothing there ever ticks.
+	c.expireDNSWaitersLocked(now)
+	c.dnsWaiters[key] = append(c.dnsWaiters[key], dnsWaiter{
+		// Copied: `query` is a slice of a reusable read buffer, and by the time
+		// the answer arrives the caller has read another packet into it.
+		query:    append([]byte(nil), query...),
+		respond:  respond,
+		deadline: now.Add(dnsWaitTimeout),
+	})
+}
+
+// deliverDNSAnswer hands `response` to everyone parked on `key` and clears them.
+// Expired waiters are dropped on the way past, so a name the tunnel never
+// answers cannot accumulate.
+func (c *Client) deliverDNSAnswer(key string, response []byte) {
+	if key == "" || len(response) == 0 {
+		return
+	}
+	c.dnsWaitersMu.Lock()
+	waiting := c.dnsWaiters[key]
+	delete(c.dnsWaiters, key)
+	c.dnsWaitersMu.Unlock()
+
+	now := time.Now()
+	for _, w := range waiting {
+		if now.After(w.deadline) {
+			continue
+		}
+		// Each caller gets the answer under its own transaction ID; a reply
+		// carrying someone else's is discarded by the resolver as unsolicited.
+		w.respond(dnsCache.PatchResponseForQuery(response, w.query))
+	}
+}
+
+// expireDNSWaitersLocked drops waiters nothing ever answered.
+// The caller must hold dnsWaitersMu.
+func (c *Client) expireDNSWaitersLocked(now time.Time) {
+	for key, waiting := range c.dnsWaiters {
+		kept := waiting[:0]
+		for _, w := range waiting {
+			if now.Before(w.deadline) {
+				kept = append(kept, w)
+			}
+		}
+		if len(kept) == 0 {
+			delete(c.dnsWaiters, key)
+			continue
+		}
+		c.dnsWaiters[key] = kept
+	}
+}
+
 type DNSListener struct {
 	client   *Client
 	conn     *net.UDPConn
@@ -259,6 +353,10 @@ func (c *Client) HandleDNSQueryRes(packet VpnProto.Packet) error {
 		if err == nil && lite.HasQuestion {
 			cacheKey := dnsCache.BuildKey(lite.FirstQuestion.Name, lite.FirstQuestion.Type, lite.FirstQuestion.Class)
 			c.localDNSCache.SetReady(cacheKey, lite.FirstQuestion.Name, lite.FirstQuestion.Type, lite.FirstQuestion.Class, assembled, time.Now())
+			// Hand it straight to whoever asked. Storing it and waiting for
+			// them to ask again is what made the first lookup of every name
+			// cost a resolver timeout.
+			c.deliverDNSAnswer(cacheKey, assembled)
 		}
 	}
 
@@ -299,12 +397,20 @@ func (c *Client) ProcessDNSQuery(query []byte, addr net.Addr, respond func([]byt
 		}
 
 		if res.Status == dnsCache.StatusPending && !res.DispatchNeeded {
-			// Already pending in tunnel, don't re-dispatch
+			// Already in the tunnel for someone else. Park on the same answer
+			// rather than dispatching a second copy of the same question - on a
+			// page loading a dozen assets from one host this is the common case.
+			c.waitForDNSAnswer(key, query, respond)
 			if c.log != nil {
 				c.log.Debugf("🔍 <yellow>DNS Query Pending: %s (%d)</yellow>", question.Name, question.Type)
 			}
 			return false
 		}
+
+		// A miss we are about to dispatch: park before sending, so an answer
+		// that comes back quickly cannot arrive before there is anyone to give
+		// it to.
+		c.waitForDNSAnswer(key, query, respond)
 	}
 
 	// 3. Dispatch to Tunnel

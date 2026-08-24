@@ -23,3 +23,6 @@ logs/
 build/
 .gocache
 .bench/
+
+# local knowledge-graph output
+graphify-out/

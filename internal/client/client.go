@@ -132,6 +132,14 @@ type Client struct {
 	localDNSCacheLoadOnce  sync.Once
 	localDNSCacheFlushOnce sync.Once
 
+	// Callers waiting for an answer that is still in the tunnel, keyed the same
+	// way the cache is. See answerWhenReady: a miss used to be answered with
+	// silence and the client's own retry, which costs a resolver timeout per
+	// name and is why a browser could not load a page while fixed-IP apps were
+	// fine.
+	dnsWaitersMu sync.Mutex
+	dnsWaiters   map[string][]dnsWaiter
+
 	// SOCKS5 brute-force rate limiter
 	socksRateLimit *socksRateLimiter
 }
