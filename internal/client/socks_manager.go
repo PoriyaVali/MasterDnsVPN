@@ -553,13 +553,28 @@ func (c *Client) sendSocks4Reply(conn net.Conn, success bool) error {
 func (c *Client) sendSocksReply(conn net.Conn, rep byte, atyp byte, bndAddr net.IP, bndPort uint16) error {
 	reply := []byte{SOCKS5_VERSION, rep, 0x00, atyp}
 
-	if atyp == SOCKS5_ATYP_IPV4 {
-		reply = append(reply, bndAddr.To4()...)
-	} else if atyp == SOCKS5_ATYP_IPV6 {
-		reply = append(reply, bndAddr.To16()...)
-	} else if atyp == SOCKS5_ATYP_DOMAIN {
+	// ⚠️ `To4()` and `To16()` return nil for an address of the wrong family, and
+	// appending nil appends nothing - which produced a reply four bytes short of
+	// what the declared ATYP promises. A client cannot detect that: it reads the
+	// port as part of the address and whatever follows as the port, and is left
+	// pointing at an endpoint that never existed. Length is the caller's
+	// promise here, so it is kept whatever it is handed.
+	switch atyp {
+	case SOCKS5_ATYP_IPV4:
+		if v4 := bndAddr.To4(); v4 != nil {
+			reply = append(reply, v4...)
+		} else {
+			reply = append(reply, net.IPv4zero.To4()...)
+		}
+	case SOCKS5_ATYP_IPV6:
+		if v6 := bndAddr.To16(); v6 != nil {
+			reply = append(reply, v6...)
+		} else {
+			reply = append(reply, net.IPv6zero...)
+		}
+	case SOCKS5_ATYP_DOMAIN:
 		reply[3] = SOCKS5_ATYP_IPV4
-		reply = append(reply, net.IPv4zero...)
+		reply = append(reply, net.IPv4zero.To4()...)
 	}
 
 	pBuf := make([]byte, 2)
@@ -601,7 +616,27 @@ func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, cli
 	defer udpConn.Close()
 
 	boundAddr := udpConn.LocalAddr().(*net.UDPAddr)
-	err = c.sendSocksReply(conn, SOCKS5_REPLY_SUCCESS, replyATYP, boundAddr.IP, uint16(boundAddr.Port))
+
+	// 🔑 Reply with an address the client can actually send to, not the address
+	// we bound.
+	//
+	// The bind is `IPv4zero:0` over network "udp", which on a dual-stack host
+	// comes back as the IPv6 unspecified address. Handing that to a reply
+	// declared ATYP=IPv4 meant `To4()` returned nil and the address was
+	// silently omitted - a six byte reply where the protocol requires ten. The
+	// client then read the port's two bytes as the start of the address and the
+	// port as zero, so it was told to send its UDP to something like
+	// 174.146.0.0:0 and sent it nowhere.
+	//
+	// ⚠️ That is why DNS "did not work" through this tunnel while TCP did: the
+	// core never received a single query to answer. Measured on a phone - the
+	// associate succeeded, the relay endpoint came back as 174.146.0.0:0, and
+	// the core's log had zero "Received DNS Query from SOCKS5 UDP" lines while
+	// TCP CONNECTs filled it.
+	//
+	// `replyIP` is the local address this very TCP control connection arrived
+	// on, so it is by construction reachable from the client.
+	err = c.sendSocksReply(conn, SOCKS5_REPLY_SUCCESS, replyATYP, replyIP, uint16(boundAddr.Port))
 	if err != nil {
 		return
 	}
@@ -671,10 +706,36 @@ func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, cli
 
 		dnsQuery := buf[payloadOffset:n]
 
+		// 🔑 The reply must name the address the datagram came FROM, which for a
+		// forwarded query is the target the client asked us to reach. RFC 1928
+		// §7 puts DST.ADDR/DST.PORT in the reply for exactly this reason: a
+		// client matches the reply to the request by that address.
+		//
+		// ⚠️ This used to hardcode 0.0.0.0:53. A client that checks - and
+		// hev-socks5-tunnel does - sees a reply claiming to come from 0.0.0.0,
+		// cannot match it to the 8.8.8.8:53 it asked about, and drops it. The
+		// query reached us, we answered, and the answer was thrown away one hop
+		// from the app. Measured on a phone: a DNS query sent through the TUN
+		// returned nothing while the identical query sent straight to this
+		// socket returned real records in 400ms.
+		replyTarget := net.ParseIP(targetAddr)
+		replyTargetATYP := byte(SOCKS5_ATYP_IPV4)
+		replyTargetBytes := []byte{0, 0, 0, 0}
+		if v4 := replyTarget.To4(); v4 != nil {
+			replyTargetBytes = v4
+		} else if v6 := replyTarget.To16(); v6 != nil {
+			replyTargetATYP = SOCKS5_ATYP_IPV6
+			replyTargetBytes = v6
+		}
+		replyPortHi := byte(targetPort >> 8)
+		replyPortLo := byte(targetPort & 0xFF)
+
 		isHit := c.ProcessDNSQuery(dnsQuery, peerAddr, func(resp []byte) {
-			header := []byte{0x00, 0x00, 0x00, SOCKS5_ATYP_IPV4, 0, 0, 0, 0, 0, 53}
-			fullResp := append(header, resp...)
-			_, _ = udpConn.WriteToUDP(fullResp, peerAddr)
+			header := make([]byte, 0, 4+len(replyTargetBytes)+2+len(resp))
+			header = append(header, 0x00, 0x00, 0x00, replyTargetATYP)
+			header = append(header, replyTargetBytes...)
+			header = append(header, replyPortHi, replyPortLo)
+			_, _ = udpConn.WriteToUDP(append(header, resp...), peerAddr)
 		})
 
 		if !isHit {
