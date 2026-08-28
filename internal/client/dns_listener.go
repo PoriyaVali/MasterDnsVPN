@@ -379,6 +379,31 @@ func (c *Client) ProcessDNSQuery(query []byte, addr net.Addr, respond func([]byt
 	question := lite.FirstQuestion
 	now := time.Now()
 
+	// 1b. Bypass, before the cache and before the tunnel.
+	//
+	// Before the cache because the two answer different questions: the cache
+	// holds what the tunnel returned, and a bypassed name wants what a local
+	// resolver returns. Serving one from the other would hand back the far-side
+	// address this exists to avoid.
+	//
+	// ⚠️ A failed direct lookup falls through to the tunnel rather than failing
+	// the query. Bypass is an optimisation; a domestic resolver being down must
+	// not take the name with it.
+	if c.bypass.Match(question.Name) {
+		if resp := c.resolveBypassDirect(query); resp != nil {
+			if respond != nil {
+				respond(resp)
+			}
+			if c.log != nil {
+				c.log.Infof("↩️ <green>DNS Bypass (direct): %s</green>", question.Name)
+			}
+			return true
+		}
+		if c.log != nil {
+			c.log.Warnf("↩️ <yellow>DNS Bypass failed for %s, falling back to the tunnel</yellow>", question.Name)
+		}
+	}
+
 	// 2. Check Local Cache
 	if c.localDNSCache != nil {
 		key := dnsCache.BuildKey(question.Name, question.Type, question.Class)

@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -124,6 +125,10 @@ type Client struct {
 	pingManager *PingManager
 
 	// DNS Management
+	// Names answered directly instead of through the tunnel. Nil until the
+	// config names a rule file, and empty means "tunnel everything", which is
+	// the behaviour this client had before the matcher existed.
+	bypass                 *BypassMatcher
 	localDNSCache          *dnsCache.Store
 	dnsResponses           *fragmentStore.Store[dnsFragmentKey]
 	localDNSCachePersist   bool
@@ -251,6 +256,28 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 	// itself off the tunnel this client is about to provide.
 	SetProtectPath(cfg.ProtectPath)
 
+	// Rules are loaded once, here, rather than re-read per query: the file is
+	// written by the launcher before the process starts, and a lookup on the
+	// DNS path must not touch the disk.
+	bypass := NewBypassMatcher()
+	if cfg.BypassDomainsFile != "" {
+		// ⚠️ Relative names resolve against the config's own directory, not the
+		// process's working directory. The launcher writes this file beside
+		// client.toml and cannot know the absolute path at the time it writes
+		// the config, and "next to the config" is what a config referring to a
+		// sibling file should mean anyway.
+		path := cfg.BypassDomainsFile
+		if !filepath.IsAbs(path) && cfg.ConfigDir != "" {
+			path = filepath.Join(cfg.ConfigDir, path)
+		}
+		if n, err := bypass.LoadFile(path); err != nil {
+			log.Warnf("↩️ <yellow>Bypass list unreadable (%s): %v — tunnelling everything</yellow>",
+				path, err)
+		} else {
+			log.Infof("↩️ <green>Bypass list loaded: <cyan>%d</cyan> rules</green>", n)
+		}
+	}
+
 	var responseMode uint8
 	if cfg.BaseEncodeData {
 		responseMode = mtuProbeBase64Reply
@@ -298,6 +325,8 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		dispatchSignal:          make(chan struct{}, 1),
 		plannerQueueSpaceSignal: make(chan struct{}, 1),
 		writerQueueSpaceSignal:  make(chan struct{}, 1),
+
+		bypass: bypass,
 
 		// DNS Management
 		// Recorded before any socket is made, so every resolver dial can ask

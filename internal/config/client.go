@@ -40,6 +40,21 @@ type ClientConfig struct {
 	// our packets to the resolvers are not captured by the tunnel we feed.
 	// Empty on desktop/router builds, where nothing is capturing them.
 	ProtectPath                           string            `toml:"PROTECT_PATH"`
+	// Names answered directly instead of through the tunnel, and who answers
+	// them.
+	//
+	// 🔑 A file rather than an inline list: the list this is meant to carry is
+	// the domestic-domain set, which runs to thousands of entries. Inline they
+	// would be parsed into the config on every start and would make the config
+	// itself megabytes - the same reason the app caps what it writes elsewhere.
+	//
+	// ⚠️ Both keys are optional and unknown keys are ignored by the decoder, so
+	// a config written by a newer app still loads on an older core. That
+	// matters here: this client has already been bricked once by a launcher
+	// passing an argument the binary did not know, and a config key is the
+	// version-safe way to add something.
+	BypassDomainsFile                     string            `toml:"BYPASS_DOMAINS_FILE"`
+	BypassDNSServers                      []string          `toml:"BYPASS_DNS_SERVERS"`
 	LocalDNSEnabled                       bool              `toml:"LOCAL_DNS_ENABLED"`
 	LocalDNSIP                            string            `toml:"LOCAL_DNS_IP"`
 	LocalDNSPort                          int               `toml:"LOCAL_DNS_PORT"`
