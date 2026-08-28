@@ -22,6 +22,16 @@ const bypassDNSTimeout = 2 * time.Second
 // would leave through the TUN this client is itself providing - straight into
 // the tunnel it was trying to avoid, and on Android into a routing loop.
 //
+// 🔑 Every resolver is asked at once and the first usable answer wins. Tried in
+// turn instead, each dead resolver costs its full timeout before the next is
+// reached: ten resolvers with nine down is eighteen seconds for a name, and a
+// page pulls in dozens of names. Racing makes nine of ten being down cost
+// nothing at all - which is the situation this whole feature exists for, when
+// the foreign internet is gone and only some domestic resolvers still answer.
+//
+// The cost is one extra UDP packet per resolver per uncached name. That is the
+// right trade against a tunnel that carries DNS inside DNS.
+//
 // Returns the raw response, or nil when the caller should fall back to the
 // tunnel. Every failure returns nil rather than an error: there is exactly one
 // thing the caller can do about any of them, and it is the same thing.
@@ -30,34 +40,54 @@ func (c *Client) resolveBypassDirect(query []byte) []byte {
 	if len(servers) == 0 {
 		return nil
 	}
+
+	// Buffered by the number of racers, so a loser that finishes after the
+	// winner has been taken still has somewhere to put its result and exits
+	// instead of leaking on a blocked send.
+	results := make(chan []byte, len(servers))
+	deadline := time.Now().Add(bypassDNSTimeout)
+
 	for _, srv := range servers {
-		conn, err := dialUDPResolver(srv)
-		if err != nil {
-			continue
-		}
-		resp := func() []byte {
-			defer func() { _ = conn.Close() }()
-			if err := conn.SetDeadline(time.Now().Add(bypassDNSTimeout)); err != nil {
-				return nil
+		go func(srv string) {
+			results <- queryResolverOnce(srv, query, deadline)
+		}(srv)
+	}
+
+	for range servers {
+		select {
+		case resp := <-results:
+			if resp != nil {
+				return resp
 			}
-			if _, err := conn.Write(query); err != nil {
-				return nil
-			}
-			// 4096 covers an EDNS0 answer; anything larger is a response this
-			// path has no business carrying, and truncation will make the
-			// client retry over TCP through the ordinary route.
-			buf := make([]byte, 4096)
-			n, err := conn.Read(buf)
-			if err != nil || n == 0 {
-				return nil
-			}
-			return buf[:n]
-		}()
-		if resp != nil {
-			return resp
+		case <-time.After(time.Until(deadline)):
+			return nil
 		}
 	}
 	return nil
+}
+
+// queryResolverOnce sends one query to one resolver and returns its reply.
+func queryResolverOnce(srv string, query []byte, deadline time.Time) []byte {
+	conn, err := dialUDPResolver(srv)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = conn.Close() }()
+	if err := conn.SetDeadline(deadline); err != nil {
+		return nil
+	}
+	if _, err := conn.Write(query); err != nil {
+		return nil
+	}
+	// 4096 covers an EDNS0 answer; anything larger is a response this path has
+	// no business carrying, and truncation makes the client retry over TCP
+	// through the ordinary route.
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil || n == 0 {
+		return nil
+	}
+	return buf[:n]
 }
 
 // bypassServers is who answers a bypassed name.

@@ -379,29 +379,60 @@ func (c *Client) ProcessDNSQuery(query []byte, addr net.Addr, respond func([]byt
 	question := lite.FirstQuestion
 	now := time.Now()
 
-	// 1b. Bypass, before the cache and before the tunnel.
+	// 1b. Bypass: answer domestic names from a domestic resolver.
 	//
-	// Before the cache because the two answer different questions: the cache
-	// holds what the tunnel returned, and a bypassed name wants what a local
-	// resolver returns. Serving one from the other would hand back the far-side
-	// address this exists to avoid.
+	// 🔴 Never inline. This function is called straight from the SOCKS5 UDP
+	// read loop - `isHit := c.ProcessDNSQuery(...)` with no goroutine - and on
+	// Android that loop is the *only* DNS path, because LOCAL_DNS_ENABLED is
+	// false. A blocking lookup here does not delay one name, it stops every
+	// other query on the device until it returns. The first version of this did
+	// exactly that: up to two seconds per resolver, tried in turn.
 	//
-	// ⚠️ A failed direct lookup falls through to the tunnel rather than failing
-	// the query. Bypass is an optimisation; a domestic resolver being down must
-	// not take the name with it.
+	// So the cache is consulted inline (free) and anything else is handed to a
+	// goroutine that answers when it can. That is the same shape the tunnel
+	// path already has - dispatch, return, respond later.
 	if c.bypass.Match(question.Name) {
-		if resp := c.resolveBypassDirect(query); resp != nil {
+		key := dnsCache.BuildKey(question.Name, question.Type, question.Class)
+		if c.localDNSCache != nil {
+			if resp, ok := c.localDNSCache.GetReady(key, query, now); ok && len(resp) > 0 {
+				if respond != nil {
+					respond(resp)
+				}
+				return true
+			}
+		}
+		// ⚠️ Copied. `query` is a slice of a reusable read buffer, and by the
+		// time this goroutine runs the loop has read another packet into it -
+		// the same trap the tunnel's own waiters document.
+		q := append([]byte(nil), query...)
+		name := question.Name
+		go func() {
+			resp := c.resolveBypassDirect(q)
+			if resp == nil {
+				// Fall back to the tunnel, as a lookup that was never bypassed
+				// would have gone. A domestic resolver being down must not take
+				// the name with it.
+				if c.log != nil {
+					c.log.Warnf("↩️ <yellow>DNS Bypass failed for %s, using the tunnel</yellow>", name)
+				}
+				c.dispatchDNSQueryToTunnel(q)
+				return
+			}
+			// 🔑 Cached. Without this every single lookup of a domestic name is
+			// a fresh query - a page with twenty hosts is twenty queries, and
+			// the next page is twenty more, all landing on the handful of
+			// resolvers that are still up when everything else is cut.
+			if c.localDNSCache != nil {
+				c.localDNSCache.SetReady(key, name, question.Type, question.Class, resp, time.Now())
+			}
 			if respond != nil {
 				respond(resp)
 			}
 			if c.log != nil {
-				c.log.Infof("↩️ <green>DNS Bypass (direct): %s</green>", question.Name)
+				c.log.Infof("↩️ <green>DNS Bypass (direct): %s</green>", name)
 			}
-			return true
-		}
-		if c.log != nil {
-			c.log.Warnf("↩️ <yellow>DNS Bypass failed for %s, falling back to the tunnel</yellow>", question.Name)
-		}
+		}()
+		return true
 	}
 
 	// 2. Check Local Cache
