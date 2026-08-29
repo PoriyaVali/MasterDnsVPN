@@ -83,11 +83,54 @@ func queryResolverOnce(srv string, query []byte, deadline time.Time) []byte {
 	// no business carrying, and truncation makes the client retry over TCP
 	// through the ordinary route.
 	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil || n == 0 {
-		return nil
+	// Read until something usable arrives or the deadline passes. A resolver
+	// that sends a late reply to an older query, or a stray datagram from
+	// anywhere else, must not end the attempt.
+	for {
+		n, err := conn.Read(buf)
+		if err != nil || n == 0 {
+			return nil
+		}
+		if usableDNSReply(buf[:n], query) {
+			return append([]byte(nil), buf[:n]...)
+		}
 	}
-	return buf[:n]
+}
+
+// usableDNSReply reports whether a datagram is an answer to `query` worth
+// handing back.
+//
+// 🔑 Racing makes this necessary rather than merely tidy. Taking the first
+// reply that arrives, unchecked, selects for whichever resolver answers
+// fastest - and on a censored network the fastest answer is very often a
+// hijacked one: an instant NXDOMAIN or a redirect to a block page, while the
+// honest resolver is still working. Without this the bypass would prefer the
+// liar, and the more resolvers raced the likelier that becomes.
+//
+// Four questions, cheapest first:
+//   - is it long enough to be a DNS header at all
+//   - does the transaction ID match the query we sent
+//   - is it a response rather than someone else's question
+//   - did it succeed; an error rcode is not an answer, and letting the race
+//     continue gives a working resolver the chance to reply
+func usableDNSReply(resp, query []byte) bool {
+	const headerLen = 12
+	if len(resp) < headerLen || len(query) < headerLen {
+		return false
+	}
+	if resp[0] != query[0] || resp[1] != query[1] {
+		return false // a different transaction
+	}
+	if resp[2]&0x80 == 0 {
+		return false // QR bit clear: not a response
+	}
+	if resp[3]&0x0F != 0 {
+		return false // rcode != NOERROR
+	}
+	// ANCOUNT: a NOERROR with nothing in it answers nothing, and for a name we
+	// deliberately routed to a domestic resolver an empty answer is the shape a
+	// filtered reply takes.
+	return resp[6] != 0 || resp[7] != 0
 }
 
 // bypassServers is who answers a bypassed name.
