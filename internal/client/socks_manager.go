@@ -325,6 +325,12 @@ func readNullTerminatedSocksField(conn net.Conn) ([]byte, error) {
 }
 
 func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr string, port uint16, atyp byte, socksVersion byte) {
+	// A bypassed address never enters the tunnel: see CIDRMatcher.
+	if ip, ok := c.bypassTarget(atyp, addr); ok {
+		c.handleDirectConnect(ctx, conn, ip, port, socksVersion)
+		return
+	}
+
 	streamID, ok := c.get_new_stream_id()
 	if !ok {
 		c.log.Errorf("❌ <red>Failed to get new Stream ID for SOCKS CONNECT</red>")
@@ -615,6 +621,10 @@ func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, cli
 	}
 	defer udpConn.Close()
 
+	// Created on the first datagram to a bypassed address, if there is one.
+	var direct *directUDPRelay
+	defer func() { direct.Close() }()
+
 	boundAddr := udpConn.LocalAddr().(*net.UDPAddr)
 
 	// 🔑 Reply with an address the client can actually send to, not the address
@@ -698,6 +708,17 @@ func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, cli
 		}
 
 		if targetPort != 53 {
+			if ip, ok := c.bypassTarget(buf[3], targetAddr); ok {
+				if direct == nil {
+					if direct, err = c.newDirectUDPRelay(udpConn); err != nil {
+						direct = nil
+						c.log.Debugf("↩️ <yellow>Direct UDP socket failed: %v</yellow>", err)
+						continue
+					}
+				}
+				direct.send(peerAddr, ip, targetPort, buf[payloadOffset:n])
+				continue
+			}
 			c.rejectSocksUDPAssociateUnsupportedTarget(conn, targetAddr, targetPort)
 			continue
 		}

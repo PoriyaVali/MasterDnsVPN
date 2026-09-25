@@ -53,8 +53,14 @@ type ClientConfig struct {
 	// matters here: this client has already been bricked once by a launcher
 	// passing an argument the binary did not know, and a config key is the
 	// version-safe way to add something.
+	//
+	// BYPASS_CIDRS_FILE (2026-09-25) lists destination ranges, one CIDR per
+	// line, whose connections leave directly instead of through the tunnel -
+	// so Android can stop turning thousands of domestic ranges into VPN
+	// routes. Resolved against the config's directory like the name list.
 	BypassDomainsFile                     string            `toml:"BYPASS_DOMAINS_FILE"`
 	BypassDNSServers                      []string          `toml:"BYPASS_DNS_SERVERS"`
+	BypassCIDRsFile                       string            `toml:"BYPASS_CIDRS_FILE"`
 	LocalDNSEnabled                       bool              `toml:"LOCAL_DNS_ENABLED"`
 	LocalDNSIP                            string            `toml:"LOCAL_DNS_IP"`
 	LocalDNSPort                          int               `toml:"LOCAL_DNS_PORT"`

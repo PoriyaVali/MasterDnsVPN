@@ -129,6 +129,7 @@ type Client struct {
 	// config names a rule file, and empty means "tunnel everything", which is
 	// the behaviour this client had before the matcher existed.
 	bypass                 *BypassMatcher
+	bypassCIDRs            *CIDRMatcher
 	localDNSCache          *dnsCache.Store
 	dnsResponses           *fragmentStore.Store[dnsFragmentKey]
 	localDNSCachePersist   bool
@@ -278,6 +279,23 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		}
 	}
 
+	// Same loading rules as the name list: once, at startup, relative to the
+	// config, and a missing file means "tunnel everything", never "do not run".
+	bypassCIDRs := NewCIDRMatcher()
+	if cfg.BypassCIDRsFile != "" {
+		path := cfg.BypassCIDRsFile
+		if !filepath.IsAbs(path) && cfg.ConfigDir != "" {
+			path = filepath.Join(cfg.ConfigDir, path)
+		}
+		if n, err := bypassCIDRs.LoadFile(path); err != nil {
+			log.Warnf("↩️ <yellow>Bypass ranges unreadable (%s): %v — tunnelling everything</yellow>",
+				path, err)
+		} else {
+			log.Infof("↩️ <green>Bypass ranges loaded: <cyan>%d</cyan> entries, <cyan>%d</cyan> merged ranges</green>",
+				n, bypassCIDRs.Len())
+		}
+	}
+
 	var responseMode uint8
 	if cfg.BaseEncodeData {
 		responseMode = mtuProbeBase64Reply
@@ -326,7 +344,8 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		plannerQueueSpaceSignal: make(chan struct{}, 1),
 		writerQueueSpaceSignal:  make(chan struct{}, 1),
 
-		bypass: bypass,
+		bypass:      bypass,
+		bypassCIDRs: bypassCIDRs,
 
 		// DNS Management
 		// Recorded before any socket is made, so every resolver dial can ask
