@@ -219,7 +219,11 @@ func main() {
 	var app *client.Client
 	switch {
 	case opts.jsonBase64 != "":
-		cfg, err := config.LoadClientConfigFromJSONBase64WithOverrides(opts.jsonBase64, overrides)
+		// ⚠️ `=` not `:=`: a fresh err here shadowed the outer one, so a failed
+		// BootstrapLoadedConfig below was never seen and the client went on with a
+		// nil app.
+		var cfg config.ClientConfig
+		cfg, err = config.LoadClientConfigFromJSONBase64WithOverrides(opts.jsonBase64, overrides)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Client startup failed: %v\n", err)
 			waitForExitInput()
