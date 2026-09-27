@@ -217,8 +217,17 @@ func (s *Server) streamARQConfig(compressionType uint8) arq.Config {
 		TerminalDrainTimeout:        s.cfg.ARQTerminalDrainTimeoutSec,
 		TerminalAckWaitTimeout:      s.cfg.ARQTerminalAckWaitTimeoutSec,
 		CompressionType:             compressionType,
+		// Left at 0 the ARQ sizes its inbound hand-off queue from the window -
+		// 1600 slots for the default window of 800, allocated up front: ~48KB of
+		// a stream's ~59KB, on every stream of every user. That queue only
+		// bridges the packet worker to the stream's own reader, which drains it
+		// immediately, and upload arrives a query at a time; a full queue drops
+		// the packet, which the client retransmits.
+		InboundQueueSize: serverStreamInboundQueueSize,
 	}
 }
+
+const serverStreamInboundQueueSize = 512
 
 func (s *Server) queueMainSessionPacket(sessionID uint8, packet VpnProto.Packet) bool {
 	packet.StreamID = 0

@@ -173,10 +173,27 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 		deferredInflightIndex: make(map[uint8]map[uint16]map[uint64]struct{}, 64),
 		packetPool: sync.Pool{
 			New: func() any {
-				return make([]byte, cfg.MaxPacketSize)
+				return make([]byte, udpReadBufferSize(cfg.MaxPacketSize))
 			},
 		},
 	}
+}
+
+// maxDNSQueryDatagram bounds the per-read buffer. Every request is a DNS query
+// whose payload rides in a <=255-byte name, so real ones are a few hundred
+// bytes; a larger datagram is truncated, fails to parse and is dropped, as a
+// junk one should be.
+//
+// ⚠️ Each queued request holds its buffer until a worker answers it. At the old
+// 64KB per buffer a full request queue (16384 by default) pinned a gigabyte of
+// memory - reachable by anyone able to send this port a flood of datagrams.
+const maxDNSQueryDatagram = 4096
+
+func udpReadBufferSize(configured int) int {
+	if configured <= 0 || configured > maxDNSQueryDatagram {
+		return maxDNSQueryDatagram
+	}
+	return configured
 }
 
 type throttledLogState struct {
