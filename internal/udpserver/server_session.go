@@ -746,7 +746,8 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 	resolvedUpload := resolveCompressionType(requestedUpload, s.uploadCompressionMask)
 	resolvedDownload := resolveCompressionType(requestedDownload, s.downloadCompressionMask)
 
-	record, reused, err := s.sessions.findOrCreate(
+	record, reused, err := s.sessions.findOrCreateFor(
+		account,
 		initSignature,
 		resolvedUpload,
 		resolvedDownload,
@@ -768,9 +769,6 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 	}
 	if record == nil {
 		return nil
-	}
-	if account != nil && !reused {
-		record.user = account // attach owner for per-user accounting
 	}
 	record.streamCleanup = s.cleanupStreamArtifacts
 

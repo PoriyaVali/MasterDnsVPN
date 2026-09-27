@@ -27,6 +27,10 @@ import (
 
 var ErrSessionTableFull = errors.New("session table full")
 
+// errSessionSignatureTaken: a SESSION_INIT repeated a live session's signature
+// but authenticated as a different user.
+var errSessionSignatureTaken = errors.New("session signature belongs to another user")
+
 const (
 	maxServerSessionID    = 255
 	maxServerSessionSlots = 255
@@ -268,6 +272,28 @@ func (s *sessionStore) findOrCreate(
 	maxClientUploadMTU int,
 	maxClientDownloadMTU int,
 ) (*sessionRecord, bool, error) {
+	return s.findOrCreateFor(nil, payload, uploadCompressionType, downloadCompressionType, maxPacketsPerBatch, maxClientUploadMTU, maxClientDownloadMTU)
+}
+
+// findOrCreateFor is findOrCreate for an authenticated owner (nil for a
+// standalone node).
+//
+// 🔴 A repeated SESSION_INIT is matched to its session by the 10-byte
+// signature alone, and the answer is that session's ID and cookie - everything
+// a client needs to send and receive on it. So the match must also be the same
+// user: otherwise anyone who presents another subscriber's signature under their
+// own valid token is handed that subscriber's session, its traffic metered to
+// the victim. The owner is also attached here, under the store lock, instead of
+// after the record has been published to every packet worker.
+func (s *sessionStore) findOrCreateFor(
+	owner *userAccount,
+	payload []byte,
+	uploadCompressionType uint8,
+	downloadCompressionType uint8,
+	maxPacketsPerBatch int,
+	maxClientUploadMTU int,
+	maxClientDownloadMTU int,
+) (*sessionRecord, bool, error) {
 	if len(payload) != sessionInitDataSize || !isValidSessionResponseMode(payload[0]) {
 		return nil, false, nil
 	}
@@ -285,6 +311,9 @@ func (s *sessionStore) findOrCreate(
 	if sessionID, ok := s.bySig[signature]; ok {
 		if existing := s.byID[sessionID]; existing != nil {
 			if nowUnixNano <= existing.reuseUntilUnixNano {
+				if existing.user != owner {
+					return nil, false, errSessionSignatureTaken
+				}
 				existing.setLastActivityUnixNano(nowUnixNano)
 				return existing, true, nil
 			}
@@ -299,6 +328,7 @@ func (s *sessionStore) findOrCreate(
 
 	record := &sessionRecord{
 		ID:                         uint8(slot),
+		user:                       owner,
 		ResponseMode:               payload[0],
 		CreatedAt:                  now,
 		ReuseUntil:                 now.Add(s.sessionInitTTL),
