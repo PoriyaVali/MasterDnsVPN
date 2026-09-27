@@ -41,7 +41,10 @@ type Entry struct {
 	CreatedAt      time.Time
 	LastUsedAt     time.Time
 	LastDispatchAt time.Time
-	Response       []byte
+	// ExpiresAt is fixed when the answer is stored, from the answer's own
+	// TTL capped by the store's. Reads never move it - see lifetime.go.
+	ExpiresAt time.Time
+	Response  []byte
 }
 
 type LookupResult struct {
@@ -221,11 +224,23 @@ func (s *Store) SetReady(key string, domain string, qType uint16, qClass uint16,
 		return
 	}
 
+	expiresAt, cacheable := s.expiryFor(rawResponse, now)
+
 	shardIdx := getShardIndex(key)
 	shard := &s.shards[shardIdx]
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
+
+	if !cacheable {
+		// Not stored - and whatever was there goes too. A pending entry left in
+		// place would park the next caller on an answer that is never coming,
+		// and a stale ready one would outlive the failure that replaced it.
+		if element, ok := shard.items[key]; ok {
+			s.removeElementLocked(shard, element)
+		}
+		return
+	}
 
 	normalized := make([]byte, len(rawResponse))
 	copy(normalized, rawResponse)
@@ -242,9 +257,10 @@ func (s *Store) SetReady(key string, domain string, qType uint16, qClass uint16,
 		node.entry.QuestionType = qType
 		node.entry.QuestionClass = qClass
 		node.entry.Status = StatusReady
-		if node.entry.CreatedAt.IsZero() {
-			node.entry.CreatedAt = now
-		}
+		// A fresh answer restarts the clock; keeping the old CreatedAt would
+		// expire a just-refreshed entry at the previous answer's deadline.
+		node.entry.CreatedAt = now
+		node.entry.ExpiresAt = expiresAt
 		node.entry.LastUsedAt = now
 		node.entry.Response = normalized
 		s.dirty.Add(1)
@@ -259,6 +275,7 @@ func (s *Store) SetReady(key string, domain string, qType uint16, qClass uint16,
 		Status:        StatusReady,
 		CreatedAt:     now,
 		LastUsedAt:    now,
+		ExpiresAt:     expiresAt,
 		Response:      normalized,
 	}
 	element := shard.order.PushBack(&cacheNode{key: key, entry: entry})
@@ -324,7 +341,12 @@ func (s *Store) isExpired(entry *Entry, now time.Time) bool {
 	if entry.Status == StatusPending {
 		return false
 	}
-	return now.Sub(entry.LastUsedAt) >= s.cacheTTL
+	// Measured from when the answer was stored, never from the last read: a
+	// sliding window kept every popular name alive indefinitely.
+	if !entry.ExpiresAt.IsZero() {
+		return !now.Before(entry.ExpiresAt)
+	}
+	return now.Sub(entry.CreatedAt) >= s.cacheTTL
 }
 
 func (s *Store) evictIfNeededLocked(shard *shard) {
@@ -415,6 +437,13 @@ func (s *Store) LoadFromFile(path string, now time.Time) (int, error) {
 			return 0, fmt.Errorf("read cache entry %d failed: %w", i, err)
 		}
 
+		// The file predates ExpiresAt; rebuild it from the stored answer so a
+		// cache written by an older build obeys the same rule.
+		expiresAt, cacheable := s.expiryFor(entry.Response, entry.CreatedAt)
+		if !cacheable {
+			continue
+		}
+		entry.ExpiresAt = expiresAt
 		if s.isExpired(&entry, now) {
 			continue
 		}
