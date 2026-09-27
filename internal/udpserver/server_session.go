@@ -633,6 +633,19 @@ func (s *Server) nextUnknownInvalidDropMode() uint8 {
 }
 
 func deferredSessionLaneForPacket(packet VpnProto.Packet) deferredSessionLane {
+	if packet.PacketType == Enums.PACKET_DNS_QUERY_REQ {
+		// A lane is a unit of ordering: everything in one lane runs on one
+		// worker, in turn. Lookups arrive on stream 0, so keyed by stream they
+		// all shared a single lane per session and one slow name held up every
+		// other lookup that user made. They have no order to keep - each is
+		// answered under its own sequence number - so each gets its own lane.
+		// (The DNS pool is separate from the connect pool, so these lanes can
+		// never be mistaken for a stream's.)
+		return deferredSessionLane{
+			sessionID: packet.SessionID,
+			streamID:  packet.SequenceNum,
+		}
+	}
 	return deferredSessionLane{
 		sessionID: packet.SessionID,
 		streamID:  packet.StreamID,

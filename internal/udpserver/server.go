@@ -277,6 +277,11 @@ func (s *throttledLogState) pruneLocked(nowUnixNano int64, interval time.Duratio
 	}
 }
 
+const (
+	minDNSDeferredWorkers = 4
+	maxDNSDeferredWorkers = 32
+)
+
 func splitDeferredSessionPools(totalWorkers int, totalQueue int) (dnsWorkers int, connectWorkers int, dnsQueue int, connectQueue int) {
 	if totalWorkers <= 0 {
 		totalWorkers = 1
@@ -285,9 +290,17 @@ func splitDeferredSessionPools(totalWorkers int, totalQueue int) (dnsWorkers int
 		totalQueue = 256
 	}
 
-	// DNS queries use a dedicated lightweight pool so connect-heavy work keeps
-	// the full user-configured deferred capacity.
-	dnsWorkers = 1
+	// DNS queries use a dedicated pool so connect-heavy work keeps the full
+	// user-configured deferred capacity.
+	//
+	// 🔴 It used to be ONE worker for the whole node. A tunnelled lookup blocks
+	// its worker for the upstream round trip - up to DNS_UPSTREAM_TIMEOUT, twice
+	// over when the host-resolver fallback runs, and up to
+	// DNS_INFLIGHT_WAIT_TIMEOUT when it waits on someone else's lookup - so one
+	// slow or dead name stalled DNS for every user on the node, and throughput
+	// was capped at one upstream round trip at a time. The work is waiting, not
+	// computing, so it takes as many workers as the connect pool.
+	dnsWorkers = min(max(totalWorkers, minDNSDeferredWorkers), maxDNSDeferredWorkers)
 	connectWorkers = totalWorkers
 
 	connectQueue = totalQueue
