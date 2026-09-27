@@ -11,6 +11,7 @@ import (
 	"container/heap"
 	"context"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -59,6 +60,7 @@ type Server struct {
 	dnsFragmentTimeout       time.Duration
 	resolveDNSQueryFn        func([]byte) ([]byte, error)
 	dialStreamUpstreamFn     func(string, string, time.Duration) (net.Conn, error)
+	lookupTargetIPsFn        func(context.Context, string) ([]netip.Addr, error)
 	uploadCompressionMask    uint8
 	downloadCompressionMask  uint8
 	dropLogIntervalNanos     int64
