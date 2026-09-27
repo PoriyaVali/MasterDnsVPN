@@ -415,6 +415,13 @@ func (c *Client) ProcessDNSQuery(query []byte, addr net.Addr, respond func([]byt
 				if c.log != nil {
 					c.log.Warnf("↩️ <yellow>DNS Bypass failed for %s, using the tunnel</yellow>", name)
 				}
+				// 🔴 Parked first, exactly as the tunnel path parks its callers.
+				// Without it the tunnel's answer was stored in the cache and
+				// handed to nobody: the caller heard silence and only got an
+				// answer on its own retry, seconds later.
+				if c.localDNSCache != nil {
+					c.waitForDNSAnswer(key, q, respond)
+				}
 				c.dispatchDNSQueryToTunnel(q)
 				return
 			}
