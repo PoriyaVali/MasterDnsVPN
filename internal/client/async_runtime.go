@@ -28,6 +28,7 @@ const clientRXDropLogInterval = 2 * time.Second
 
 type asyncReadPacket struct {
 	data      []byte
+	buf       *[]byte // pooled buffer data is read into; nil if not pooled
 	addr      *net.UDPAddr
 	localAddr string
 }
@@ -508,9 +509,7 @@ drainRX:
 	for {
 		select {
 		case pkt := <-c.rxChannel:
-			if pkt.data != nil {
-				c.udpBufferPool.Put(pkt.data[:cap(pkt.data)])
-			}
+			c.putRuntimeUDPBuffer(pkt.buf)
 		default:
 			return
 		}
@@ -833,10 +832,11 @@ func (c *Client) asyncReaderWorker(ctx context.Context, id int, conn *net.UDPCon
 		case <-ctx.Done():
 			return
 		default:
-			buf := c.udpBufferPool.Get().([]byte)
+			bufRef := c.getRuntimeUDPBuffer()
+			buf := *bufRef
 			n, addr, err := conn.ReadFromUDP(buf)
 			if err != nil {
-				c.udpBufferPool.Put(buf)
+				c.putRuntimeUDPBuffer(bufRef)
 				if ctx.Err() != nil {
 					return
 				}
@@ -844,7 +844,7 @@ func (c *Client) asyncReaderWorker(ctx context.Context, id int, conn *net.UDPCon
 			}
 
 			if n < 12 { // Basic DNS header length
-				c.udpBufferPool.Put(buf)
+				c.putRuntimeUDPBuffer(bufRef)
 				continue
 			}
 
@@ -852,17 +852,17 @@ func (c *Client) asyncReaderWorker(ctx context.Context, id int, conn *net.UDPCon
 			// DNS Header: ID(2), Flags(2)... Flags first byte bit 7 is QR.
 			if (buf[2] & 0x80) == 0 {
 				// Not a response, we are a client, we only care about responses.
-				c.udpBufferPool.Put(buf)
+				c.putRuntimeUDPBuffer(bufRef)
 				continue
 			}
 
 			packetData := buf[:n]
 
 			select {
-			case c.rxChannel <- asyncReadPacket{data: packetData, addr: addr, localAddr: localAddr}:
+			case c.rxChannel <- asyncReadPacket{data: packetData, buf: bufRef, addr: addr, localAddr: localAddr}:
 			default:
 				// Queue full! Drop packet and RECYCLE buffer.
-				c.udpBufferPool.Put(buf)
+				c.putRuntimeUDPBuffer(bufRef)
 				c.onRXDrop(addr)
 			}
 		}
@@ -881,7 +881,7 @@ func (c *Client) asyncProcessorWorker(ctx context.Context, id int) {
 			c.handleInboundPacket(pkt.data, pkt.addr, pkt.localAddr)
 
 			// RECYCLE buffer back to the pool.
-			c.udpBufferPool.Put(pkt.data[:cap(pkt.data)])
+			c.putRuntimeUDPBuffer(pkt.buf)
 		}
 	}
 }

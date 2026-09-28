@@ -313,7 +313,8 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		responseMode:        responseMode,
 		udpBufferPool: sync.Pool{
 			New: func() any {
-				return make([]byte, RuntimeUDPReadBufferSize)
+				buf := make([]byte, RuntimeUDPReadBufferSize)
+				return &buf
 			},
 		},
 		resolverConns:                         make(map[string]chan pooledUDPConn),

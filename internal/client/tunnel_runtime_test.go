@@ -155,3 +155,54 @@ func TestExchangeUDPQueryWithConnDrainsStaleResponsesBeforeSending(t *testing.T)
 
 	<-serverDone
 }
+
+// A host app can start a new client (which sets the protect path) while the
+// previous one's goroutines are still dialing resolvers. Run with -race.
+func TestProtectPathConcurrentSetAndDial(t *testing.T) {
+	defer SetProtectPath("")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			SetProtectPath("/nonexistent/protect.sock")
+			SetProtectPath("")
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		_ = currentProtectPath()
+	}
+	<-done
+	if got := currentProtectPath(); got != "" {
+		t.Fatalf("protect path = %q, want empty", got)
+	}
+}
+
+func TestRuntimeUDPBufferPoolRoundTrip(t *testing.T) {
+	c := &Client{}
+	c.udpBufferPool.New = func() any {
+		buf := make([]byte, RuntimeUDPReadBufferSize)
+		return &buf
+	}
+	first := c.getRuntimeUDPBuffer()
+	if first == nil || len(*first) != RuntimeUDPReadBufferSize {
+		t.Fatal("pool must hand out full-size buffers")
+	}
+	c.putRuntimeUDPBuffer(first)
+
+	// Short or foreign buffers are never pooled, so a later get cannot
+	// return one too small for a DNS response.
+	short := make([]byte, 10)
+	c.putRuntimeUDPBuffer(&short)
+	c.putRuntimeUDPBuffer(nil)
+	for i := 0; i < 4; i++ {
+		if got := c.getRuntimeUDPBuffer(); len(*got) != RuntimeUDPReadBufferSize {
+			t.Fatalf("got a %d-byte buffer", len(*got))
+		}
+	}
+
+	var nilClient *Client
+	if got := nilClient.getRuntimeUDPBuffer(); len(*got) != RuntimeUDPReadBufferSize {
+		t.Fatal("nil client must still hand out a buffer")
+	}
+	nilClient.putRuntimeUDPBuffer(first)
+}
