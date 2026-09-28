@@ -426,98 +426,27 @@ func ExtractVPNResponseWith(packet []byte, baseEncoded bool, open func([]byte) (
 }
 
 // BuildSealedVPNResponsePacket answers a tunnel query with an already-sealed
-// session v2 frame. The sealed bytes are opaque, so they are split into TXT
-// strings by position alone: one answer when they fit, otherwise chunk 0 is
-// [0x00][count][data] and chunk N is [N][data] - the same framing v1 uses,
-// without v1's need to read a frame header out of chunk 0.
+// session v2 frame, in one TXT record split into 255-byte strings - the same
+// shape v1 answers now have. The sealed bytes are opaque; nothing in them is
+// read here.
 func BuildSealedVPNResponsePacket(questionPacket []byte, answerName string, sealed []byte, baseEncode bool) ([]byte, error) {
-	maxChunk := maxTXTAnswerPayload
-	if baseEncode {
-		maxChunk = maxTXTEncodedChunk
+	answer, err := buildTXTAnswerRData(sealed, baseEncode)
+	if err != nil {
+		return nil, err
 	}
-	if len(sealed) <= maxChunk {
-		return buildSingleTXTResponsePacket(questionPacket, answerName, buildTXTAnswerChunk(sealed, baseEncode))
-	}
-
-	maxChunk0Data := maxChunk - 2
-	maxChunkNData := maxChunk - 1
-	totalChunks := 1
-	if remaining := len(sealed) - maxChunk0Data; remaining > 0 {
-		totalChunks += (remaining + maxChunkNData - 1) / maxChunkNData
-	}
-	if totalChunks > 255 {
-		return nil, ErrTXTAnswerTooLarge
-	}
-
-	chunks := make([][]byte, 0, totalChunks)
-	raw := make([]byte, 0, maxChunk)
-	raw = append(raw, 0x00, byte(totalChunks))
-	raw = append(raw, sealed[:maxChunk0Data]...)
-	chunks = append(chunks, buildTXTAnswerChunk(raw, baseEncode))
-	cursor := maxChunk0Data
-	for chunkID := 1; cursor < len(sealed); chunkID++ {
-		end := min(cursor+maxChunkNData, len(sealed))
-		raw = raw[:0]
-		raw = append(raw, byte(chunkID))
-		raw = append(raw, sealed[cursor:end]...)
-		chunks = append(chunks, buildTXTAnswerChunk(raw, baseEncode))
-		cursor = end
-	}
-	return BuildTXTResponsePacket(questionPacket, answerName, chunks)
+	return buildSingleTXTResponsePacket(questionPacket, answerName, answer)
 }
 
-// assembleSealedBlob reverses BuildSealedVPNResponsePacket's framing.
+// assembleSealedBlob reads a sealed answer back: always one record, its
+// strings joined. v2 has only ever been sent that way.
 func assembleSealedBlob(rawAnswers [][]byte, baseEncoded bool) ([]byte, error) {
-	decode := func(raw []byte) ([]byte, error) {
-		if !baseEncoded {
-			return raw, nil
-		}
-		return baseCodec.DecodeRawBase64(raw)
-	}
-	if len(rawAnswers) == 1 {
-		return decode(rawAnswers[0])
-	}
-
-	var chunks [256][]byte
-	total := 0
-	seen := 0
-	for _, raw := range rawAnswers {
-		data, err := decode(raw)
-		if err != nil {
-			return nil, err
-		}
-		if len(data) < 1 {
-			return nil, ErrTXTAnswerMalformed
-		}
-		id := int(data[0])
-		body := data[1:]
-		if id == 0 {
-			if len(data) < 2 {
-				return nil, ErrTXTAnswerMalformed
-			}
-			total = int(data[1])
-			body = data[2:]
-		}
-		if chunks[id] == nil {
-			seen++
-		}
-		chunks[id] = body
-	}
-	if total <= 0 || seen != total {
+	if len(rawAnswers) != 1 {
 		return nil, ErrTXTAnswerMalformed
 	}
-	size := 0
-	for i := 0; i < total; i++ {
-		if chunks[i] == nil {
-			return nil, ErrTXTAnswerMalformed
-		}
-		size += len(chunks[i])
+	if !baseEncoded {
+		return rawAnswers[0], nil
 	}
-	blob := make([]byte, 0, size)
-	for i := 0; i < total; i++ {
-		blob = append(blob, chunks[i]...)
-	}
-	return blob, nil
+	return baseCodec.DecodeRawBase64(rawAnswers[0])
 }
 
 func DescribeResponseWithoutTunnelPayload(packet []byte) string {
