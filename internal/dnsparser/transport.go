@@ -370,6 +370,130 @@ func ExtractVPNResponse(packet []byte, baseEncoded bool) (VpnProto.Packet, error
 	return assembleVPNResponse(rawAnswers, baseEncoded)
 }
 
+// ExtractVPNResponseWith is ExtractVPNResponse for a client that may hold
+// session v2 keys. open, when non-nil, is offered the reassembled answer first;
+// if it authenticates, the frame inside is the packet and sealed is true.
+// Otherwise the answer is read as a plain v1 frame and sealed is false - the
+// caller decides what, if anything, it accepts unsealed.
+func ExtractVPNResponseWith(packet []byte, baseEncoded bool, open func([]byte) ([]byte, bool)) (VpnProto.Packet, bool, error) {
+	parsed, err := ParsePacket(packet)
+	if err != nil {
+		return VpnProto.Packet{}, false, err
+	}
+
+	rawAnswers := extractTXTAnswerPayloads(parsed)
+	if len(rawAnswers) == 0 {
+		return VpnProto.Packet{}, false, ErrTXTAnswerMissing
+	}
+
+	if open != nil {
+		if blob, err := assembleSealedBlob(rawAnswers, baseEncoded); err == nil {
+			if frame, ok := open(blob); ok {
+				vpnPacket, err := VpnProto.ParseInflated(frame)
+				return vpnPacket, err == nil, err
+			}
+		}
+	}
+
+	vpnPacket, err := assembleVPNResponse(rawAnswers, baseEncoded)
+	return vpnPacket, false, err
+}
+
+// BuildSealedVPNResponsePacket answers a tunnel query with an already-sealed
+// session v2 frame. The sealed bytes are opaque, so they are split into TXT
+// strings by position alone: one answer when they fit, otherwise chunk 0 is
+// [0x00][count][data] and chunk N is [N][data] - the same framing v1 uses,
+// without v1's need to read a frame header out of chunk 0.
+func BuildSealedVPNResponsePacket(questionPacket []byte, answerName string, sealed []byte, baseEncode bool) ([]byte, error) {
+	maxChunk := maxTXTAnswerPayload
+	if baseEncode {
+		maxChunk = maxTXTEncodedChunk
+	}
+	if len(sealed) <= maxChunk {
+		return buildSingleTXTResponsePacket(questionPacket, answerName, buildTXTAnswerChunk(sealed, baseEncode))
+	}
+
+	maxChunk0Data := maxChunk - 2
+	maxChunkNData := maxChunk - 1
+	totalChunks := 1
+	if remaining := len(sealed) - maxChunk0Data; remaining > 0 {
+		totalChunks += (remaining + maxChunkNData - 1) / maxChunkNData
+	}
+	if totalChunks > 255 {
+		return nil, ErrTXTAnswerTooLarge
+	}
+
+	chunks := make([][]byte, 0, totalChunks)
+	raw := make([]byte, 0, maxChunk)
+	raw = append(raw, 0x00, byte(totalChunks))
+	raw = append(raw, sealed[:maxChunk0Data]...)
+	chunks = append(chunks, buildTXTAnswerChunk(raw, baseEncode))
+	cursor := maxChunk0Data
+	for chunkID := 1; cursor < len(sealed); chunkID++ {
+		end := min(cursor+maxChunkNData, len(sealed))
+		raw = raw[:0]
+		raw = append(raw, byte(chunkID))
+		raw = append(raw, sealed[cursor:end]...)
+		chunks = append(chunks, buildTXTAnswerChunk(raw, baseEncode))
+		cursor = end
+	}
+	return BuildTXTResponsePacket(questionPacket, answerName, chunks)
+}
+
+// assembleSealedBlob reverses BuildSealedVPNResponsePacket's framing.
+func assembleSealedBlob(rawAnswers [][]byte, baseEncoded bool) ([]byte, error) {
+	decode := func(raw []byte) ([]byte, error) {
+		if !baseEncoded {
+			return raw, nil
+		}
+		return baseCodec.DecodeRawBase64(raw)
+	}
+	if len(rawAnswers) == 1 {
+		return decode(rawAnswers[0])
+	}
+
+	var chunks [256][]byte
+	total := 0
+	seen := 0
+	for _, raw := range rawAnswers {
+		data, err := decode(raw)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) < 1 {
+			return nil, ErrTXTAnswerMalformed
+		}
+		id := int(data[0])
+		body := data[1:]
+		if id == 0 {
+			if len(data) < 2 {
+				return nil, ErrTXTAnswerMalformed
+			}
+			total = int(data[1])
+			body = data[2:]
+		}
+		if chunks[id] == nil {
+			seen++
+		}
+		chunks[id] = body
+	}
+	if total <= 0 || seen != total {
+		return nil, ErrTXTAnswerMalformed
+	}
+	size := 0
+	for i := 0; i < total; i++ {
+		if chunks[i] == nil {
+			return nil, ErrTXTAnswerMalformed
+		}
+		size += len(chunks[i])
+	}
+	blob := make([]byte, 0, size)
+	for i := 0; i < total; i++ {
+		blob = append(blob, chunks[i]...)
+	}
+	return blob, nil
+}
+
 func DescribeResponseWithoutTunnelPayload(packet []byte) string {
 	parsed, err := ParsePacket(packet)
 	if err != nil {
