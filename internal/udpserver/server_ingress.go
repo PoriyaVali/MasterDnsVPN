@@ -156,7 +156,7 @@ func (s *Server) parseTunnelLabels(labels string) (vpnPacket VpnProto.Packet, se
 		if sessionID, ok := sessioncrypto.PeekRoute(&s.users.mask, decoded); ok {
 			if record, ok := s.sessions.Get(sessionID); ok && record.v2 {
 				if frame, ok := record.keys.OpenUp(decoded); ok {
-					vpnPacket, err := VpnProto.ParseInflated(frame)
+					vpnPacket, err := parseTunnelFrame(frame)
 					if err == nil && vpnPacket.SessionID == sessionID {
 						return vpnPacket, true, -1, nil
 					}
@@ -177,11 +177,29 @@ func (s *Server) parseTunnelLabels(labels string) (vpnPacket VpnProto.Packet, se
 	}
 	// A v1 frame that happened to show the route marker (1 in 256) is still
 	// a v1 frame: if it parses, it is not an orphan.
-	vpnPacket, err = VpnProto.ParseInflated(raw)
+	vpnPacket, err = parseTunnelFrame(raw)
 	if err == nil {
 		return vpnPacket, false, -1, nil
 	}
 	return vpnPacket, false, orphan, err
+}
+
+// errCompressedPreSession is a pre-session frame that claims to be compressed.
+var errCompressedPreSession = errors.New("pre-session frame must not be compressed")
+
+// parseTunnelFrame parses a decrypted frame and inflates its payload. No
+// client compresses an MTU probe or a SESSION_INIT, and those are the frames
+// anyone holding the node key can send without a session, so a compressed
+// one is refused before anything is decompressed.
+func parseTunnelFrame(raw []byte) (VpnProto.Packet, error) {
+	packet, err := VpnProto.Parse(raw)
+	if err != nil {
+		return packet, err
+	}
+	if isPreSessionRequestType(packet.PacketType) && packet.HasCompressionType && packet.CompressionType != 0 {
+		return VpnProto.Packet{}, errCompressedPreSession
+	}
+	return VpnProto.InflatePayload(packet)
 }
 
 // buildOrphanSealedDropResponse answers a sealed frame whose session is gone
