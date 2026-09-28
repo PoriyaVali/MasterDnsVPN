@@ -41,9 +41,14 @@ type MultiLevelQueue[T any] struct {
 	census map[uint64]censusEntry[T]
 }
 
+// mlqCensusHint caps the census map's initial size. The map grows as items
+// arrive; sizing it for the whole window up front cost ~10 KB on every
+// server stream, most of which never queue more than a few packets at once.
+const mlqCensusHint = 16
+
 func New[T any](initialCapacity int) *MultiLevelQueue[T] {
 	m := &MultiLevelQueue[T]{
-		census: make(map[uint64]censusEntry[T], initialCapacity),
+		census: make(map[uint64]censusEntry[T], min(initialCapacity, mlqCensusHint)),
 	}
 	for i := range m.queues {
 		m.queues[i].items = list.New()
