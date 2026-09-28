@@ -28,6 +28,10 @@ import (
 
 var ErrSessionTableFull = errors.New("session table full")
 
+// ErrUserSessionLimit is a subscriber already holding MaxSessionsPerUser busy
+// sessions. The client is answered the same way as for a full table.
+var ErrUserSessionLimit = errors.New("per-user session limit reached")
+
 // errSessionSignatureTaken: a SESSION_INIT repeated a live session's signature
 // but authenticated as a different user.
 var errSessionSignatureTaken = errors.New("session signature belongs to another user")
@@ -375,7 +379,7 @@ func (s *sessionStore) findOrCreateFor(
 		count, quietest := s.userSessionsLocked(owner.user)
 		if count >= s.maxSessionsPerUser {
 			if quietest == nil || nowUnixNano-quietest.lastActivity() < perUserEvictIdle.Nanoseconds() {
-				return nil, false, nil, ErrSessionTableFull
+				return nil, false, nil, ErrUserSessionLimit
 			}
 			evicted = append(evicted, s.evictLocked(quietest.ID, now))
 		}
@@ -774,11 +778,17 @@ func (s *sessionStore) SweepRecentlyClosedStreams(now time.Time) {
 	}
 }
 
-func (s *sessionStore) allocateSlotLocked() int {
-	maxActiveSessions := s.maxActiveSessions
-	if maxActiveSessions <= 0 || maxActiveSessions > maxServerSessionSlots {
-		maxActiveSessions = maxServerSessionSlots
+// effectiveMaxActiveSessions is the table's size: the configured limit,
+// within the 255 an 8-bit session ID allows.
+func (s *sessionStore) effectiveMaxActiveSessions() int {
+	if s.maxActiveSessions <= 0 || s.maxActiveSessions > maxServerSessionSlots {
+		return maxServerSessionSlots
 	}
+	return s.maxActiveSessions
+}
+
+func (s *sessionStore) allocateSlotLocked() int {
+	maxActiveSessions := s.effectiveMaxActiveSessions()
 
 	if s.activeCount >= uint16(maxActiveSessions) {
 		return -1

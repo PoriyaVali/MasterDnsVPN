@@ -281,7 +281,7 @@ func TestSessionStore_PerUserCapReplacesTheQuietest(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Both busy: a third is refused rather than cutting a live session.
-	if _, _, _, err := store.findOrCreateFor(owner, signatureWith(3), 0, 0, 8, 150, 700); err != ErrSessionTableFull {
+	if _, _, _, err := store.findOrCreateFor(owner, signatureWith(3), 0, 0, 8, 150, 700); err != ErrUserSessionLimit {
 		t.Fatalf("third session while both are busy: %v", err)
 	}
 	// a goes quiet: the next one replaces it.

@@ -880,8 +880,8 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 		)
 	}
 	if err != nil {
-		if err == ErrSessionTableFull {
-			s.logSessionTableFull()
+		if err == ErrSessionTableFull || err == ErrUserSessionLimit {
+			s.noteRefusedSessionInit(err == ErrUserSessionLimit)
 			return s.buildSessionBusyResponse(questionPacket, decision.RequestName, initSignature[0], initSignature[6:10])
 		}
 		return nil
@@ -1012,27 +1012,61 @@ func (s *Server) handleMTUDownRequest(questionPacket []byte, _ DnsParser.LitePac
 	return response
 }
 
-// sessionTableFullLogInterval is how often a full session table is reported.
-const sessionTableFullLogInterval = 10 * time.Second
+// sessionInitRefusalLogInterval is how often refused SESSION_INITs are
+// reported. A variable so tests can shorten it.
+var sessionInitRefusalLogInterval = 10 * time.Second
 
-// logSessionTableFull reports refused SESSION_INITs at most once per
-// interval, with how many were refused since the last report. Each refusal
-// used to write its own error line: 45 clients over capacity wrote 2,814
-// lines in two and a half minutes, and anyone holding the node key could
-// fill the disk that way on purpose.
-func (s *Server) logSessionTableFull() {
-	refused := s.sessionTableFullRefused.Add(1)
-	if s.log == nil {
+// noteRefusedSessionInit counts a SESSION_INIT refused for room - a full
+// session table, or a subscriber at their session limit - and reports them
+// at most once per interval. Each refusal used to write its own error line:
+// 45 clients over capacity wrote 2,814 lines in two and a half minutes, and
+// anyone holding the node key could fill the disk that way on purpose.
+//
+// The first refusal after a quiet spell is reported at once; the ones that
+// follow are reported at the end of each interval while they keep coming, so
+// a burst that stops is still reported in full.
+func (s *Server) noteRefusedSessionInit(userLimit bool) {
+	if userLimit {
+		s.refusedInitsUserLimit.Add(1)
+	} else {
+		s.refusedInitsTableFull.Add(1)
+	}
+	if s.log == nil || !s.refusedInitsReportArmed.CompareAndSwap(false, true) {
 		return
 	}
-	now := time.Now().UnixNano()
-	last := s.sessionTableFullLastLog.Load()
-	if now-last < int64(sessionTableFullLogInterval) || !s.sessionTableFullLastLog.CompareAndSwap(last, now) {
+	s.reportRefusedSessionInits()
+	time.AfterFunc(sessionInitRefusalLogInterval, s.flushRefusedSessionInits)
+}
+
+func (s *Server) flushRefusedSessionInits() {
+	if s.reportRefusedSessionInits() {
+		time.AfterFunc(sessionInitRefusalLogInterval, s.flushRefusedSessionInits)
 		return
 	}
-	s.sessionTableFullRefused.Add(-refused)
+	s.refusedInitsReportArmed.Store(false)
+	// A refusal counted after the report above but before the flag cleared
+	// saw a report still armed and left it to this one.
+	if (s.refusedInitsTableFull.Load() > 0 || s.refusedInitsUserLimit.Load() > 0) &&
+		s.refusedInitsReportArmed.CompareAndSwap(false, true) {
+		time.AfterFunc(sessionInitRefusalLogInterval, s.flushRefusedSessionInits)
+	}
+}
+
+// reportRefusedSessionInits logs and clears the refusals counted so far,
+// naming the limit that refused each; false when there were none.
+func (s *Server) reportRefusedSessionInits() bool {
+	tableFull := s.refusedInitsTableFull.Swap(0)
+	userLimit := s.refusedInitsUserLimit.Swap(0)
+	if tableFull == 0 && userLimit == 0 {
+		return false
+	}
+	tableLimit, userCap := maxServerSessionSlots, 0
+	if s.sessions != nil {
+		tableLimit, userCap = s.sessions.effectiveMaxActiveSessions(), s.sessions.maxSessionsPerUser
+	}
 	s.log.Errorf(
-		"\U0001F6AB <red>Session Table Full: refused <cyan>%d</cyan> SESSION_INIT(s) in the last %s; a node holds at most %d sessions</red>",
-		refused, sessionTableFullLogInterval, maxServerSessionSlots,
+		"\U0001F6AB <red>SESSION_INIT Refused: <cyan>%d</cyan> for a full session table (limit <cyan>%d</cyan>), <cyan>%d</cyan> for a subscriber at their session limit (<cyan>%d</cyan>)</red>",
+		tableFull, tableLimit, userLimit, userCap,
 	)
+	return true
 }
