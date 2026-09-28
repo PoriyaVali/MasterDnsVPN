@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"time"
 
 	"masterdnsvpn-go/internal/arq"
@@ -198,7 +199,10 @@ func (s *Server) buildSessionVPNResponse(questionPacket []byte, requestName stri
 // through the tunnel) is readable on the wire, by the censor or by another
 // subscriber holding the node key.
 func buildSealedResponse(questionPacket []byte, requestName string, keys *sessioncrypto.Keys, packet VpnProto.Packet, base64 bool) []byte {
-	raw, err := VpnProto.BuildRawAuto(VpnProto.BuildOptions{
+	frameBuf, sealBuf := sealScratch.Get().(*[]byte), sealScratch.Get().(*[]byte)
+	defer putSealScratch(frameBuf)
+	defer putSealScratch(sealBuf)
+	raw, err := VpnProto.BuildRawAutoInto(*frameBuf, VpnProto.BuildOptions{
 		SessionID:       packet.SessionID,
 		PacketType:      packet.PacketType,
 		SessionCookie:   packet.SessionCookie,
@@ -212,15 +216,32 @@ func buildSealedResponse(questionPacket []byte, requestName string, keys *sessio
 	if err != nil {
 		return nil
 	}
-	sealed, err := keys.SealDown(raw)
+	*frameBuf = raw[:0]
+	sealed, err := keys.SealDownTo(*sealBuf, raw)
 	if err != nil {
 		return nil
 	}
+	*sealBuf = sealed[:0]
 	response, err := DnsParser.BuildSealedVPNResponsePacket(questionPacket, requestName, sealed, base64)
 	if err != nil {
 		return nil
 	}
 	return response
+}
+
+// sealScratch holds the frame and its sealed form while a v2 answer is
+// built; only the answer itself is allocated.
+var sealScratch = sync.Pool{New: func() any {
+	b := make([]byte, 0, 2048)
+	return &b
+}}
+
+func putSealScratch(b *[]byte) {
+	if cap(*b) > 64*1024 {
+		return
+	}
+	*b = (*b)[:0]
+	sealScratch.Put(b)
 }
 
 func (s *Server) queueSessionPacket(sessionID uint8, packet VpnProto.Packet) bool {

@@ -255,10 +255,22 @@ func (k *Keys) OpenUp(b []byte) ([]byte, bool) {
 
 // SealDown seals a server -> client frame.
 func (k *Keys) SealDown(frame []byte) ([]byte, error) {
+	return k.SealDownTo(nil, frame)
+}
+
+// SealDownTo is SealDown writing into dst's storage when it is large enough.
+// dst must not overlap frame.
+func (k *Keys) SealDownTo(dst []byte, frame []byte) ([]byte, error) {
 	if k == nil {
 		return nil, errors.New("sessioncrypto: no keys")
 	}
-	out := make([]byte, chacha20poly1305.NonceSize, chacha20poly1305.NonceSize+len(frame)+chacha20poly1305.Overhead)
+	size := chacha20poly1305.NonceSize + len(frame) + chacha20poly1305.Overhead
+	var out []byte
+	if cap(dst) >= size {
+		out = dst[:chacha20poly1305.NonceSize]
+	} else {
+		out = make([]byte, chacha20poly1305.NonceSize, size)
+	}
 	if _, err := rand.Read(out); err != nil {
 		return nil, fmt.Errorf("sessioncrypto: nonce: %w", err)
 	}

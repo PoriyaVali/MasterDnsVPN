@@ -63,10 +63,15 @@ func ParseInflated(data []byte) (Packet, error) {
 }
 
 func BuildRawAuto(opts BuildOptions, minSize int) ([]byte, error) {
+	return BuildRawAutoInto(nil, opts, minSize)
+}
+
+// BuildRawAutoInto is BuildRawAuto writing into dst's storage when it fits.
+func BuildRawAutoInto(dst []byte, opts BuildOptions, minSize int) ([]byte, error) {
 	payload, compressionType := PreparePayload(opts.PacketType, opts.Payload, opts.CompressionType, minSize)
 	opts.Payload = payload
 	opts.CompressionType = compressionType
-	return BuildRaw(opts)
+	return BuildRawInto(dst, opts)
 }
 
 func BuildEncodedAuto(opts BuildOptions, codec *security.Codec, minSize int) (string, error) {
