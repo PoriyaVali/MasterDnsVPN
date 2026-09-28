@@ -85,6 +85,12 @@ type ClientConfig struct {
 	EncryptionKey                         string            `toml:"ENCRYPTION_KEY"`
 	Uuid                                  string            `toml:"UUID"`
 	NodeSecret                            string            `toml:"NODE_SECRET"`
+	// DeviceID identifies this device to the node's device limit (session
+	// v2). Any stable string; it is hashed before it leaves the device.
+	DeviceID                              string            `toml:"DEVICE_ID"`
+	// SessionV2: "auto" (v2, falling back to v1 against a node that does not
+	// answer it), "on" (v2 only) or "off" (v1 only).
+	SessionV2                             string            `toml:"SESSION_V2"`
 	MinUploadMTU                          int               `toml:"MIN_UPLOAD_MTU"`
 	MinDownloadMTU                        int               `toml:"MIN_DOWNLOAD_MTU"`
 	MaxUploadMTU                          int               `toml:"MAX_UPLOAD_MTU"`
@@ -359,6 +365,15 @@ func LoadClientConfigFromJSONBase64WithOverrides(encoded string, overrides Clien
 func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 	cfg.ProtocolType = strings.ToUpper(strings.TrimSpace(cfg.ProtocolType))
 	cfg.LogLevel = strings.TrimSpace(cfg.LogLevel)
+	cfg.DeviceID = strings.TrimSpace(cfg.DeviceID)
+	// ⚠️ An unknown value is read as "auto" rather than refused: a config
+	// written by a newer launcher must still start this core.
+	switch mode := strings.ToLower(strings.TrimSpace(cfg.SessionV2)); mode {
+	case "on", "off":
+		cfg.SessionV2 = mode
+	default:
+		cfg.SessionV2 = "auto"
+	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "INFO"
 	}

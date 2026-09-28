@@ -127,7 +127,7 @@ func (c *Client) new_stream(streamID uint16, conn net.Conn, targetPayload []byte
 	}
 
 	// Initialize and start the highly-optimized ARQ engine (Ported from Python)
-	mtu := c.syncedUploadMTU
+	mtu := c.uploadPayloadMTU()
 	if mtu <= 0 {
 		mtu = 1200 // Safe default
 	}
@@ -574,7 +574,7 @@ func (c *Client) InitVirtualStream0() {
 		CreateTime: time.Now(),
 	}
 
-	mtu := c.syncedUploadMTU
+	mtu := c.uploadPayloadMTU()
 	if mtu <= 0 {
 		mtu = 1200
 	}

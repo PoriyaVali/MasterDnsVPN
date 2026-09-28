@@ -16,12 +16,13 @@ import (
 	"net"
 	"time"
 
-	"masterdnsvpn-go/internal/netutil"
 	"masterdnsvpn-go/internal/arq"
 	"masterdnsvpn-go/internal/client/handlers"
 	DnsParser "masterdnsvpn-go/internal/dnsparser"
 	Enums "masterdnsvpn-go/internal/enums"
 	fragmentStore "masterdnsvpn-go/internal/fragmentstore"
+	"masterdnsvpn-go/internal/netutil"
+	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
 const clientRXDropLogInterval = 2 * time.Second
@@ -241,6 +242,7 @@ func (c *Client) resetSessionState(resetSessionCookie bool) {
 	}
 	c.sessionReady = false
 	c.sessionID = 0
+	c.sessionKeys.Store(nil)
 	if resetSessionCookie {
 		c.sessionCookie = 0
 	}
@@ -891,7 +893,7 @@ func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr, localAddr s
 	// c.log.Debugf("Inbound packet from %v (%d bytes)", addr, len(data))
 
 	// 1. Extract VPN Packet from DNS Response
-	vpnPacket, err := DnsParser.ExtractVPNResponse(data, c.responseMode == mtuProbeBase64Reply)
+	vpnPacket, trusted, err := c.decodeInbound(data)
 	if err != nil {
 		if errors.Is(err, DnsParser.ErrTXTAnswerMissing) {
 			receivedAt := time.Now()
@@ -926,6 +928,11 @@ func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr, localAddr s
 		time.Now(),
 		0,
 	)
+	if !trusted {
+		// The resolver did answer (so it is credited above), but not with
+		// anything this session will act on.
+		return
+	}
 	// if c.log != nil && c.log.Enabled(logger.LevelDebug) && vpnPacket.PacketType != Enums.PACKET_PONG {
 	// 	if vpnPacket.PacketType == Enums.PACKET_STREAM_DATA_ACK {
 	// 		c.log.Debugf("Client received ACK | Stream: %d | Seq: %d", vpnPacket.StreamID, vpnPacket.SequenceNum)
@@ -948,4 +955,39 @@ func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr, localAddr s
 		c.log.Debugf("\U0001F6A8 <red>Handler execution failed: %v</red>", err)
 	}
 
+}
+
+// decodeInbound reads a tunnel response. trusted=false means it parsed but
+// must not be acted on.
+//
+// 🔴 A v2 session's server seals everything it sends. An unsealed packet
+// claiming to be session traffic was made by someone without the keys - it is
+// dropped before it can touch a stream.
+func (c *Client) decodeInbound(data []byte) (VpnProto.Packet, bool, error) {
+	var open func([]byte) ([]byte, bool)
+	keys := c.sessionKeys.Load()
+	if keys != nil {
+		open = keys.OpenDown
+	}
+	vpnPacket, sealed, err := DnsParser.ExtractVPNResponseWith(data, c.responseMode == mtuProbeBase64Reply, open)
+	if err != nil {
+		return vpnPacket, false, err
+	}
+	if keys != nil && !sealed && !acceptUnsealedInV2Session(vpnPacket.PacketType) {
+		return vpnPacket, false, nil
+	}
+	return vpnPacket, true, nil
+}
+
+// acceptUnsealedInV2Session lists what a v2 session still takes in clear: the
+// replies a server gives without knowing (or before having) the session's keys
+// - "that session is gone", "the node is full", and MTU probe answers. None of
+// them carries data, and each is checked by its own handler.
+func acceptUnsealedInV2Session(packetType uint8) bool {
+	switch packetType {
+	case Enums.PACKET_ERROR_DROP, Enums.PACKET_SESSION_BUSY, Enums.PACKET_MTU_UP_RES, Enums.PACKET_MTU_DOWN_RES:
+		return true
+	default:
+		return false
+	}
 }
