@@ -298,3 +298,27 @@ func TestLoadServerConfigFromJSONBase64WithOverridesAppliesBeforeFinalize(t *tes
 		t.Fatalf("unexpected override domain: %+v", cfg.Domain)
 	}
 }
+
+func TestServerConfigNXDomainBelowTunnelDefaultsOn(t *testing.T) {
+	if !DefaultServerConfig().NXDomainForNonTXTSubdomains {
+		t.Fatal("NXDOMAIN_FOR_NON_TXT_SUBDOMAINS must default to true")
+	}
+
+	dir := t.TempDir()
+	for body, want := range map[string]bool{
+		`DOMAIN = ["config.example.com"]`:                                            true,
+		"DOMAIN = [\"config.example.com\"]\nNXDOMAIN_FOR_NON_TXT_SUBDOMAINS = false": false,
+	} {
+		path := filepath.Join(dir, "server_config.toml")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("WriteFile config failed: %v", err)
+		}
+		cfg, err := LoadServerConfig(path)
+		if err != nil {
+			t.Fatalf("LoadServerConfig returned error: %v", err)
+		}
+		if cfg.NXDomainForNonTXTSubdomains != want {
+			t.Fatalf("%q: NXDomainForNonTXTSubdomains=%v want=%v", body, cfg.NXDomainForNonTXTSubdomains, want)
+		}
+	}
+}

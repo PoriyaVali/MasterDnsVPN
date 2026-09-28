@@ -96,6 +96,7 @@ func (m *Matcher) Match(parsed DnsParser.LitePacket) Decision {
 			Question:     q0,
 			RequestName:  requestName,
 			BaseDomain:   baseDomain,
+			Labels:       labels,
 			QuestionType: q0.Type,
 		}
 	}

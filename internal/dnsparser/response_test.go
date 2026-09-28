@@ -410,3 +410,38 @@ func encodeDNSName(name string) []byte {
 
 	return append(encoded, 0)
 }
+
+// NoData from the tunnel server is an authority's statement. Knot Resolver and
+// PowerDNS Recursor do not accept it without AA.
+func TestBuildNoDataResponseIsAuthoritative(t *testing.T) {
+	request := buildDNSQuery(0x7171, "v.example.com", Enums.DNS_RECORD_TYPE_A, true)
+	for name, build := range map[string]func() ([]byte, error){
+		"full": func() ([]byte, error) { return BuildNoDataResponse(request) },
+		"lite": func() ([]byte, error) {
+			parsed, err := ParseDNSRequestLite(request)
+			if err != nil {
+				return nil, err
+			}
+			return BuildNoDataResponseFromLite(request, parsed)
+		},
+		"formerr": func() ([]byte, error) {
+			parsed, err := ParseDNSRequestLite(request)
+			if err != nil {
+				return nil, err
+			}
+			return BuildAuthoritativeFormatErrorResponseFromLite(request, parsed)
+		},
+	} {
+		response, err := build()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		flags := binary.BigEndian.Uint16(response[2:4])
+		if flags&(1<<10) == 0 || flags&(1<<7) != 0 {
+			t.Fatalf("%s: want AA set and RA clear, flags=%#04x", name, flags)
+		}
+		if flags&(1<<8) == 0 {
+			t.Fatalf("%s: RD must be copied", name)
+		}
+	}
+}

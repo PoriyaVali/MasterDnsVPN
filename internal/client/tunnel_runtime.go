@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"masterdnsvpn-go/internal/dnsparser"
@@ -72,8 +73,9 @@ func (c *Client) exchangeUDPQueryWithConn(conn *net.UDPConn, packet []byte, time
 	}
 	expectedID := binary.BigEndian.Uint16(packet[:2])
 
-	buffer := c.getRuntimeUDPBuffer()
-	defer c.putRuntimeUDPBuffer(buffer)
+	bufferRef := c.getRuntimeUDPBuffer()
+	defer c.putRuntimeUDPBuffer(bufferRef)
+	buffer := *bufferRef
 	defer func() {
 		_ = conn.SetDeadline(time.Time{})
 	}()
@@ -211,41 +213,43 @@ func (c *Client) closeResolverConnPools() {
 	}
 }
 
-// getRuntimeUDPBuffer retrieves a byte slice from the internal buffer pool.
-// This is used to reduce allocations during high-frequency network operations.
-func (c *Client) getRuntimeUDPBuffer() []byte {
-	if c == nil {
-		return make([]byte, RuntimeUDPReadBufferSize)
+// getRuntimeUDPBuffer takes a RuntimeUDPReadBufferSize buffer from the
+// internal pool, to spare an allocation per packet. The pool holds pointers:
+// putting a bare slice back would allocate its header every time.
+func (c *Client) getRuntimeUDPBuffer() *[]byte {
+	if c != nil {
+		if buf, _ := c.udpBufferPool.Get().(*[]byte); buf != nil && len(*buf) == RuntimeUDPReadBufferSize {
+			return buf
+		}
 	}
-
-	buf, _ := c.udpBufferPool.Get().([]byte)
-	if cap(buf) < RuntimeUDPReadBufferSize {
-		return make([]byte, RuntimeUDPReadBufferSize)
-	}
-
-	return buf[:RuntimeUDPReadBufferSize]
+	buf := make([]byte, RuntimeUDPReadBufferSize)
+	return &buf
 }
 
-// putRuntimeUDPBuffer returns a byte slice to the internal buffer pool.
-func (c *Client) putRuntimeUDPBuffer(buf []byte) {
-	if c == nil || buf == nil {
+// putRuntimeUDPBuffer returns a buffer from getRuntimeUDPBuffer to the pool.
+func (c *Client) putRuntimeUDPBuffer(buf *[]byte) {
+	if c == nil || buf == nil || len(*buf) != RuntimeUDPReadBufferSize {
 		return
 	}
-	if cap(buf) < RuntimeUDPReadBufferSize {
-		return
-	}
-
-	c.udpBufferPool.Put(buf[:RuntimeUDPReadBufferSize])
+	c.udpBufferPool.Put(buf)
 }
 
-// protectPath is set once at startup from the config. dialUDPResolver is a
-// free function with no client to ask, and threading the path through every
-// caller would spread an Android detail across code that has no other reason
-// to know about it.
-var protectPath string
+// protectPath is set at startup from the config. dialUDPResolver is a free
+// function with no client to ask, and threading the path through every caller
+// would spread an Android detail across code that has no other reason to know
+// about it. It is atomic because a host app can start a new client while the
+// old one's goroutines are still dialing.
+var protectPath atomic.Pointer[string]
 
 // SetProtectPath records where the VPN app listens to protect our sockets.
-func SetProtectPath(p string) { protectPath = p }
+func SetProtectPath(p string) { protectPath.Store(&p) }
+
+func currentProtectPath() string {
+	if p := protectPath.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
 
 // dialUDPResolver resolves the resolver address and establishes a new UDP connection.
 func dialUDPResolver(resolverLabel string) (*net.UDPConn, error) {
@@ -255,7 +259,7 @@ func dialUDPResolver(resolverLabel string) (*net.UDPConn, error) {
 	}
 	// Same reason as the listeners in async_runtime: this is our own path out
 	// to a resolver and must not go through the tunnel we are providing.
-	d := net.Dialer{Control: netutil.Control(protectPath)}
+	d := net.Dialer{Control: netutil.Control(currentProtectPath())}
 	conn, err := d.Dial("udp", addr.String())
 	if err != nil {
 		return nil, err

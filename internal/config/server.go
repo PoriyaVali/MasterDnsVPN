@@ -30,6 +30,8 @@ type ServerConfig struct {
 	UDPHost                           string   `toml:"UDP_HOST"`
 	UDPPort                           int      `toml:"UDP_PORT"`
 	UDPReaders                        int      `toml:"UDP_READERS"`
+	TCPEnabled                        bool     `toml:"TCP_ENABLED"`
+	TCPMaxConnections                 int      `toml:"TCP_MAX_CONNECTIONS"`
 	SocketBufferSize                  int      `toml:"SOCKET_BUFFER_SIZE"`
 	MaxConcurrentRequests             int      `toml:"MAX_CONCURRENT_REQUESTS"`
 	DNSRequestWorkers                 int      `toml:"DNS_REQUEST_WORKERS"`
@@ -66,6 +68,7 @@ type ServerConfig struct {
 	ForwardPort                       int      `toml:"FORWARD_PORT"`
 	Domain                            []string `toml:"DOMAIN"`
 	MinVPNLabelLength                 int      `toml:"MIN_VPN_LABEL_LENGTH"`
+	NXDomainForNonTXTSubdomains       bool     `toml:"NXDOMAIN_FOR_NON_TXT_SUBDOMAINS"`
 	SupportedUploadCompressionTypes   []int    `toml:"SUPPORTED_UPLOAD_COMPRESSION_TYPES"`
 	SupportedDownloadCompressionTypes []int    `toml:"SUPPORTED_DOWNLOAD_COMPRESSION_TYPES"`
 	DataEncryptionMethod              int      `toml:"DATA_ENCRYPTION_METHOD"`
@@ -120,6 +123,8 @@ func defaultServerConfig() ServerConfig {
 		UDPHost:                           "0.0.0.0",
 		UDPPort:                           53,
 		UDPReaders:                        8,
+		TCPEnabled:                        true,
+		TCPMaxConnections:                 512,
 		SocketBufferSize:                  8 * 1024 * 1024,
 		MaxConcurrentRequests:             16384,
 		DNSRequestWorkers:                 24,
@@ -156,6 +161,7 @@ func defaultServerConfig() ServerConfig {
 		ForwardPort:                       1080,
 		Domain:                            nil,
 		MinVPNLabelLength:                 3,
+		NXDomainForNonTXTSubdomains:       true,
 		SupportedUploadCompressionTypes:   []int{0, 1, 2, 3},
 		SupportedDownloadCompressionTypes: []int{0, 1, 2, 3},
 		DataEncryptionMethod:              1,
@@ -439,6 +445,9 @@ func finalizeServerConfig(cfg ServerConfig) (ServerConfig, error) {
 
 	if cfg.MinVPNLabelLength <= 0 {
 		cfg.MinVPNLabelLength = 3
+	}
+	if cfg.TCPMaxConnections <= 0 {
+		cfg.TCPMaxConnections = 512
 	}
 
 	cfg.SupportedUploadCompressionTypes = normalizeCompressionTypeList(cfg.SupportedUploadCompressionTypes)

@@ -12,12 +12,14 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"masterdnsvpn-go/internal/arq"
 	dnsCache "masterdnsvpn-go/internal/dnscache"
 	dnsParser "masterdnsvpn-go/internal/dnsparser"
+	"masterdnsvpn-go/internal/dnstcp"
 	Enums "masterdnsvpn-go/internal/enums"
 	"masterdnsvpn-go/internal/netutil"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
@@ -125,6 +127,7 @@ func (c *Client) expireDNSWaitersLocked(now time.Time) {
 type DNSListener struct {
 	client   *Client
 	conn     *net.UDPConn
+	tcp      net.Listener
 	stopChan chan struct{}
 	stopOnce sync.Once
 }
@@ -188,7 +191,89 @@ func (l *DNSListener) Start(ctx context.Context, ip string, port int) error {
 		}
 	}()
 
+	l.startTCP(ctx, ip, actualPort)
 	return nil
+}
+
+// DNS over TCP on the same address. Applications retry over TCP when an
+// answer comes back truncated, and some resolvers are set to use only TCP;
+// without a listener those lookups failed. A port already taken for TCP only
+// costs this, not the UDP listener.
+const (
+	dnsTCPIdleTimeout  = 30 * time.Second
+	dnsTCPWriteTimeout = 10 * time.Second
+	dnsTCPMaxConns     = 256
+	dnsTCPBacklog      = 64
+)
+
+func (l *DNSListener) startTCP(ctx context.Context, ip string, port int) {
+	ln, err := net.Listen("tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+	if err != nil {
+		if l.client != nil && l.client.log != nil {
+			l.client.log.Warnf("⚠️ <yellow>DNS over TCP not available on %s:%d: %v</yellow>", ip, port, err)
+		}
+		return
+	}
+	l.tcp = ln
+	go func() {
+		slots := make(chan struct{}, dnsTCPMaxConns)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				select {
+				case <-l.stopChan:
+					return
+				case <-ctx.Done():
+					return
+				case <-time.After(50 * time.Millisecond):
+				}
+				continue
+			}
+			select {
+			case slots <- struct{}{}:
+			default:
+				_ = conn.Close()
+				continue
+			}
+			go func() {
+				defer func() { <-slots }()
+				l.serveTCPConn(ctx, conn)
+			}()
+		}
+	}()
+}
+
+func (l *DNSListener) serveTCPConn(ctx context.Context, conn net.Conn) {
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	defer conn.Close()
+
+	// Answers can come long after the query (it went through the tunnel), so
+	// they are written by the connection's own writer, never by whoever
+	// delivers them.
+	writer := dnstcp.NewWriter(conn, dnsTCPBacklog, dnsTCPWriteTimeout)
+	defer writer.Close()
+
+	buf := make([]byte, 0xFFFF)
+	for {
+		select {
+		case <-l.stopChan:
+			return
+		default:
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(dnsTCPIdleTimeout))
+		n, err := dnstcp.ReadMessage(conn, buf)
+		if err != nil {
+			return
+		}
+		query := append([]byte(nil), buf[:n]...)
+		if l.client != nil {
+			l.client.ProcessDNSQuery(query, conn.RemoteAddr(), func(resp []byte) { writer.Send(resp) })
+		}
+	}
 }
 
 func dnsListenerShouldRetryRead(err error) bool {
@@ -219,6 +304,9 @@ func (l *DNSListener) Stop() {
 		if l.conn != nil {
 			_ = l.conn.Close()
 			l.conn = nil
+		}
+		if l.tcp != nil {
+			_ = l.tcp.Close()
 		}
 	})
 }

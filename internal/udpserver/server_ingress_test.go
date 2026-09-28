@@ -77,6 +77,56 @@ func TestHandlePacketKeepsUnsupportedAllowedAQueryAsNoData(t *testing.T) {
 	}
 }
 
+// With the switch on (the default), a non-TXT query below the tunnel domain is
+// NXDOMAIN, so a QNAME-minimising resolver stops walking the tunnel labels.
+// The domain itself, and TXT queries, are never NXDOMAIN.
+func TestHandlePacketNXDOMAINBelowTunnelDomain(t *testing.T) {
+	server := &Server{
+		domainMatcher:       domainMatcher.New([]string{"vpn.example.com"}, 3),
+		nxdomainBelowTunnel: true,
+	}
+	cases := []struct {
+		name  string
+		qtype uint16
+		rcode uint8
+	}{
+		{"probe.vpn.example.com", Enums.DNS_RECORD_TYPE_A, Enums.DNSR_CODE_NAME_ERROR},
+		{"_.vpn.example.com", Enums.DNS_RECORD_TYPE_A, Enums.DNSR_CODE_NAME_ERROR},
+		{"a.b.vpn.example.com", Enums.DNS_RECORD_TYPE_NS, Enums.DNSR_CODE_NAME_ERROR},
+		{"vpn.example.com", Enums.DNS_RECORD_TYPE_A, Enums.DNSR_CODE_NO_ERROR},
+		{"vpn.example.com", Enums.DNS_RECORD_TYPE_NS, Enums.DNSR_CODE_NO_ERROR},
+		{"vpn.example.com", Enums.DNS_RECORD_TYPE_TXT, Enums.DNSR_CODE_NO_ERROR},
+		{"ab.vpn.example.com", Enums.DNS_RECORD_TYPE_TXT, Enums.DNSR_CODE_NO_ERROR},
+	}
+	for _, c := range cases {
+		response := server.handlePacket(buildTestDNSQuery(0x7171, c.name, c.qtype), "")
+		if response == nil {
+			t.Fatalf("%s/%d: no response", c.name, c.qtype)
+		}
+		flags := binary.BigEndian.Uint16(response[2:4])
+		if got := uint8(flags & 0x000F); got != c.rcode {
+			t.Fatalf("%s/%d: rcode=%d want=%d", c.name, c.qtype, got, c.rcode)
+		}
+		if flags&(1<<10) == 0 || flags&(1<<7) != 0 {
+			t.Fatalf("%s/%d: want AA set and RA clear, flags=%#04x", c.name, c.qtype, flags)
+		}
+		if got := binary.BigEndian.Uint16(response[6:8]) + binary.BigEndian.Uint16(response[8:10]); got != 0 {
+			t.Fatalf("%s/%d: want no answer or authority records, got %d", c.name, c.qtype, got)
+		}
+	}
+}
+
+func TestHandlePacketNoDataIsAuthoritative(t *testing.T) {
+	server := &Server{
+		domainMatcher: domainMatcher.New([]string{"vpn.example.com"}, 3),
+	}
+	response := server.handlePacket(buildTestDNSQuery(0x6262, "probe.vpn.example.com", Enums.DNS_RECORD_TYPE_A), "")
+	flags := binary.BigEndian.Uint16(response[2:4])
+	if flags&(1<<10) == 0 || flags&(1<<7) != 0 {
+		t.Fatalf("want AA set and RA clear, flags=%#04x", flags)
+	}
+}
+
 func buildTestDNSQuery(id uint16, name string, qtype uint16) []byte {
 	qname := encodeTestDNSName(name)
 	packet := make([]byte, 12+len(qname)+4)

@@ -46,13 +46,30 @@ func (s *Server) handlePacket(packet []byte, clientIP string) []byte {
 	case domainMatcher.ActionFormatError:
 		return s.buildFormatErrorResponseLiteLogged(packet, parsed, decision.Reason)
 	case domainMatcher.ActionNoData:
-		if decision.Reason == "unauthorized-domain" {
+		if decision.Reason == "unauthorized-domain" || s.nameErrorBelowTunnelDomain(decision) {
 			return s.buildNameErrorResponseLiteLogged(packet, parsed, decision.Reason)
 		}
 		return s.buildNoDataResponseLiteLogged(packet, parsed, decision.Reason)
 	default:
 		return s.buildNoDataResponseLiteLogged(packet, parsed, "domain-match-unknown-action")
 	}
+}
+
+// nameErrorBelowTunnelDomain says whether a query for a name under a tunnel
+// domain, of a type other than TXT, gets NXDOMAIN instead of NoData.
+//
+// Those queries come from resolvers doing QNAME minimisation: they walk down
+// the tunnel's labels one at a time (A or NS queries for each ancestor) before
+// they ask the real TXT query. NoData tells them each ancestor exists, so they
+// keep walking, one round trip per label. NXDOMAIN makes Unbound, BIND and
+// PowerDNS give up the walk and send the full TXT query at once. It is sent
+// without an SOA, so it is not cached (RFC 2308) and cannot hide the TXT name
+// that is asked next; resolvers only cut the tree below an NXDOMAIN (RFC 8020)
+// when it is DNSSEC-validated. The tunnel domain itself keeps NoData.
+func (s *Server) nameErrorBelowTunnelDomain(decision domainMatcher.Decision) bool {
+	return s.nxdomainBelowTunnel &&
+		decision.Reason == "unsupported-qtype" &&
+		decision.Labels != ""
 }
 
 func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacket, decision domainMatcher.Decision, clientIP string) []byte {

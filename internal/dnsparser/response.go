@@ -28,6 +28,10 @@ func BuildEmptyNoErrorResponseFromLite(request []byte, parsed LitePacket) ([]byt
 	return buildResponseWithRCodeLite(request, parsed, Enums.DNSR_CODE_NO_ERROR)
 }
 
+// BuildNoDataResponse answers, as the zone's authority, that the name exists
+// but holds no record of the asked type. The tunnel server sends it for its own
+// domains; resolvers such as Knot and PowerDNS Recursor refuse a non-AA NoData
+// from an authoritative server and retry or fail the lookup.
 func BuildNoDataResponse(request []byte) ([]byte, error) {
 	parsed, err := ParseDNSRequestLite(request)
 	if err != nil {
@@ -50,6 +54,12 @@ func BuildFormatErrorResponse(request []byte) ([]byte, error) {
 
 func BuildFormatErrorResponseFromLite(request []byte, parsed LitePacket) ([]byte, error) {
 	return buildResponseWithRCodeLite(request, parsed, Enums.DNSR_CODE_FORMAT_ERROR)
+}
+
+// BuildAuthoritativeFormatErrorResponseFromLite is FORMERR as the tunnel
+// server sends it to resolvers: AA set, RA clear, like its other answers.
+func BuildAuthoritativeFormatErrorResponseFromLite(request []byte, parsed LitePacket) ([]byte, error) {
+	return buildAuthoritativeResponseWithRCodeLite(request, parsed, Enums.DNSR_CODE_FORMAT_ERROR)
 }
 
 func BuildRefusedResponseFromLite(request []byte, parsed LitePacket) ([]byte, error) {
@@ -145,7 +155,7 @@ func buildResponseWithFlagsLite(request []byte, parsed LitePacket, flags uint16)
 }
 
 func buildNoDataResponseLite(request []byte, parsed LitePacket) ([]byte, error) {
-	return buildResponseWithRCodeLite(request, parsed, Enums.DNSR_CODE_NO_ERROR)
+	return buildAuthoritativeResponseWithRCodeLite(request, parsed, Enums.DNSR_CODE_NO_ERROR)
 }
 
 func getARCount(optLen int) int {

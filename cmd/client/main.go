@@ -219,9 +219,9 @@ func main() {
 	var app *client.Client
 	switch {
 	case opts.jsonBase64 != "":
-		// ⚠️ `=` not `:=`: a fresh err here shadowed the outer one, so a failed
-		// BootstrapLoadedConfig below was never seen and the client went on with a
-		// nil app.
+		// err is the function's, not a new one: the bootstrap error below
+		// must reach the check after the switch, or a failed bootstrap goes
+		// on with a nil client.
 		var cfg config.ClientConfig
 		cfg, err = config.LoadClientConfigFromJSONBase64WithOverrides(opts.jsonBase64, overrides)
 		if err != nil {
