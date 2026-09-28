@@ -43,6 +43,7 @@ type deferredSessionProcessor struct {
 	sessionPendingCap  int32
 	sessionPressureLog throttledLogState
 	backlogHighLog     throttledLogState
+	panicLog           throttledLogState
 	nextWorker         int
 }
 
@@ -236,8 +237,12 @@ func (p *deferredSessionProcessor) runDeferredWorker(ctx context.Context, worker
 					cancel()
 					worker.pending.Add(-1)
 					p.finishLane(task.lane, workerIdx)
-					if recovered := recover(); recovered != nil && p.log != nil {
-						p.log.Debugf(
+					// A panic here is a bug, not an expected outcome: it is
+					// reported at error level (it used to be debug, so it was
+					// never seen), at most once a second per worker.
+					if recovered := recover(); recovered != nil && p.log != nil &&
+						p.panicLog.allow(fmt.Sprintf("worker:%d", workerIdx), time.Now(), time.Second) {
+						p.log.Errorf(
 							"Deferred Session Worker Panic, Worker: %d, Session: %d, Stream: %d, Error: %v",
 							workerIdx+1,
 							task.lane.sessionID,

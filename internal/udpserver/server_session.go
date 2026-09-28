@@ -860,12 +860,7 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 	}
 	if err != nil {
 		if err == ErrSessionTableFull {
-			if s.log != nil {
-				s.log.Errorf(
-					"\U0001F6AB <red>Session Table Full Request: <cyan>SESSION_INIT</cyan>, Domain: <cyan>%s</cyan></red>",
-					decision.RequestName,
-				)
-			}
+			s.logSessionTableFull()
 			return s.buildSessionBusyResponse(questionPacket, decision.RequestName, initSignature[0], initSignature[6:10])
 		}
 		return nil
@@ -995,4 +990,29 @@ func (s *Server) handleMTUDownRequest(questionPacket []byte, _ DnsParser.LitePac
 	}
 
 	return response
+}
+
+// sessionTableFullLogInterval is how often a full session table is reported.
+const sessionTableFullLogInterval = 10 * time.Second
+
+// logSessionTableFull reports refused SESSION_INITs at most once per
+// interval, with how many were refused since the last report. Each refusal
+// used to write its own error line: 45 clients over capacity wrote 2,814
+// lines in two and a half minutes, and anyone holding the node key could
+// fill the disk that way on purpose.
+func (s *Server) logSessionTableFull() {
+	refused := s.sessionTableFullRefused.Add(1)
+	if s.log == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := s.sessionTableFullLastLog.Load()
+	if now-last < int64(sessionTableFullLogInterval) || !s.sessionTableFullLastLog.CompareAndSwap(last, now) {
+		return
+	}
+	s.sessionTableFullRefused.Add(-refused)
+	s.log.Errorf(
+		"\U0001F6AB <red>Session Table Full: refused <cyan>%d</cyan> SESSION_INIT(s) in the last %s; a node holds at most %d sessions</red>",
+		refused, sessionTableFullLogInterval, maxServerSessionSlots,
+	)
 }

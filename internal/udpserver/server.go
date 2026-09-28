@@ -89,6 +89,8 @@ type Server struct {
 	lastDeferredDropLogUnix  atomic.Int64
 	pongNonce                atomic.Uint32
 	invalidDropMode          atomic.Uint32
+	sessionTableFullRefused  atomic.Int64
+	sessionTableFullLastLog  atomic.Int64
 }
 
 type request struct {
