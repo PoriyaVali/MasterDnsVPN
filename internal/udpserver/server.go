@@ -124,6 +124,10 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 	sessions := newSessionStore(cfg.EffectiveSessionOrphanQueueInitialCap(), cfg.EffectiveStreamQueueInitialCapacity(), cfg.SessionInitReuseTTL(), cfg.RecentlyClosedStreamTTL(), cfg.RecentlyClosedStreamCap)
 	sessions.maxActiveSessions = cfg.MaxAllowedClientActiveSessions
 	sessions.maxActiveStreams = cfg.MaxAllowedClientActiveStreams
+	sessions.maxSessionsPerUser = cfg.MaxSessionsPerUser
+	if retention := cfg.ClosedSessionRetention(); retention > 0 {
+		sessions.closedRetention = retention
+	}
 	return &Server{
 		cfg:                    cfg,
 		log:                    log,

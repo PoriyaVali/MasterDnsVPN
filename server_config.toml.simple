@@ -256,6 +256,17 @@ ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS = 90.0
 MAX_ALLOWED_CLIENT_ACTIVE_SESSION = 255
 MAX_ALLOWED_CLIENT_ACTIVE_STREAMS_PER_SESSION = 2000
 
+# Most live sessions one subscriber may hold (0 = no cap). A new one replaces
+# their longest-silent session once it has been quiet 30s. A full table also
+# evicts the node's longest-silent session once it has been quiet 60s. Both
+# exist because session IDs are 8 bits: without them, clients that vanish
+# without closing (phones changing network) could lock everyone out.
+MAX_SESSIONS_PER_USER = 8
+
+# Refuse session protocol v1 from registered users. Turn on only once every
+# client in the field speaks v2 (SESSION_V2 = "auto" or "on").
+REQUIRE_SESSION_V2 = false
+
 # ------------------------------------------------------------------------------
 # 8.1) Client Policy Sync Limits
 # What this section does:
