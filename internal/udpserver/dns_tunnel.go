@@ -17,6 +17,7 @@ import (
 
 	"masterdnsvpn-go/internal/dnscache"
 	DnsParser "masterdnsvpn-go/internal/dnsparser"
+	"masterdnsvpn-go/internal/dnstcp"
 	Enums "masterdnsvpn-go/internal/enums"
 	"masterdnsvpn-go/internal/inflight"
 )
@@ -450,12 +451,13 @@ func (s *Server) queryOneUpstream(upstream string, rawQuery []byte, timeout time
 		return nil, err
 	}
 
-	buffer := s.dnsUpstreamBufferPool.Get().([]byte)
+	bufferRef := s.dnsUpstreamBufferPool.Get().(*[]byte)
+	defer s.dnsUpstreamBufferPool.Put(bufferRef)
+	buffer := *bufferRef
 	n, readErr := conn.Read(buffer)
 	_ = conn.Close()
 
 	if readErr != nil || n == 0 {
-		s.dnsUpstreamBufferPool.Put(buffer)
 		if readErr == nil {
 			return nil, ErrInvalidDNSUpstream
 		}
@@ -464,15 +466,35 @@ func (s *Server) queryOneUpstream(upstream string, rawQuery []byte, timeout time
 
 	if len(rawQuery) >= 2 && n >= 2 {
 		if buffer[0] != rawQuery[0] || buffer[1] != rawQuery[1] {
-			s.dnsUpstreamBufferPool.Put(buffer)
 			return nil, ErrInvalidDNSUpstream
 		}
 	}
 
 	response := make([]byte, n)
 	copy(response, buffer[:n])
-	s.dnsUpstreamBufferPool.Put(buffer)
+
+	// Truncated: the full answer is only available over TCP. If that fails,
+	// the truncated one is still better than none; its TC bit tells the
+	// application what it got.
+	if n >= 4 && response[2]&dnsFlagTC != 0 {
+		if full, err := queryUpstreamTCP(upstream, rawQuery, timeout); err == nil {
+			return full, nil
+		}
+	}
 	return response, nil
+}
+
+// dnsFlagTC is the truncation bit in the high byte of the DNS flags.
+const dnsFlagTC = 0x02
+
+// queryUpstreamTCP asks one upstream over TCP (RFC 7766), for answers too
+// large for UDP.
+func queryUpstreamTCP(upstream string, rawQuery []byte, timeout time.Duration) ([]byte, error) {
+	host, port, err := splitHostPortDefault53(upstream)
+	if err != nil {
+		return nil, err
+	}
+	return dnstcp.Exchange(nil, net.JoinHostPort(host, port), rawQuery, timeout)
 }
 
 func newUDPUpstreamConn(endpoint string) (*net.UDPConn, error) {

@@ -30,6 +30,8 @@ type ServerConfig struct {
 	UDPHost                           string   `toml:"UDP_HOST"`
 	UDPPort                           int      `toml:"UDP_PORT"`
 	UDPReaders                        int      `toml:"UDP_READERS"`
+	TCPEnabled                        bool     `toml:"TCP_ENABLED"`
+	TCPMaxConnections                 int      `toml:"TCP_MAX_CONNECTIONS"`
 	SocketBufferSize                  int      `toml:"SOCKET_BUFFER_SIZE"`
 	MaxConcurrentRequests             int      `toml:"MAX_CONCURRENT_REQUESTS"`
 	DNSRequestWorkers                 int      `toml:"DNS_REQUEST_WORKERS"`
@@ -119,6 +121,8 @@ func defaultServerConfig() ServerConfig {
 		UDPHost:                           "0.0.0.0",
 		UDPPort:                           53,
 		UDPReaders:                        8,
+		TCPEnabled:                        true,
+		TCPMaxConnections:                 512,
 		SocketBufferSize:                  8 * 1024 * 1024,
 		MaxConcurrentRequests:             16384,
 		DNSRequestWorkers:                 24,
@@ -437,6 +441,9 @@ func finalizeServerConfig(cfg ServerConfig) (ServerConfig, error) {
 
 	if cfg.MinVPNLabelLength <= 0 {
 		cfg.MinVPNLabelLength = 3
+	}
+	if cfg.TCPMaxConnections <= 0 {
+		cfg.TCPMaxConnections = 512
 	}
 
 	cfg.SupportedUploadCompressionTypes = normalizeCompressionTypeList(cfg.SupportedUploadCompressionTypes)

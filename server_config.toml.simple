@@ -52,6 +52,15 @@ SUPPORTED_DOWNLOAD_COMPRESSION_TYPES = [0, 1, 2, 3]
 UDP_HOST = "0.0.0.0"
 UDP_PORT = 53
 
+# Also answer DNS over TCP on the same host and port (RFC 7766). Resolvers use
+# TCP when they are configured to, when UDP is blocked on their path, or to
+# retry a truncated answer. If the TCP port is already taken the server logs a
+# warning and keeps serving UDP.
+TCP_ENABLED = true
+
+# Most TCP connections served at once; further ones are closed right away.
+TCP_MAX_CONNECTIONS = 512
+
 # UDP readers, DNS workers, and front-door request queue are smart-sized
 # internally. Only override them if you are profiling a specific host.
 UDP_READERS = 6
