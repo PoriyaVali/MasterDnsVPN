@@ -204,7 +204,7 @@ func BuildTXTResponsePacket(questionPacket []byte, answerName string, answerPayl
 	questionBytes, questionCount, questionEndOffset := extractQuestionSection(questionPacket, header)
 	optStart, optLen := findOPTRecordRange(questionPacket, header, questionEndOffset)
 
-	nameBytes, err := responseAnswerNameBytes(questionPacket, answerName)
+	nameBytes, err := responseAnswerNameBytes(questionPacket, questionBytes, answerName)
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +221,7 @@ func BuildTXTResponsePacket(questionPacket []byte, answerName string, answerPayl
 
 	response := make([]byte, dnsHeaderSize+len(questionBytes)+answerLen+optLen)
 	binary.BigEndian.PutUint16(response[0:2], header.ID)
-	binary.BigEndian.PutUint16(response[2:4], buildResponseFlags(header.Flags, Enums.DNSR_CODE_NO_ERROR))
+	binary.BigEndian.PutUint16(response[2:4], buildAuthoritativeResponseFlags(header.Flags, Enums.DNSR_CODE_NO_ERROR))
 	binary.BigEndian.PutUint16(response[4:6], questionCount)
 	binary.BigEndian.PutUint16(response[6:8], uint16(len(answerPayloads)))
 	binary.BigEndian.PutUint16(response[8:10], 0)
@@ -230,6 +230,9 @@ func BuildTXTResponsePacket(questionPacket []byte, answerName string, answerPayl
 	offset := dnsHeaderSize
 	offset += copy(response[offset:], questionBytes)
 	firstAnswerNameOffset := offset
+	if isQuestionNamePointer(nameBytes) {
+		firstAnswerNameOffset = dnsHeaderSize
+	}
 
 	for i, payload := range answerPayloads {
 		if useAnswerNameCompression && i > 0 && firstAnswerNameOffset <= 0x3FFF {
@@ -270,20 +273,30 @@ func BuildVPNResponsePacket(questionPacket []byte, answerName string, packet Vpn
 		return nil, err
 	}
 
-	maxChunk := maxTXTAnswerPayload
-	if baseEncode {
-		maxChunk = maxTXTEncodedChunk
-	}
-	if len(rawFrame) <= maxChunk {
-		return buildSingleTXTResponsePacket(questionPacket, answerName, buildTXTAnswerChunk(rawFrame, baseEncode))
-	}
-
-	answerPayloads, err := buildTXTAnswerChunks(rawFrame, baseEncode)
+	answer, err := buildTXTAnswerRData(rawFrame, baseEncode)
 	if err != nil {
 		return nil, err
 	}
+	return buildSingleTXTResponsePacket(questionPacket, answerName, answer)
+}
 
-	return BuildTXTResponsePacket(questionPacket, answerName, answerPayloads)
+// buildTXTAnswerRData carries the whole frame in one TXT record, split into
+// as many 255-byte character-strings as it needs. Clients have always read a
+// single record by joining its strings, so this is what they already accept;
+// against one record per 255 bytes it saves 12 bytes of record header and a
+// chunk byte for every extra string, and a resolver cannot reorder or drop
+// part of it.
+func buildTXTAnswerRData(rawFrame []byte, baseEncode bool) ([]byte, error) {
+	data := rawFrame
+	if baseEncode {
+		data = make([]byte, baseCodec.EncodedRawBase64Len(len(rawFrame)))
+		baseCodec.EncodeRawBase64Into(data, rawFrame)
+	}
+	rdata := appendLengthPrefixedTXT(data)
+	if len(rdata) > 0xFFFF {
+		return nil, ErrTXTAnswerTooLarge
+	}
+	return rdata, nil
 }
 
 func buildSingleTXTResponsePacket(questionPacket []byte, answerName string, answerPayload []byte) ([]byte, error) {
@@ -295,14 +308,14 @@ func buildSingleTXTResponsePacket(questionPacket []byte, answerName string, answ
 	questionBytes, questionCount, questionEndOffset := extractQuestionSection(questionPacket, header)
 	optStart, optLen := findOPTRecordRange(questionPacket, header, questionEndOffset)
 
-	nameBytes, err := responseAnswerNameBytes(questionPacket, answerName)
+	nameBytes, err := responseAnswerNameBytes(questionPacket, questionBytes, answerName)
 	if err != nil {
 		return nil, err
 	}
 
 	response := make([]byte, dnsHeaderSize+len(questionBytes)+len(nameBytes)+10+len(answerPayload)+optLen)
 	binary.BigEndian.PutUint16(response[0:2], header.ID)
-	binary.BigEndian.PutUint16(response[2:4], buildResponseFlags(header.Flags, Enums.DNSR_CODE_NO_ERROR))
+	binary.BigEndian.PutUint16(response[2:4], buildAuthoritativeResponseFlags(header.Flags, Enums.DNSR_CODE_NO_ERROR))
 	binary.BigEndian.PutUint16(response[4:6], questionCount)
 	binary.BigEndian.PutUint16(response[6:8], 1)
 	binary.BigEndian.PutUint16(response[8:10], 0)
@@ -325,10 +338,23 @@ func buildSingleTXTResponsePacket(questionPacket []byte, answerName string, answ
 	return response, nil
 }
 
-func responseAnswerNameBytes(questionPacket []byte, answerName string) ([]byte, error) {
-	rawName, parsedName, ok := extractFirstQuestionNameWire(questionPacket)
-	if ok && sameDNSName(parsedName, answerName) {
-		return rawName, nil
+// questionNamePointer names the answer by pointing at the question's name,
+// which always starts right after the header. It is two bytes instead of the
+// full name (up to 255), and it keeps the question's exact letter case, which
+// resolvers that randomise case (0x20) check the answer against.
+var questionNamePointer = []byte{0xC0, dnsHeaderSize}
+
+func isQuestionNamePointer(name []byte) bool {
+	return len(name) == 2 && name[0] == questionNamePointer[0] && name[1] == questionNamePointer[1]
+}
+
+// responseAnswerNameBytes is the answer's owner name: a pointer to the question
+// when it is the question's name and the question is copied into the response,
+// otherwise the name itself.
+func responseAnswerNameBytes(questionPacket []byte, questionBytes []byte, answerName string) ([]byte, error) {
+	_, parsedName, ok := extractFirstQuestionNameWire(questionPacket)
+	if ok && len(questionBytes) > 0 && sameDNSName(parsedName, answerName) {
+		return questionNamePointer, nil
 	}
 	return encodeDNSNameStrict(answerName)
 }
@@ -476,6 +502,9 @@ func BuildTunnelQuestionName(domain string, encodedFrame string) (string, error)
 	return name, nil
 }
 
+// buildTXTAnswerChunks splits a frame over several TXT records, each with a
+// chunk index. Servers before the single-record answer sent frames this way;
+// clients still read it, and the tests use it to check that they do.
 func buildTXTAnswerChunks(rawFrame []byte, baseEncode bool) ([][]byte, error) {
 	maxChunk := maxTXTAnswerPayload
 	if baseEncode {

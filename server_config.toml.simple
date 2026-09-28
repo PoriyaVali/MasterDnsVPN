@@ -15,6 +15,14 @@
 # Must match client DOMAINS.
 DOMAIN = ["v.domain.com"]
 
+# Answer non-TXT queries for names under DOMAIN (A, AAAA, NS, ...) with
+# NXDOMAIN instead of an empty answer. Resolvers that use QNAME minimisation
+# ask such a query for every label of a tunnel name before the real TXT query;
+# NXDOMAIN stops that walk after the first label, which saves round trips on
+# every request. The domain itself still answers with an empty NOERROR.
+# Set to false only if a resolver on your path stops working with it.
+NXDOMAIN_FOR_NON_TXT_SUBDOMAINS = true
+
 # How this server should handle new connections.
 # Allowed values:
 # "SOCKS5" = the client/program chooses the destination for each connection.
@@ -43,6 +51,15 @@ SUPPORTED_DOWNLOAD_COMPRESSION_TYPES = [0, 1, 2, 3]
 # UDP bind endpoint.
 UDP_HOST = "0.0.0.0"
 UDP_PORT = 53
+
+# Also answer DNS over TCP on the same host and port (RFC 7766). Resolvers use
+# TCP when they are configured to, when UDP is blocked on their path, or to
+# retry a truncated answer. If the TCP port is already taken the server logs a
+# warning and keeps serving UDP.
+TCP_ENABLED = true
+
+# Most TCP connections served at once; further ones are closed right away.
+TCP_MAX_CONNECTIONS = 512
 
 # UDP readers, DNS workers, and front-door request queue are smart-sized
 # internally. Only override them if you are profiling a specific host.
@@ -190,6 +207,11 @@ FORWARD_PORT = 0
 # 3 = AES-128-GCM
 # 4 = AES-192-GCM
 # 5 = AES-256-GCM
+# 0 and 1 encode the same packet as the same query name every time. Resolvers
+# that merge identical in-flight queries, or keep answers longer than the TTL
+# of 0 the server sends, then answer a resend or a duplicate from their cache
+# and it never reaches the server. On such resolvers, and on lossy paths, 2
+# (ChaCha20) is faster: every query name is new. It costs 16 bytes per packet.
 # Must match the client.
 DATA_ENCRYPTION_METHOD = 1
 

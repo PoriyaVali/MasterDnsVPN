@@ -50,7 +50,7 @@ func (c *Client) handleDirectConnect(ctx context.Context, conn net.Conn, ip net.
 	target := net.JoinHostPort(ip.String(), strconv.Itoa(int(port)))
 	c.log.Infof("↩️ <green>Direct TCP CONNECT to <cyan>%s</cyan> (bypass range)</green>", target)
 
-	d := net.Dialer{Timeout: directDialTimeout, Control: netutil.Control(protectPath)}
+	d := net.Dialer{Timeout: directDialTimeout, Control: netutil.Control(currentProtectPath())}
 	upstream, err := d.DialContext(ctx, "tcp", target)
 	if err != nil {
 		c.log.Debugf("↩️ <yellow>Direct dial to %s failed: %v</yellow>", target, err)
@@ -141,7 +141,7 @@ type directUDPRelay struct {
 }
 
 func (c *Client) newDirectUDPRelay(assoc *net.UDPConn) (*directUDPRelay, error) {
-	lc := net.ListenConfig{Control: netutil.Control(protectPath)}
+	lc := net.ListenConfig{Control: netutil.Control(currentProtectPath())}
 	pc, err := lc.ListenPacket(context.Background(), "udp", ":0")
 	if err != nil {
 		return nil, err

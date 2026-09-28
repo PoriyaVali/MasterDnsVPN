@@ -1404,8 +1404,9 @@ func (c *Client) canBuildUploadPayload(domain string, payloadLen int) bool {
 		return true
 	}
 
-	buf := c.udpBufferPool.Get().([]byte)
-	defer c.udpBufferPool.Put(buf)
+	bufRef := c.getRuntimeUDPBuffer()
+	defer c.putRuntimeUDPBuffer(bufRef)
+	buf := *bufRef
 
 	if payloadLen > len(buf) {
 		return false
@@ -1494,8 +1495,9 @@ func (c *Client) encodedCharsForPacketPayload(packetType uint8, payloadLen int) 
 		return 0
 	}
 
-	buf := c.udpBufferPool.Get().([]byte)
-	defer c.udpBufferPool.Put(buf)
+	bufRef := c.getRuntimeUDPBuffer()
+	defer c.putRuntimeUDPBuffer(bufRef)
+	buf := *bufRef
 
 	if payloadLen > len(buf) {
 		return 0

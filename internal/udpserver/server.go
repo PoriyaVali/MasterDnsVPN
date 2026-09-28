@@ -46,6 +46,7 @@ type Server struct {
 	authorizerMu             sync.RWMutex
 	authorizer               SessionAuthorizer
 	domainMatcher            *domainMatcher.Matcher
+	nxdomainBelowTunnel      bool
 	sessions                 *sessionStore
 	deferredDNSSession       *deferredSessionProcessor
 	deferredConnectSession   *deferredSessionProcessor
@@ -93,6 +94,8 @@ type request struct {
 	size int
 	addr *net.UDPAddr
 	conn *net.UDPConn
+	// reply sends the response back on a TCP connection; nil for UDP.
+	reply func([]byte)
 }
 
 type postSessionValidation struct {
@@ -128,6 +131,7 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 		codec:                  codec,
 		users:                  newUserRegistry([]byte(cfg.NodeSecret)),
 		domainMatcher:          domainMatcher.New(cfg.Domain, cfg.MinVPNLabelLength),
+		nxdomainBelowTunnel:    cfg.NXDomainForNonTXTSubdomains,
 		sessions:               sessions,
 		deferredDNSSession:     newDeferredSessionProcessor(dnsDeferredWorkers, dnsDeferredQueue, log),
 		deferredConnectSession: newDeferredSessionProcessor(connectDeferredWorkers, connectDeferredQueue, log),
@@ -144,7 +148,8 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 		dnsFragmentTimeout: dnsFragmentTimeout,
 		dnsUpstreamBufferPool: sync.Pool{
 			New: func() any {
-				return make([]byte, 65535)
+				buf := make([]byte, 65535)
+				return &buf
 			},
 		},
 		dialStreamUpstreamFn: func(network string, address string, timeout time.Duration) (net.Conn, error) {
@@ -343,7 +348,16 @@ func (s *Server) Run(ctx context.Context) error {
 	var readerWG sync.WaitGroup
 	s.startReaders(runCtx, conns, reqCh, readErrCh, &readerWG)
 
+	// TCP feeds the same queue and workers. It stops with the UDP readers,
+	// and all its senders are gone before the queue is closed.
+	tcpCtx, stopTCP := context.WithCancel(runCtx)
+	defer stopTCP()
+	var tcpWG sync.WaitGroup
+	s.startTCP(tcpCtx, reqCh, &tcpWG)
+
 	readerWG.Wait()
+	stopTCP()
+	tcpWG.Wait()
 	close(reqCh)
 	workerWG.Wait()
 	cancel()

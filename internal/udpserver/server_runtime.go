@@ -225,7 +225,9 @@ func (s *Server) dnsWorker(ctx context.Context, conn *net.UDPConn, reqCh <-chan 
 				clientIP = req.addr.IP.String()
 			}
 			response := s.safeHandlePacket(req.buf[:req.size], clientIP)
-			if len(response) != 0 {
+			if req.reply != nil {
+				req.reply(response)
+			} else if len(response) != 0 {
 				writeConn := conn
 				if req.conn != nil {
 					writeConn = req.conn
