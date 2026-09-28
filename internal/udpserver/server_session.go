@@ -868,7 +868,6 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 	if record == nil {
 		return nil
 	}
-	record.streamCleanup = s.cleanupStreamArtifacts
 
 	if !reused && s.log != nil {
 		s.log.Infof(

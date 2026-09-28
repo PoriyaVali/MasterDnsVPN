@@ -238,6 +238,8 @@ type sessionStore struct {
 	maxSessionsPerUser int
 	// closedRetention is how long an evicted session keeps answering "closed".
 	closedRetention time.Duration
+	// streamCleanup is handed to every record this store creates.
+	streamCleanup func(uint8, uint16)
 }
 
 func newSessionStore(orphanQueueCap int, streamQueueCap int, options ...any) *sessionStore {
@@ -409,6 +411,7 @@ func (s *sessionStore) findOrCreateFor(
 		RecentlyClosedTTL:          s.recentlyClosedTTL,
 		RecentlyClosedCap:          s.recentlyClosedCap,
 		OrphanQueue:                mlq.New[VpnProto.Packet](s.orphanQueueCap),
+		streamCleanup:              s.streamCleanup,
 	}
 
 	// Initialize virtual Stream 0 for control packets

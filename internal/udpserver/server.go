@@ -133,7 +133,7 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 	if retention := cfg.ClosedSessionRetention(); retention > 0 {
 		sessions.closedRetention = retention
 	}
-	return &Server{
+	server := &Server{
 		cfg:                    cfg,
 		log:                    log,
 		codec:                  codec,
@@ -188,6 +188,11 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 			},
 		},
 	}
+	// Set here, before any session exists, rather than on every SESSION_INIT:
+	// retransmitted inits for one session reach several workers at once, and
+	// each used to write the record's callback while another could read it.
+	server.sessions.streamCleanup = server.cleanupStreamArtifacts
+	return server
 }
 
 // maxDNSQueryDatagram bounds the per-read buffer. Every request is a DNS query
