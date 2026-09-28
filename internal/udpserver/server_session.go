@@ -18,17 +18,26 @@ import (
 	DnsParser "masterdnsvpn-go/internal/dnsparser"
 	domainMatcher "masterdnsvpn-go/internal/domainmatcher"
 	Enums "masterdnsvpn-go/internal/enums"
+	"masterdnsvpn-go/internal/sessioncrypto"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
-func (s *Server) validatePostSessionPacket(questionPacket []byte, requestName string, vpnPacket VpnProto.Packet) postSessionValidation {
+func (s *Server) validatePostSessionPacket(questionPacket []byte, requestName string, vpnPacket VpnProto.Packet, sealed bool) postSessionValidation {
 	now := time.Now()
-	validation := s.sessions.ValidateAndTouch(vpnPacket.SessionID, vpnPacket.SessionCookie, now)
+	validation := s.sessions.ValidateAndTouchAuth(vpnPacket.SessionID, vpnPacket.SessionCookie, sealed, now)
 	if validation.Valid {
 		return postSessionValidation{
 			record: validation.Active,
 			ok:     true,
 		}
+	}
+
+	if validation.Unsealed {
+		// Someone without this v2 session's keys naming its ID and cookie.
+		// Answered with nothing: not the session's queued data, not even an
+		// error that would confirm the guess.
+		s.logInvalidSessionDrop("unsealed packet for sealed session", vpnPacket.SessionID, vpnPacket.SessionCookie, 0, 0)
+		return postSessionValidation{}
 	}
 
 	if !validation.Known {
@@ -65,13 +74,19 @@ func (s *Server) validatePostSessionPacket(questionPacket []byte, requestName st
 	}
 }
 
-func (s *Server) handleSessionCloseNotice(vpnPacket VpnProto.Packet, now time.Time) {
+func (s *Server) handleSessionCloseNotice(vpnPacket VpnProto.Packet, sealed bool, now time.Time) {
 	if s == nil || vpnPacket.SessionID == 0 {
 		return
 	}
 
 	lookup, known := s.sessions.Lookup(vpnPacket.SessionID)
 	if !known || lookup.State != sessionLookupActive || lookup.Cookie != vpnPacket.SessionCookie {
+		return
+	}
+	// 🔴 A v1 close is an 8-bit ID and an 8-bit cookie under the node key every
+	// subscriber holds: at most 65536 guesses closed anyone's session. A v2
+	// session is only closed by a close sealed under its own keys.
+	if record, ok := s.sessions.Get(vpnPacket.SessionID); ok && record.v2 != sealed {
 		return
 	}
 
@@ -167,7 +182,41 @@ func (s *Server) buildSessionVPNResponse(questionPacket []byte, requestName stri
 	}
 	packet.SessionID = record.ID
 	packet.SessionCookie = record.Cookie
+	if record.v2 {
+		return buildSealedResponse(questionPacket, requestName, record.keys, packet, record.ResponseBase64)
+	}
 	response, err := DnsParser.BuildVPNResponsePacket(questionPacket, requestName, packet, record.ResponseBase64)
+	if err != nil {
+		return nil
+	}
+	return response
+}
+
+// buildSealedResponse answers a v2 session: the frame is built exactly as v1
+// builds it, then sealed under the session's downstream key - so neither its
+// header nor its payload (the user's traffic, and every name they resolve
+// through the tunnel) is readable on the wire, by the censor or by another
+// subscriber holding the node key.
+func buildSealedResponse(questionPacket []byte, requestName string, keys *sessioncrypto.Keys, packet VpnProto.Packet, base64 bool) []byte {
+	raw, err := VpnProto.BuildRawAuto(VpnProto.BuildOptions{
+		SessionID:       packet.SessionID,
+		PacketType:      packet.PacketType,
+		SessionCookie:   packet.SessionCookie,
+		StreamID:        packet.StreamID,
+		SequenceNum:     packet.SequenceNum,
+		FragmentID:      packet.FragmentID,
+		TotalFragments:  packet.TotalFragments,
+		CompressionType: packet.CompressionType,
+		Payload:         packet.Payload,
+	}, compression.DefaultMinSize)
+	if err != nil {
+		return nil
+	}
+	sealed, err := keys.SealDown(raw)
+	if err != nil {
+		return nil
+	}
+	response, err := DnsParser.BuildSealedVPNResponsePacket(questionPacket, requestName, sealed, base64)
 	if err != nil {
 		return nil
 	}
@@ -217,8 +266,17 @@ func (s *Server) streamARQConfig(compressionType uint8) arq.Config {
 		TerminalDrainTimeout:        s.cfg.ARQTerminalDrainTimeoutSec,
 		TerminalAckWaitTimeout:      s.cfg.ARQTerminalAckWaitTimeoutSec,
 		CompressionType:             compressionType,
+		// Left at 0 the ARQ sizes its inbound hand-off queue from the window -
+		// 1600 slots for the default window of 800, allocated up front: ~48KB of
+		// a stream's ~59KB, on every stream of every user. That queue only
+		// bridges the packet worker to the stream's own reader, which drains it
+		// immediately, and upload arrives a query at a time; a full queue drops
+		// the packet, which the client retransmits.
+		InboundQueueSize: serverStreamInboundQueueSize,
 	}
 }
+
+const serverStreamInboundQueueSize = 512
 
 func (s *Server) queueMainSessionPacket(sessionID uint8, packet VpnProto.Packet) bool {
 	packet.StreamID = 0
@@ -633,6 +691,19 @@ func (s *Server) nextUnknownInvalidDropMode() uint8 {
 }
 
 func deferredSessionLaneForPacket(packet VpnProto.Packet) deferredSessionLane {
+	if packet.PacketType == Enums.PACKET_DNS_QUERY_REQ {
+		// A lane is a unit of ordering: everything in one lane runs on one
+		// worker, in turn. Lookups arrive on stream 0, so keyed by stream they
+		// all shared a single lane per session and one slow name held up every
+		// other lookup that user made. They have no order to keep - each is
+		// answered under its own sequence number - so each gets its own lane.
+		// (The DNS pool is separate from the connect pool, so these lanes can
+		// never be mistaken for a stream's.)
+		return deferredSessionLane{
+			sessionID: packet.SessionID,
+			streamID:  packet.SequenceNum,
+		}
+	}
 	return deferredSessionLane{
 		sessionID: packet.SessionID,
 		streamID:  packet.StreamID,
@@ -686,54 +757,91 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 		return nil
 	}
 
-	// Multi-user auth. The 10-byte session signature is unchanged; an 8-byte
-	// user token may follow it. When the node has registered users, a valid
-	// token is required; a standalone node (no users) accepts the legacy
-	// 10-byte form so existing single-key deployments keep working.
+	// Three forms, all starting with the unchanged 10-byte signature:
+	//   signature                            standalone node (no users), v1
+	//   signature | token                    multi-user, v1
+	//   signature | token | v2 | device | proof   multi-user, session v2
+	// A node with registered users requires a token. v2 additionally proves the
+	// client holds the subscriber's own key (not just the token, which crosses
+	// the wire under the node key every subscriber has), and seals the session.
+	payload := vpnPacket.Payload
 	var account *userAccount
-	switch len(vpnPacket.Payload) {
+	var owner sessionOwner
+	switch len(payload) {
 	case sessionInitDataSize:
 		if s.users != nil && s.users.count() > 0 {
 			return nil // token required but missing -> reject
 		}
-	case sessionInitDataSize + UserTokenLen:
+	case sessionInitDataSize + UserTokenLen, sessionInitDataSize + UserTokenLen + sessioncrypto.InitTailLen:
 		if s.users == nil {
 			return nil
 		}
 		var tok UserToken
-		copy(tok[:], vpnPacket.Payload[sessionInitDataSize:sessionInitDataSize+UserTokenLen])
+		copy(tok[:], payload[sessionInitDataSize:sessionInitDataSize+UserTokenLen])
 		if account = s.users.lookup(tok); account == nil {
 			return nil // unknown / revoked user -> reject
 		}
-		// Authorisation is separate from authentication: the token proves who the
-		// subscriber is, the embedder decides whether this device may open a
-		// session. Only a NEW address is put to the hook - an address already
-		// counted for this user is the same device coming back, and a session
-		// re-init is routine, so asking again would refuse a subscriber whose
-		// single allowed device is the one already holding the slot.
-		//
-		// Asked before the address is recorded, so a refused session never leaves
-		// a sighting behind to be reported as a device that is not really there.
-		now := time.Now()
-		if !account.addrs.has(clientIP, now) && !s.authorizeSession(account.uuid, clientIP) {
+		owner.user = account
+
+		if len(payload) > sessionInitDataSize+UserTokenLen {
+			tail := payload[sessionInitDataSize+UserTokenLen:]
+			version := tail[0]
+			var device [sessioncrypto.DeviceLen]byte
+			copy(device[:], tail[1:1+sessioncrypto.DeviceLen])
+			proof := tail[1+sessioncrypto.DeviceLen:]
+			if version != sessioncrypto.Version ||
+				!sessioncrypto.VerifyInitProof(account.key, payload[:sessionInitDataSize], version, device, proof) {
+				return nil
+			}
+			keys, err := sessioncrypto.DeriveKeys(account.key, payload[:sessionInitDataSize], device)
+			if err != nil {
+				return nil
+			}
+			owner.v2 = true
+			owner.keys = keys
+			owner.deviceAddr = sessioncrypto.DeviceAddr(device)
+		} else if s.cfg.RequireSessionV2 {
+			// Once every client speaks v2, a v1 init is only ever someone
+			// replaying or forging a token they were not given.
 			return nil
 		}
-		// Authenticated: this is the only point where a source address and a
-		// subscriber are both known, so it is the only place a device can be
-		// counted. Recorded after the token check, so an unauthenticated packet
-		// cannot inflate someone's device count by claiming their address.
-		account.noteAddr(clientIP, now, 0)
+
+		// Authorisation is separate from authentication: the token proves who the
+		// subscriber is, the embedder decides whether this device may open a
+		// session. Only a NEW device is put to the hook - one already counted for
+		// this user is the same device coming back, and a session re-init is
+		// routine, so asking again would refuse a subscriber whose single allowed
+		// device is the one already holding the slot.
+		//
+		// The device is the one the client declared (v2) when it declared one,
+		// otherwise the source address - which for a DNS tunnel is a resolver's,
+		// so v1 counts resolvers, not phones.
+		//
+		// Asked before the device is recorded, so a refused session never leaves
+		// a sighting behind to be reported as a device that is not really there.
+		device := clientIP
+		if owner.deviceAddr != "" {
+			device = owner.deviceAddr
+		}
+		now := time.Now()
+		if !account.addrs.has(device, now) && !s.authorizeSession(account.uuid, device) {
+			return nil
+		}
+		// Authenticated: recorded after the token (and v2 proof) check, so an
+		// unauthenticated packet cannot inflate someone's device count.
+		account.noteAddr(device, now, 0)
 	default:
 		return nil
 	}
 	// findOrCreate keys sessions on the 10-byte signature only.
-	initSignature := vpnPacket.Payload[:sessionInitDataSize]
+	initSignature := payload[:sessionInitDataSize]
 
 	requestedUpload, requestedDownload := compression.SplitPair(initSignature[1])
 	resolvedUpload := resolveCompressionType(requestedUpload, s.uploadCompressionMask)
 	resolvedDownload := resolveCompressionType(requestedDownload, s.downloadCompressionMask)
 
-	record, reused, err := s.sessions.findOrCreate(
+	record, reused, evicted, err := s.sessions.findOrCreateFor(
+		owner,
 		initSignature,
 		resolvedUpload,
 		resolvedDownload,
@@ -741,6 +849,15 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 		s.cfg.ClientMaxUploadMTU,
 		s.cfg.ClientMaxDownloadMTU,
 	)
+	for _, gone := range evicted {
+		s.cleanupClosedSession(gone.ID, gone.record)
+	}
+	if len(evicted) > 0 && s.log != nil {
+		s.log.Infof(
+			"\U0001F9F9 <yellow>Evicted <cyan>%d</cyan> silent session(s) to make room</yellow>",
+			len(evicted),
+		)
+	}
 	if err != nil {
 		if err == ErrSessionTableFull {
 			if s.log != nil {
@@ -755,9 +872,6 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 	}
 	if record == nil {
 		return nil
-	}
-	if account != nil && !reused {
-		record.user = account // attach owner for per-user accounting
 	}
 	record.streamCleanup = s.cleanupStreamArtifacts
 
@@ -795,11 +909,17 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 		HasClientPolicySync: true,
 	})
 
-	response, err := DnsParser.BuildVPNResponsePacket(questionPacket, decision.RequestName, VpnProto.Packet{
+	acceptPacket := VpnProto.Packet{
 		SessionID:  0,
 		PacketType: Enums.PACKET_SESSION_ACCEPT,
 		Payload:    responsePayload,
-	}, record.ResponseMode == mtuProbeModeBase64)
+	}
+	if record.v2 {
+		// Sealed like everything else in the session: the ID and cookie it
+		// hands out are the session's handle, and only its owner may see them.
+		return buildSealedResponse(questionPacket, decision.RequestName, record.keys, acceptPacket, record.ResponseMode == mtuProbeModeBase64)
+	}
+	response, err := DnsParser.BuildVPNResponsePacket(questionPacket, decision.RequestName, acceptPacket, record.ResponseMode == mtuProbeModeBase64)
 	if err != nil {
 		return nil
 	}

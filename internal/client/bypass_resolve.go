@@ -83,18 +83,41 @@ func queryResolverOnce(srv string, query []byte, deadline time.Time) []byte {
 	// no business carrying, and truncation makes the client retry over TCP
 	// through the ordinary route.
 	buf := make([]byte, 4096)
-	// Read until something usable arrives or the deadline passes. A resolver
-	// that sends a late reply to an older query, or a stray datagram from
-	// anywhere else, must not end the attempt.
+	// Read until this resolver has answered or the deadline passes. A late
+	// reply to an older query, or a stray datagram from anywhere else, must not
+	// end the attempt - but this resolver's own answer does, usable or not.
+	// ⚠️ It used to keep reading after a rejected answer too, and a resolver
+	// sends one answer per question: every racer that got a NODATA then sat out
+	// the full deadline, so an AAAA or HTTPS lookup for an IPv4-only domestic
+	// site - most of them - cost two seconds before it even reached the tunnel.
 	for {
 		n, err := conn.Read(buf)
 		if err != nil || n == 0 {
 			return nil
 		}
-		if usableDNSReply(buf[:n], query) {
-			return append([]byte(nil), buf[:n]...)
+		reply := buf[:n]
+		if !answersQuery(reply, query) {
+			continue
 		}
+		if usableDNSReply(reply, query) {
+			return append([]byte(nil), reply...)
+		}
+		return nil
 	}
+}
+
+// answersQuery reports whether a datagram is a response to `query` at all:
+// long enough, same transaction ID, QR set. Anything else is somebody else's
+// traffic and is skipped.
+func answersQuery(resp, query []byte) bool {
+	const headerLen = 12
+	if len(resp) < headerLen || len(query) < headerLen {
+		return false
+	}
+	if resp[0] != query[0] || resp[1] != query[1] {
+		return false
+	}
+	return resp[2]&0x80 != 0
 }
 
 // usableDNSReply reports whether a datagram is an answer to `query` worth
@@ -107,30 +130,34 @@ func queryResolverOnce(srv string, query []byte, deadline time.Time) []byte {
 // honest resolver is still working. Without this the bypass would prefer the
 // liar, and the more resolvers raced the likelier that becomes.
 //
-// Four questions, cheapest first:
+// Checked cheapest first:
 //   - is it long enough to be a DNS header at all
 //   - does the transaction ID match the query we sent
 //   - is it a response rather than someone else's question
 //   - did it succeed; an error rcode is not an answer, and letting the race
 //     continue gives a working resolver the chance to reply
+//   - is an empty or NXDOMAIN answer backed by the zone's SOA
 func usableDNSReply(resp, query []byte) bool {
-	const headerLen = 12
-	if len(resp) < headerLen || len(query) < headerLen {
+	if !answersQuery(resp, query) {
 		return false
 	}
-	if resp[0] != query[0] || resp[1] != query[1] {
-		return false // a different transaction
+	hasAnswers := resp[6] != 0 || resp[7] != 0
+	hasAuthority := resp[8] != 0 || resp[9] != 0
+	switch resp[3] & 0x0F {
+	case 0: // NOERROR
+		// With records it is an answer. Without, it is only believed when it
+		// carries the zone's SOA (RFC 2308): that is how an honest resolver says
+		// "this name has no record of this type" - the everyday case for AAAA
+		// and HTTPS lookups - while a bare empty reply is the shape a filtered
+		// one takes.
+		return hasAnswers || hasAuthority
+	case 3: // NXDOMAIN
+		// Same rule: a real NXDOMAIN names its zone's SOA; an instant bare one
+		// is the classic injected lie, and rejecting it lets the race go on.
+		return hasAuthority
+	default:
+		return false // SERVFAIL, REFUSED, ...: not an answer about the name
 	}
-	if resp[2]&0x80 == 0 {
-		return false // QR bit clear: not a response
-	}
-	if resp[3]&0x0F != 0 {
-		return false // rcode != NOERROR
-	}
-	// ANCOUNT: a NOERROR with nothing in it answers nothing, and for a name we
-	// deliberately routed to a domestic resolver an empty answer is the shape a
-	// filtered reply takes.
-	return resp[6] != 0 || resp[7] != 0
 }
 
 // bypassServers is who answers a bypassed name.

@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"masterdnsvpn-go/internal/sessioncrypto"
 	"masterdnsvpn-go/internal/usertoken"
 )
 
@@ -35,6 +36,9 @@ type UserBytes struct {
 
 type userAccount struct {
 	uuid string
+	// key is the subscriber secret session v2 is keyed from. Derived from the
+	// UUID, which other subscribers do not have - unlike the node key.
+	key  sessioncrypto.UserKey
 	up   atomic.Int64
 	down atomic.Int64
 
@@ -81,6 +85,9 @@ func (a *userAccount) limiter() *tokenBucket {
 // userRegistry maps handshake tokens to accounts. Safe for concurrent use.
 type userRegistry struct {
 	secret []byte
+	// mask lets the packet path find a sealed (v2) frame's session before it
+	// knows which session key to open it with.
+	mask   sessioncrypto.MaskKey
 	mu     sync.RWMutex
 	byTok  map[UserToken]*userAccount
 	byUUID map[string]UserToken
@@ -89,6 +96,7 @@ type userRegistry struct {
 func newUserRegistry(secret []byte) *userRegistry {
 	return &userRegistry{
 		secret: append([]byte(nil), secret...),
+		mask:   sessioncrypto.DeriveMaskKey(secret),
 		byTok:  make(map[UserToken]*userAccount),
 		byUUID: make(map[string]UserToken),
 	}
@@ -105,7 +113,10 @@ func (r *userRegistry) add(uuid string) UserToken {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.byTok[tok]; !ok {
-		r.byTok[tok] = &userAccount{uuid: uuid}
+		r.byTok[tok] = &userAccount{
+			uuid: uuid,
+			key:  sessioncrypto.DeriveUserKey(r.secret, uuid),
+		}
 		r.byUUID[uuid] = tok
 	}
 	return tok

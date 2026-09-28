@@ -26,6 +26,7 @@ import (
 	"masterdnsvpn-go/internal/logger"
 	"masterdnsvpn-go/internal/mlq"
 	"masterdnsvpn-go/internal/security"
+	"masterdnsvpn-go/internal/sessioncrypto"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
@@ -73,15 +74,30 @@ type Client struct {
 	streamResolverFailoverCooldown        time.Duration
 
 	// Session States
-	sessionID             uint8
-	sessionCookie         uint8
-	responseMode          uint8
-	sessionReady          bool
-	initStateMu           sync.Mutex
-	sessionInitReady      bool
-	sessionInitBase64     bool
-	sessionInitPayload    []byte
-	sessionInitVerify     [4]byte
+	sessionID          uint8
+	sessionCookie      uint8
+	responseMode       uint8
+	sessionReady       bool
+	initStateMu        sync.Mutex
+	sessionInitReady   bool
+	sessionInitBase64  bool
+	sessionInitPayload []byte
+	sessionInitVerify  [4]byte
+	// Keys the pending SESSION_INIT will be sealed under if the node accepts
+	// it as v2; nil for a v1 init.
+	sessionInitKeys *sessioncrypto.Keys
+
+	// Session protocol v2 (package sessioncrypto).
+	v2Capable      bool // UUID + node secret configured and SESSION_V2 != off
+	v2Required     bool // SESSION_V2 = on: never fall back to v1
+	v2UserKey      sessioncrypto.UserKey
+	v2Mask         sessioncrypto.MaskKey
+	v2Device       [sessioncrypto.DeviceLen]byte
+	v2Fallback     atomic.Bool // auto mode gave up on v2 for this run
+	v2Proven       atomic.Bool // a node accepted v2 once: never fall back
+	v2InitFailures int
+	// sessionKeys are the live session's keys; nil for a v1 session.
+	sessionKeys           atomic.Pointer[sessioncrypto.Keys]
 	sessionInitCursor     int
 	sessionInitBusyUnix   atomic.Int64
 	sessionResetPending   atomic.Bool
@@ -296,6 +312,16 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		}
 	}
 
+	// Session v2 needs the subscriber's identity to key sessions from; without
+	// it (a standalone node) the client speaks v1 exactly as before.
+	v2Capable := cfg.Uuid != "" && cfg.NodeSecret != "" && cfg.SessionV2 != "off"
+	var v2UserKey sessioncrypto.UserKey
+	var v2Mask sessioncrypto.MaskKey
+	if v2Capable {
+		v2UserKey = sessioncrypto.DeriveUserKey([]byte(cfg.NodeSecret), cfg.Uuid)
+		v2Mask = sessioncrypto.DeriveMaskKey([]byte(cfg.NodeSecret))
+	}
+
 	var responseMode uint8
 	if cfg.BaseEncodeData {
 		responseMode = mtuProbeBase64Reply
@@ -347,6 +373,12 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 
 		bypass:      bypass,
 		bypassCIDRs: bypassCIDRs,
+
+		v2Capable:  v2Capable,
+		v2Required: v2Capable && cfg.SessionV2 == "on",
+		v2UserKey:  v2UserKey,
+		v2Mask:     v2Mask,
+		v2Device:   sessioncrypto.DeviceHash(cfg.DeviceID),
 
 		// DNS Management
 		// Recorded before any socket is made, so every resolver dial can ask
@@ -615,6 +647,12 @@ func (c *Client) HandleSessionBusy() error {
 }
 
 func (c *Client) HandleErrorDrop(packet VpnProto.Packet) error {
+	// The drop names the session it is about. One about an earlier session -
+	// a late answer to a query sent before the last re-init - says nothing
+	// about this one, and used to tear it down.
+	if packet.SessionID != c.sessionID {
+		return nil
+	}
 	c.requestSessionRestart("error drop received")
 	return nil
 }

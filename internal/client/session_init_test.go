@@ -25,7 +25,7 @@ func TestNextSessionInitAttemptUsesBalancerSnapshotConnection(t *testing.T) {
 	originalDomain := connections[0].Domain
 	connections[0].Domain = "mutated.example.com"
 
-	conn, _, _, err := c.nextSessionInitAttempt()
+	conn, _, _, _, err := c.nextSessionInitAttempt()
 	if err != nil {
 		t.Fatalf("nextSessionInitAttempt returned error: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestApplySessionInitPacketAppliesServerClientPolicy(t *testing.T) {
 	err := c.applySessionInitPacket(VpnProto.Packet{
 		PacketType: Enums.PACKET_SESSION_ACCEPT,
 		Payload:    payload[:],
-	}, initPayload, verifyCode)
+	}, false, initPayload, verifyCode, nil)
 	if err != nil {
 		t.Fatalf("applySessionInitPacket returned error: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestApplySessionInitPacketAcceptsLegacySessionAcceptPayload(t *testing.T) {
 	err := c.applySessionInitPacket(VpnProto.Packet{
 		PacketType: Enums.PACKET_SESSION_ACCEPT,
 		Payload:    payload,
-	}, initPayload, verifyCode)
+	}, false, initPayload, verifyCode, nil)
 	if err != nil {
 		t.Fatalf("legacy session accept should still work, got error: %v", err)
 	}
@@ -235,7 +235,7 @@ func TestApplySessionInitPacketPreservesHigherTunnelProcessWorkers(t *testing.T)
 	initPayload := make([]byte, sessionInitPayloadSize)
 	initPayload[0] = 1
 
-	if err := c.applySessionInitPacket(packet, initPayload, verifyCode); err != nil {
+	if err := c.applySessionInitPacket(packet, false, initPayload, verifyCode, nil); err != nil {
 		t.Fatalf("applySessionInitPacket returned error: %v", err)
 	}
 

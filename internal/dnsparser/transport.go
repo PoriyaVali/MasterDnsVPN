@@ -396,6 +396,59 @@ func ExtractVPNResponse(packet []byte, baseEncoded bool) (VpnProto.Packet, error
 	return assembleVPNResponse(rawAnswers, baseEncoded)
 }
 
+// ExtractVPNResponseWith is ExtractVPNResponse for a client that may hold
+// session v2 keys. open, when non-nil, is offered the reassembled answer first;
+// if it authenticates, the frame inside is the packet and sealed is true.
+// Otherwise the answer is read as a plain v1 frame and sealed is false - the
+// caller decides what, if anything, it accepts unsealed.
+func ExtractVPNResponseWith(packet []byte, baseEncoded bool, open func([]byte) ([]byte, bool)) (VpnProto.Packet, bool, error) {
+	parsed, err := ParsePacket(packet)
+	if err != nil {
+		return VpnProto.Packet{}, false, err
+	}
+
+	rawAnswers := extractTXTAnswerPayloads(parsed)
+	if len(rawAnswers) == 0 {
+		return VpnProto.Packet{}, false, ErrTXTAnswerMissing
+	}
+
+	if open != nil {
+		if blob, err := assembleSealedBlob(rawAnswers, baseEncoded); err == nil {
+			if frame, ok := open(blob); ok {
+				vpnPacket, err := VpnProto.ParseInflated(frame)
+				return vpnPacket, err == nil, err
+			}
+		}
+	}
+
+	vpnPacket, err := assembleVPNResponse(rawAnswers, baseEncoded)
+	return vpnPacket, false, err
+}
+
+// BuildSealedVPNResponsePacket answers a tunnel query with an already-sealed
+// session v2 frame, in one TXT record split into 255-byte strings - the same
+// shape v1 answers now have. The sealed bytes are opaque; nothing in them is
+// read here.
+func BuildSealedVPNResponsePacket(questionPacket []byte, answerName string, sealed []byte, baseEncode bool) ([]byte, error) {
+	answer, err := buildTXTAnswerRData(sealed, baseEncode)
+	if err != nil {
+		return nil, err
+	}
+	return buildSingleTXTResponsePacket(questionPacket, answerName, answer)
+}
+
+// assembleSealedBlob reads a sealed answer back: always one record, its
+// strings joined. v2 has only ever been sent that way.
+func assembleSealedBlob(rawAnswers [][]byte, baseEncoded bool) ([]byte, error) {
+	if len(rawAnswers) != 1 {
+		return nil, ErrTXTAnswerMalformed
+	}
+	if !baseEncoded {
+		return rawAnswers[0], nil
+	}
+	return baseCodec.DecodeRawBase64(rawAnswers[0])
+}
+
 func DescribeResponseWithoutTunnelPayload(packet []byte) string {
 	parsed, err := ParsePacket(packet)
 	if err != nil {

@@ -22,6 +22,7 @@ import (
 	Enums "masterdnsvpn-go/internal/enums"
 	fragmentStore "masterdnsvpn-go/internal/fragmentstore"
 	"masterdnsvpn-go/internal/mlq"
+	"masterdnsvpn-go/internal/sessioncrypto"
 	"masterdnsvpn-go/internal/usertoken"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
@@ -56,11 +57,40 @@ func (c *Client) InitializeSession(maxAttempts int) error {
 		}
 	}
 
+	c.noteV2InitRoundFailed()
 	return ErrSessionInitFailed
 }
 
+// v2InitFallbackRounds is how many whole init rounds a v2 SESSION_INIT may go
+// unanswered before "auto" retries in v1. A node that predates v2 does not
+// answer the longer init at all, so without this an updated client could never
+// reach an old node.
+const v2InitFallbackRounds = 2
+
+func (c *Client) usingSessionV2() bool {
+	return c.v2Capable && !c.v2Fallback.Load()
+}
+
+func (c *Client) noteV2InitRoundFailed() {
+	if !c.usingSessionV2() || c.v2Required || c.v2Proven.Load() {
+		return
+	}
+	c.v2InitFailures++
+	if c.v2InitFailures < v2InitFallbackRounds {
+		return
+	}
+	// ⚠️ Once any node has accepted v2 this run never falls back: a v2 node
+	// that stops answering is a network problem, and retrying in v1 would hand
+	// anyone able to drop packets a way to switch the encryption off.
+	c.v2Fallback.Store(true)
+	c.resetSessionInitState()
+	if c.log != nil {
+		c.log.Warnf("<yellow>Session v2 was not answered; this node looks older than v2 - retrying with v1 (downstream unencrypted)</yellow>")
+	}
+}
+
 func (c *Client) initializeSessionRequest() error {
-	conn, initPayload, verifyCode, err := c.nextSessionInitAttempt()
+	conn, initPayload, verifyCode, initKeys, err := c.nextSessionInitAttempt()
 	if err != nil {
 		return err
 	}
@@ -83,6 +113,7 @@ func (c *Client) initializeSessionRequest() error {
 	type result struct {
 		err    error
 		packet VpnProto.Packet
+		sealed bool
 	}
 
 	resChan := make(chan result, racingCount)
@@ -97,9 +128,12 @@ func (c *Client) initializeSessionRequest() error {
 		}
 
 		go func() {
-			packet, err := c.exchangeDNSOverConnection(conn, query, c.mtuTestTimeout*3)
+			// The answer is decoded the way this init asked for it, not by
+			// c.responseMode: a session reset zeroes that, which made every
+			// re-init in base64 mode unreadable.
+			packet, sealed, err := c.exchangeDNSOverConnectionWith(conn, query, c.mtuTestTimeout*3, initPayload[0] == mtuProbeBase64Reply, initKeys)
 			select {
-			case resChan <- result{err: err, packet: packet}:
+			case resChan <- result{err: err, packet: packet, sealed: sealed}:
 			case <-ctx.Done():
 			}
 		}()
@@ -113,7 +147,7 @@ waitPhase:
 		case res := <-resChan:
 			responsesReceived++
 			if res.err == nil {
-				if err := c.applySessionInitPacket(res.packet, initPayload, verifyCode); err == nil {
+				if err := c.applySessionInitPacket(res.packet, res.sealed, initPayload, verifyCode, initKeys); err == nil {
 					cancel()
 					return nil
 				} else if errors.Is(err, ErrSessionInitBusy) {
@@ -137,7 +171,7 @@ waitPhase:
 	}
 }
 
-func (c *Client) applySessionInitPacket(packet VpnProto.Packet, initPayload []byte, verifyCode [4]byte) error {
+func (c *Client) applySessionInitPacket(packet VpnProto.Packet, sealed bool, initPayload []byte, verifyCode [4]byte, initKeys *sessioncrypto.Keys) error {
 	if c.SessionReady() {
 		return nil
 	}
@@ -150,6 +184,12 @@ func (c *Client) applySessionInitPacket(packet VpnProto.Packet, initPayload []by
 		c.setSessionInitBusyUntil(time.Now().Add(c.cfg.SessionInitBusyRetryInterval()))
 		return ErrSessionInitBusy
 	case Enums.PACKET_SESSION_ACCEPT:
+		// A v2 init is only ever accepted sealed under the keys it committed
+		// to, and a v1 init only in clear. Anything else is not this node
+		// answering this init.
+		if sealed != (initKeys != nil) {
+			return ErrSessionInitFailed
+		}
 		sessionAccept, err := VpnProto.DecodeSessionAcceptPayload(packet.Payload)
 		if err != nil || !bytes.Equal(sessionAccept.VerifyCode[:], verifyCode[:]) {
 			return ErrSessionInitFailed
@@ -165,6 +205,11 @@ func (c *Client) applySessionInitPacket(packet VpnProto.Packet, initPayload []by
 		c.sessionID = sessionAccept.SessionID
 		c.sessionCookie = sessionAccept.SessionCookie
 		c.responseMode = initPayload[0]
+		c.sessionKeys.Store(initKeys)
+		if initKeys != nil {
+			c.v2Proven.Store(true)
+			c.v2InitFailures = 0
+		}
 		c.uploadCompression, c.downloadCompression = compression.SplitPair(sessionAccept.CompressionPair)
 		if sessionAccept.HasClientPolicySync {
 			c.applySessionClientPolicy(sessionAccept.ClientPolicy)
@@ -249,7 +294,7 @@ func (c *Client) syncSessionPolicyDerivedState() {
 		c.syncedUploadMTU = min(c.syncedUploadMTU, c.cfg.MaxUploadMTU)
 		c.syncedUploadChars = c.encodedCharsForPayload(c.syncedUploadMTU)
 		c.safeUploadMTU = computeSafeUploadMTU(c.syncedUploadMTU, c.mtuCryptoOverhead)
-		c.maxPackedBlocks = VpnProto.CalculateMaxPackedBlocks(c.syncedUploadMTU, 80, c.cfg.MaxPacketsPerBatch)
+		c.maxPackedBlocks = VpnProto.CalculateMaxPackedBlocks(c.uploadPayloadMTU(), 80, c.cfg.MaxPacketsPerBatch)
 	} else {
 		c.syncedUploadChars = 0
 		c.safeUploadMTU = 0
@@ -350,11 +395,11 @@ func formatPolicyFloat(value float64) string {
 	return fmt.Sprintf("%.3f", value)
 }
 
-func (c *Client) buildSessionInitPayload() ([]byte, bool, [4]byte, error) {
+func (c *Client) buildSessionInitPayload() ([]byte, bool, [4]byte, *sessioncrypto.Keys, error) {
 	var verifyCode [4]byte
 	randomPart, err := randomBytes(len(verifyCode))
 	if err != nil {
-		return nil, false, verifyCode, err
+		return nil, false, verifyCode, nil, err
 	}
 	copy(verifyCode[:], randomPart)
 
@@ -375,13 +420,28 @@ func (c *Client) buildSessionInitPayload() ([]byte, bool, [4]byte, error) {
 		payload = append(payload, tok[:]...)
 	}
 
-	return payload, payload[0] == mtuProbeBase64Reply, verifyCode, nil
+	// Session v2: version, device, and a proof made with the subscriber's own
+	// key, from which this session's keys are also derived.
+	var keys *sessioncrypto.Keys
+	if c.usingSessionV2() {
+		signature := payload[:sessionInitPayloadSize]
+		keys, err = sessioncrypto.DeriveKeys(c.v2UserKey, signature, c.v2Device)
+		if err != nil {
+			return nil, false, verifyCode, nil, err
+		}
+		proof := sessioncrypto.InitProof(c.v2UserKey, signature, sessioncrypto.Version, c.v2Device)
+		payload = append(payload, sessioncrypto.Version)
+		payload = append(payload, c.v2Device[:]...)
+		payload = append(payload, proof[:]...)
+	}
+
+	return payload, payload[0] == mtuProbeBase64Reply, verifyCode, keys, nil
 }
 
-func (c *Client) nextSessionInitAttempt() (Connection, []byte, [4]byte, error) {
+func (c *Client) nextSessionInitAttempt() (Connection, []byte, [4]byte, *sessioncrypto.Keys, error) {
 	var empty [4]byte
 	if c == nil {
-		return Connection{}, nil, empty, ErrSessionInitFailed
+		return Connection{}, nil, empty, nil, ErrSessionInitFailed
 	}
 
 	c.initStateMu.Lock()
@@ -389,20 +449,21 @@ func (c *Client) nextSessionInitAttempt() (Connection, []byte, [4]byte, error) {
 
 	// Persistence Check: reuse existing token/payload if already ready
 	if !c.sessionInitReady {
-		payload, responseBase64, verifyCode, err := c.buildSessionInitPayload()
+		payload, responseBase64, verifyCode, keys, err := c.buildSessionInitPayload()
 		if err != nil {
-			return Connection{}, nil, empty, err
+			return Connection{}, nil, empty, nil, err
 		}
 		c.sessionInitPayload = payload
 		c.sessionInitBase64 = responseBase64
 		c.sessionInitVerify = verifyCode
+		c.sessionInitKeys = keys
 		c.sessionInitReady = true
 		c.sessionInitCursor = 0
 	}
 
 	active := c.balancer.ActiveConnections()
 	if len(active) == 0 {
-		return Connection{}, nil, empty, ErrNoValidConnections
+		return Connection{}, nil, empty, nil, ErrNoValidConnections
 	}
 
 	// Use the cursor to rotate between valid resolvers in a Round-Robin fashion.
@@ -416,10 +477,10 @@ func (c *Client) nextSessionInitAttempt() (Connection, []byte, [4]byte, error) {
 		}
 
 		c.sessionInitCursor = (idxInValid + 1) % validLen
-		return conn, c.sessionInitPayload, c.sessionInitVerify, nil
+		return conn, c.sessionInitPayload, c.sessionInitVerify, c.sessionInitKeys, nil
 	}
 
-	return Connection{}, nil, empty, ErrNoValidConnections
+	return Connection{}, nil, empty, nil, ErrNoValidConnections
 }
 
 func (c *Client) resetSessionInitState() {
@@ -434,6 +495,7 @@ func (c *Client) resetSessionInitState() {
 func (c *Client) resetSessionInitStateLocked() {
 	c.sessionInitPayload = nil
 	c.sessionInitVerify = [4]byte{}
+	c.sessionInitKeys = nil
 	c.sessionInitBase64 = false
 	c.sessionInitReady = false
 	c.sessionInitCursor = 0
@@ -588,7 +650,7 @@ func (c *Client) applySyncedMTUState(uploadMTU int, downloadMTU int, uploadChars
 	c.syncedDownloadMTU = downloadMTU
 	c.syncedUploadChars = uploadChars
 	c.safeUploadMTU = computeSafeUploadMTU(uploadMTU, c.mtuCryptoOverhead)
-	c.maxPackedBlocks = VpnProto.CalculateMaxPackedBlocks(uploadMTU, 80, c.cfg.MaxPacketsPerBatch)
+	c.maxPackedBlocks = VpnProto.CalculateMaxPackedBlocks(c.uploadPayloadMTU(), 80, c.cfg.MaxPacketsPerBatch)
 	c.applySessionCompressionPolicy()
 	if c.log != nil && c.successMTUChecks {
 		c.log.Infof("\U0001F4CF <green>MTU state applied: UP=%d, DOWN=%d</green>", uploadMTU, downloadMTU)
@@ -663,3 +725,22 @@ func (c *Client) applySessionCompressionPolicy() {
 		)
 	}
 }
+
+// uploadPayloadMTU is the most payload one upstream frame may carry.
+//
+// The measured upload MTU already paid for the node codec's own overhead (the
+// probe travels under it). A v2 frame is sealed instead of encoded with that
+// codec, so the budget moves by the difference - smaller than v1 under
+// ChaCha20 or no encryption, slightly larger under AES-GCM.
+func (c *Client) uploadPayloadMTU() int {
+	mtu := c.syncedUploadMTU
+	if mtu <= 0 {
+		return mtu
+	}
+	if c.sessionKeys.Load() != nil || (c.usingSessionV2() && !c.sessionReady) {
+		mtu -= sessioncrypto.UpOverhead - c.mtuCryptoOverhead
+	}
+	return max(mtu, minSealedUploadPayload)
+}
+
+const minSealedUploadPayload = 16

@@ -91,6 +91,8 @@ type ServerConfig struct {
 	ARQTerminalDrainTimeoutSec        float64  `toml:"ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS"`
 	ARQTerminalAckWaitTimeoutSec      float64  `toml:"ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS"`
 	MaxAllowedClientActiveSessions    int      `toml:"MAX_ALLOWED_CLIENT_ACTIVE_SESSION"`
+	MaxSessionsPerUser                int      `toml:"MAX_SESSIONS_PER_USER"`
+	RequireSessionV2                  bool     `toml:"REQUIRE_SESSION_V2"`
 	MaxAllowedClientActiveStreams     int      `toml:"MAX_ALLOWED_CLIENT_ACTIVE_STREAMS_PER_SESSION"`
 	ClientMaxPacketDuplicationCount   int      `toml:"MAX_ALLOWED_CLIENT_PACKET_DUPLICATION_COUNT"`
 	ClientMaxSetupDuplicationCount    int      `toml:"MAX_ALLOWED_CLIENT_SETUP_PACKET_DUPLICATION_COUNT"`
@@ -181,6 +183,8 @@ func defaultServerConfig() ServerConfig {
 		ARQTerminalDrainTimeoutSec:        120.0,
 		ARQTerminalAckWaitTimeoutSec:      90.0,
 		MaxAllowedClientActiveSessions:    255,
+		MaxSessionsPerUser:                8,
+		RequireSessionV2:                  false,
 		MaxAllowedClientActiveStreams:     2000,
 		ClientMaxPacketDuplicationCount:   5,
 		ClientMaxSetupDuplicationCount:    6,

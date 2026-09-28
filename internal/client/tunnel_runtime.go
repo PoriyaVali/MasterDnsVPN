@@ -19,8 +19,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"masterdnsvpn-go/internal/netutil"
 	"masterdnsvpn-go/internal/dnsparser"
+	"masterdnsvpn-go/internal/netutil"
+	"masterdnsvpn-go/internal/sessioncrypto"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
@@ -306,24 +307,31 @@ func (c *Client) exchangeUDPQuery(transport *udpQueryTransport, packet []byte, t
 }
 
 // exchangeDNSOverConnection sends a DNS query and returns the extracted VPN packet.
-func (c *Client) exchangeDNSOverConnection(conn Connection, query []byte, timeout time.Duration) (VpnProto.Packet, error) {
+// exchangeDNSOverConnectionWith sends one tunnel query on a pooled socket and
+// reads its answer, decoded as base64 says, and opened with keys when the
+// answer may be sealed (a v2 SESSION_INIT). sealed reports whether it was.
+func (c *Client) exchangeDNSOverConnectionWith(conn Connection, query []byte, timeout time.Duration, base64 bool, keys *sessioncrypto.Keys) (VpnProto.Packet, bool, error) {
 	udpConn, err := c.getUDPConn(conn.ResolverLabel)
 	if err != nil {
-		return VpnProto.Packet{}, err
+		return VpnProto.Packet{}, false, err
 	}
 
 	response, err := c.exchangeUDPQueryWithConn(udpConn, query, timeout)
 	if err != nil {
 		_ = udpConn.Close()
-		return VpnProto.Packet{}, err
+		return VpnProto.Packet{}, false, err
 	}
 
 	c.putUDPConn(conn.ResolverLabel, udpConn)
 
-	packet, err := dnsparser.ExtractVPNResponse(response, c.responseMode == mtuProbeBase64Reply)
+	var open func([]byte) ([]byte, bool)
+	if keys != nil {
+		open = keys.OpenDown
+	}
+	packet, sealed, err := dnsparser.ExtractVPNResponseWith(response, base64, open)
 	if err != nil {
-		return VpnProto.Packet{}, err
+		return VpnProto.Packet{}, false, err
 	}
 
-	return packet, nil
+	return packet, sealed, nil
 }

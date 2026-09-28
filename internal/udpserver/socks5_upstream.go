@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -79,10 +80,92 @@ func (s *Server) dialSOCKSStreamTargetContext(ctx context.Context, host string, 
 	}
 
 	if !s.useExternalSOCKS5 || len(targetPayload) == 0 {
-		return s.dialTCPTargetContext(ctx, net.JoinHostPort(host, strconv.Itoa(int(port))))
+		return s.dialDirectSOCKSTarget(ctx, host, port)
 	}
 	return s.dialExternalSOCKS5TargetContext(ctx, targetPayload)
 }
+
+// dialDirectSOCKSTarget connects to a client-chosen target from this host.
+//
+// 🔴 A name is resolved HERE and every address it yields is checked before
+// anything is dialled. validateSOCKSTargetHost can only judge a literal IP; a
+// name went straight to the dialer, so any name whose A record says 127.0.0.1
+// or 10.x or 169.254.169.254 (there are public ones built for exactly that)
+// handed a subscriber this node's loopback services and private network. The
+// connection goes to the address that was checked, so a record that changes
+// between the check and the dial (rebinding) changes nothing.
+func (s *Server) dialDirectSOCKSTarget(ctx context.Context, host string, port uint16) (net.Conn, error) {
+	portText := strconv.Itoa(int(port))
+	if _, err := netip.ParseAddr(strings.TrimSpace(host)); err == nil {
+		return s.dialTCPTargetContext(ctx, net.JoinHostPort(host, portText))
+	}
+
+	lookup := s.lookupTargetIPsFn
+	if lookup == nil {
+		lookup = func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	addrs, err := lookup(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+
+	allowed := make([]netip.Addr, 0, len(addrs))
+	for _, addr := range addrs {
+		if !isBlockedSOCKSTargetIP(addr) {
+			allowed = append(allowed, addr)
+		}
+	}
+	if len(allowed) == 0 {
+		return nil, &blockedSOCKSTargetError{host: host}
+	}
+	if len(allowed) > maxDirectTargetAddrs {
+		allowed = allowed[:maxDirectTargetAddrs]
+	}
+
+	// Addresses are tried in turn, each given its share of what is left of the
+	// deadline (with a floor), the way the standard dialer splits a timeout
+	// across a name's addresses - so one dead address cannot spend the whole
+	// budget before a working one is reached.
+	var lastErr error
+	for i, addr := range allowed {
+		attemptCtx := ctx
+		cancel := context.CancelFunc(func() {})
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			share := remaining / time.Duration(len(allowed)-i)
+			if share < minDirectTargetAttempt {
+				share = min(minDirectTargetAttempt, remaining)
+			}
+			attemptCtx, cancel = context.WithTimeout(ctx, share)
+		}
+		conn, err := s.dialTCPTargetContext(attemptCtx, net.JoinHostPort(addr.String(), portText))
+		cancel()
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if lastErr == nil {
+		lastErr = ctx.Err()
+	}
+	return nil, lastErr
+}
+
+const (
+	maxDirectTargetAddrs   = 4
+	minDirectTargetAttempt = 2 * time.Second
+)
 
 func validateSOCKSTargetHost(host string) error {
 	trimmed := strings.TrimSpace(host)
@@ -95,31 +178,47 @@ func validateSOCKSTargetHost(host string) error {
 		return &blockedSOCKSTargetError{host: host}
 	}
 
-	ip := net.ParseIP(trimmed)
-	if ip == nil {
+	addr, err := netip.ParseAddr(trimmed)
+	if err != nil {
+		// A name: judged by what it resolves to, in dialDirectSOCKSTarget.
 		return nil
 	}
-
-	if !ip.IsGlobalUnicast() ||
-		ip.IsLoopback() ||
-		ip.IsPrivate() ||
-		ip.IsMulticast() ||
-		ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() ||
-		ip.IsUnspecified() {
+	if isBlockedSOCKSTargetIP(addr) {
 		return &blockedSOCKSTargetError{host: host}
 	}
+	return nil
+}
 
-	if v4 := ip.To4(); v4 != nil {
-		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
-			return &blockedSOCKSTargetError{host: host}
-		}
-		if v4[0] == 198 && (v4[1] == 18 || v4[1] == 19) {
-			return &blockedSOCKSTargetError{host: host}
+var blockedSOCKSTargetPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),      // "this network"
+	netip.MustParsePrefix("100.64.0.0/10"),  // carrier-grade NAT
+	netip.MustParsePrefix("198.18.0.0/15"),  // benchmarking
+	netip.MustParsePrefix("64:ff9b:1::/48"), // local-use NAT64
+}
+
+// isBlockedSOCKSTargetIP reports addresses a subscriber must not reach through
+// this node: its own loopback, private and link-local networks (which include
+// cloud metadata at 169.254.169.254), multicast, and the special ranges above.
+// An IPv4-mapped IPv6 address is judged as the IPv4 address it carries.
+func isBlockedSOCKSTargetIP(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	if !addr.IsValid() ||
+		!addr.IsGlobalUnicast() ||
+		addr.IsLoopback() ||
+		addr.IsPrivate() ||
+		addr.IsMulticast() ||
+		addr.IsLinkLocalUnicast() ||
+		addr.IsLinkLocalMulticast() ||
+		addr.IsInterfaceLocalMulticast() ||
+		addr.IsUnspecified() {
+		return true
+	}
+	for _, prefix := range blockedSOCKSTargetPrefixes {
+		if prefix.Contains(addr) {
+			return true
 		}
 	}
-
-	return nil
+	return false
 }
 
 func (s *Server) dialTCPTarget(address string) (net.Conn, error) {

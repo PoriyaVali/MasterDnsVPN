@@ -22,10 +22,15 @@ import (
 	"masterdnsvpn-go/internal/arq"
 	Enums "masterdnsvpn-go/internal/enums"
 	"masterdnsvpn-go/internal/mlq"
+	"masterdnsvpn-go/internal/sessioncrypto"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
 var ErrSessionTableFull = errors.New("session table full")
+
+// errSessionSignatureTaken: a SESSION_INIT repeated a live session's signature
+// but authenticated as a different user.
+var errSessionSignatureTaken = errors.New("session signature belongs to another user")
 
 const (
 	maxServerSessionID    = 255
@@ -38,17 +43,24 @@ const (
 type sessionRecord struct {
 	mu sync.RWMutex
 
-	ID                                  uint8
-	Cookie                              uint8
-	ResponseMode                        uint8
-	UploadCompression                   uint8
-	DownloadCompression                 uint8
-	UploadMTU                           uint16
-	DownloadMTU                         uint16
-	DownloadMTUBytes                    int
-	VerifyCode                          [4]byte
-	Signature                           [sessionInitDataSize]byte
-	user                                *userAccount // multi-user: owning V2board account (nil = standalone)
+	ID                  uint8
+	Cookie              uint8
+	ResponseMode        uint8
+	UploadCompression   uint8
+	DownloadCompression uint8
+	UploadMTU           uint16
+	DownloadMTU         uint16
+	DownloadMTUBytes    int
+	VerifyCode          [4]byte
+	Signature           [sessionInitDataSize]byte
+	user                *userAccount // multi-user: owning V2board account (nil = standalone)
+	// Session protocol v2 (see package sessioncrypto): every packet of this
+	// session is sealed under its own keys, and a packet that is not is refused.
+	v2   bool
+	keys *sessioncrypto.Keys
+	// deviceAddr stands in for the client address when counting devices; ""
+	// means the client sent no device, and the resolver address is used.
+	deviceAddr                          string
 	MaxPackedBlocks                     int
 	StreamReadBufferSize                int
 	CreatedAt                           time.Time
@@ -153,6 +165,9 @@ type sessionRuntimeView struct {
 	// session). Carried on the view so the packet path can meter the client's
 	// address without reaching back into the record and taking its lock.
 	user                *userAccount
+	v2                  bool
+	keys                *sessioncrypto.Keys
+	deviceAddr          string
 	ID                  uint8
 	Cookie              uint8
 	ResponseMode        uint8
@@ -187,7 +202,9 @@ type sessionValidationResult struct {
 	Lookup sessionLookupResult
 	Known  bool
 	Valid  bool
-	Active *sessionRuntimeView
+	// Unsealed: the session is v2 and this packet was not sealed for it.
+	Unsealed bool
+	Active   *sessionRuntimeView
 }
 
 type closedSessionCleanup struct {
@@ -217,6 +234,10 @@ type sessionStore struct {
 	sessionInitTTL         time.Duration
 	recentlyClosedTTL      time.Duration
 	recentlyClosedCap      int
+	// maxSessionsPerUser caps one subscriber's live sessions (0 = no cap).
+	maxSessionsPerUser int
+	// closedRetention is how long an evicted session keeps answering "closed".
+	closedRetention time.Duration
 }
 
 func newSessionStore(orphanQueueCap int, streamQueueCap int, options ...any) *sessionStore {
@@ -257,6 +278,7 @@ func newSessionStore(orphanQueueCap int, streamQueueCap int, options ...any) *se
 		sessionInitTTL:    sessionInitTTL,
 		recentlyClosedTTL: recentlyClosedTTL,
 		recentlyClosedCap: recentlyClosedCap,
+		closedRetention:   600 * time.Second,
 	}
 }
 
@@ -268,8 +290,59 @@ func (s *sessionStore) findOrCreate(
 	maxClientUploadMTU int,
 	maxClientDownloadMTU int,
 ) (*sessionRecord, bool, error) {
+	record, reused, _, err := s.findOrCreateFor(sessionOwner{}, payload, uploadCompressionType, downloadCompressionType, maxPacketsPerBatch, maxClientUploadMTU, maxClientDownloadMTU)
+	return record, reused, err
+}
+
+// sessionOwner is everything an authenticated SESSION_INIT established about
+// who is asking. The zero value is a standalone (single-key, v1) session.
+type sessionOwner struct {
+	user       *userAccount
+	v2         bool
+	keys       *sessioncrypto.Keys
+	deviceAddr string
+}
+
+const (
+	// A live client is heard from at least every ~15s (its coldest ping), so a
+	// session quiet this long has lost its client. Only ever evicted when room
+	// is needed.
+	perUserEvictIdle = 30 * time.Second
+	tableEvictIdle   = 60 * time.Second
+)
+
+// findOrCreateFor finds the session a SESSION_INIT names, or creates it.
+// Sessions it had to evict to make room are returned for the caller to clean
+// up outside the lock, whether or not the init itself succeeded.
+//
+// 🔴 A repeated SESSION_INIT is matched to its session by the 10-byte
+// signature alone, and the answer is that session's ID and cookie - everything
+// a client needs to send and receive on it. So the match must also be the same
+// user, speaking the same protocol version from the same device: otherwise
+// anyone who presents another subscriber's signature under their own valid
+// token is handed that subscriber's session, and a v1 init could pull a v2
+// session's handle back out in clear. The owner is attached here, under the
+// store lock, instead of after the record has been published to every packet
+// worker.
+//
+// Room. Session IDs are 8 bits, so a node holds at most 255 sessions, and a
+// client that vanishes without SESSION_CLOSE (a phone changing network) leaves
+// its session to idle out over SESSION_TIMEOUT. Two rules keep that from
+// locking everyone out: one subscriber holds at most maxSessionsPerUser
+// sessions - a new one replaces their longest-quiet one - and a full table
+// makes room by evicting the node's longest-quiet session, once it has been
+// silent long enough that its client is surely gone.
+func (s *sessionStore) findOrCreateFor(
+	owner sessionOwner,
+	payload []byte,
+	uploadCompressionType uint8,
+	downloadCompressionType uint8,
+	maxPacketsPerBatch int,
+	maxClientUploadMTU int,
+	maxClientDownloadMTU int,
+) (*sessionRecord, bool, []closedSessionCleanup, error) {
 	if len(payload) != sessionInitDataSize || !isValidSessionResponseMode(payload[0]) {
-		return nil, false, nil
+		return nil, false, nil, nil
 	}
 
 	var signature [sessionInitDataSize]byte
@@ -285,20 +358,44 @@ func (s *sessionStore) findOrCreate(
 	if sessionID, ok := s.bySig[signature]; ok {
 		if existing := s.byID[sessionID]; existing != nil {
 			if nowUnixNano <= existing.reuseUntilUnixNano {
+				if existing.user != owner.user || existing.v2 != owner.v2 || existing.deviceAddr != owner.deviceAddr {
+					return nil, false, nil, errSessionSignatureTaken
+				}
 				existing.setLastActivityUnixNano(nowUnixNano)
-				return existing, true, nil
+				return existing, true, nil, nil
 			}
 		}
 		delete(s.bySig, signature)
 	}
 
+	var evicted []closedSessionCleanup
+	if owner.user != nil && s.maxSessionsPerUser > 0 {
+		count, quietest := s.userSessionsLocked(owner.user)
+		if count >= s.maxSessionsPerUser {
+			if quietest == nil || nowUnixNano-quietest.lastActivity() < perUserEvictIdle.Nanoseconds() {
+				return nil, false, nil, ErrSessionTableFull
+			}
+			evicted = append(evicted, s.evictLocked(quietest.ID, now))
+		}
+	}
+
 	slot := s.allocateSlotLocked()
 	if slot < 0 {
-		return nil, false, ErrSessionTableFull
+		if victim := s.quietestLocked(nowUnixNano, tableEvictIdle); victim != nil {
+			evicted = append(evicted, s.evictLocked(victim.ID, now))
+			slot = s.allocateSlotLocked()
+		}
+		if slot < 0 {
+			return nil, false, evicted, ErrSessionTableFull
+		}
 	}
 
 	record := &sessionRecord{
 		ID:                         uint8(slot),
+		user:                       owner.user,
+		v2:                         owner.v2,
+		keys:                       owner.keys,
+		deviceAddr:                 owner.deviceAddr,
 		ResponseMode:               payload[0],
 		CreatedAt:                  now,
 		ReuseUntil:                 now.Add(s.sessionInitTTL),
@@ -336,7 +433,62 @@ func (s *sessionStore) findOrCreate(
 	s.updateNextReuseSweepLocked(record.reuseUntilUnixNano)
 	delete(s.recentClosed, uint8(slot))
 	s.nextID = uint16(nextSessionID(uint8(slot)))
-	return record, false, nil
+	return record, false, evicted, nil
+}
+
+// userSessionsLocked counts a subscriber's sessions and finds their quietest.
+func (s *sessionStore) userSessionsLocked(user *userAccount) (int, *sessionRecord) {
+	count := 0
+	var quietest *sessionRecord
+	for id := 1; id <= maxServerSessionID; id++ {
+		record := s.byID[id]
+		if record == nil || record.user != user {
+			continue
+		}
+		count++
+		if quietest == nil || record.lastActivity() < quietest.lastActivity() {
+			quietest = record
+		}
+	}
+	return count, quietest
+}
+
+// quietestLocked is the session silent the longest, if silent at least minIdle.
+func (s *sessionStore) quietestLocked(nowUnixNano int64, minIdle time.Duration) *sessionRecord {
+	var quietest *sessionRecord
+	for id := 1; id <= maxServerSessionID; id++ {
+		record := s.byID[id]
+		if record == nil {
+			continue
+		}
+		if quietest == nil || record.lastActivity() < quietest.lastActivity() {
+			quietest = record
+		}
+	}
+	if quietest == nil || nowUnixNano-quietest.lastActivity() < minIdle.Nanoseconds() {
+		return nil
+	}
+	return quietest
+}
+
+// evictLocked removes a session exactly as an idle expiry does, so its client
+// is told "closed" and starts over.
+func (s *sessionStore) evictLocked(sessionID uint8, now time.Time) closedSessionCleanup {
+	record := s.byID[sessionID]
+	delete(s.bySig, record.Signature)
+	s.byID[sessionID] = nil
+	if s.activeCount > 0 {
+		s.activeCount--
+	}
+	if s.closedRetention > 0 {
+		s.recentClosed[sessionID] = closedSessionRecord{
+			Cookie:       record.Cookie,
+			ResponseMode: record.ResponseMode,
+			ExpiresAt:    now.Add(s.closedRetention),
+		}
+	}
+	record.markClosed()
+	return closedSessionCleanup{ID: sessionID, record: record}
 }
 
 func (s *sessionStore) expireReuseLocked(nowUnixNano int64) {
@@ -407,6 +559,16 @@ func (s *sessionStore) Lookup(sessionID uint8) (sessionLookupResult, bool) {
 }
 
 func (s *sessionStore) ValidateAndTouch(sessionID uint8, cookie uint8, now time.Time) sessionValidationResult {
+	return s.ValidateAndTouchAuth(sessionID, cookie, false, now)
+}
+
+// ValidateAndTouchAuth is ValidateAndTouch knowing whether the packet arrived
+// sealed under the session's own keys. A v2 session accepts nothing else: an
+// unsealed packet naming it is someone guessing its ID and cookie, and is
+// refused without refreshing the session's idle clock. A sealed packet is
+// equally refused by a v1 session, which has no keys it could have been
+// sealed with.
+func (s *sessionStore) ValidateAndTouchAuth(sessionID uint8, cookie uint8, sealed bool, now time.Time) sessionValidationResult {
 	s.mu.RLock()
 	if record := s.byID[sessionID]; record != nil {
 		result := sessionValidationResult{
@@ -415,8 +577,9 @@ func (s *sessionStore) ValidateAndTouch(sessionID uint8, cookie uint8, now time.
 				ResponseMode: record.ResponseMode,
 				State:        sessionLookupActive,
 			},
-			Known: true,
-			Valid: record.Cookie == cookie,
+			Known:    true,
+			Valid:    record.Cookie == cookie && sealed == record.v2,
+			Unsealed: record.v2 && !sealed,
 		}
 		if result.Valid {
 			view := record.runtimeView()
@@ -750,6 +913,11 @@ func (r *sessionRecord) applyMTUFromSessionInit(
 	r.UploadMTU = clampMTUToLimit(uploadMTU, effectiveUploadMax)
 	r.DownloadMTU = clampMTUToLimit(downloadMTU, effectiveDownloadMax)
 	r.DownloadMTUBytes = int(r.DownloadMTU)
+	if r.v2 {
+		// The client measured how large a response gets through; sealing adds
+		// a nonce and a tag to every one, so the payload must shrink by that.
+		r.DownloadMTUBytes = max(r.DownloadMTUBytes-sessioncrypto.DownOverhead, minSessionMTU)
+	}
 	r.MaxPackedBlocks = VpnProto.CalculateMaxPackedBlocks(r.DownloadMTUBytes, 80, maxPacketsPerBatch)
 }
 
@@ -774,6 +942,9 @@ func clampSessionInitAllowedMTU(value int) uint16 {
 func (r *sessionRecord) runtimeView() sessionRuntimeView {
 	return sessionRuntimeView{
 		user:                r.user,
+		v2:                  r.v2,
+		keys:                r.keys,
+		deviceAddr:          r.deviceAddr,
 		ID:                  r.ID,
 		Cookie:              r.Cookie,
 		ResponseMode:        r.ResponseMode,
@@ -1202,4 +1373,14 @@ func (r *sessionRecord) enqueueOrphanReset(packetType uint8, streamID uint16, se
 	key := orphanResetKey(packetType, streamID)
 	// Orphans have high priority (0).
 	r.OrphanQueue.Push(0, key, packet)
+}
+
+// deviceKey is what this session's traffic is counted against as a device:
+// the device the client declared (v2), or else the address the packet came
+// from - which, for a DNS tunnel, is a recursive resolver's.
+func (v *sessionRuntimeView) deviceKey(clientIP string) string {
+	if v != nil && v.deviceAddr != "" {
+		return v.deviceAddr
+	}
+	return clientIP
 }

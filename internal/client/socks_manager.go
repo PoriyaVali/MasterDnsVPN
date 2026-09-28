@@ -402,7 +402,7 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 		return
 	}
 
-	fragments := fragmentPayload(targetPayload, c.syncedUploadMTU)
+	fragments := fragmentPayload(targetPayload, c.uploadPayloadMTU())
 	total := uint8(len(fragments))
 	sn := uint16(0)
 

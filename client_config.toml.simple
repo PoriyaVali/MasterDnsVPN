@@ -39,6 +39,20 @@ DATA_ENCRYPTION_METHOD = 1
 # Must match the server-side key file contents.
 ENCRYPTION_KEY = ""
 
+# Session protocol v2 (multi-user nodes: needs UUID and NODE_SECRET).
+# Every packet of the session - both directions - is encrypted and
+# authenticated under keys derived from this subscriber's UUID, which other
+# subscribers do not have. Under v1 only client -> server traffic is encrypted,
+# under the node key every subscriber shares.
+# "auto" = use v2; if the node never answers it (a node older than v2), fall
+#          back to v1 - but never once any node has accepted v2 in this run.
+# "on"   = v2 only.  "off" = v1 only.
+SESSION_V2 = "auto"
+
+# Identifies this device to the node's device limit (v2). Any stable string;
+# only a hash of it is sent. Empty = the node counts resolver addresses.
+DEVICE_ID = ""
+
 # ------------------------------------------------------------------------------
 # 2) Local Proxy Listener
 # What this section does:

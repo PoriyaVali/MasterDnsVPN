@@ -261,6 +261,12 @@ func (c *Codec) chachaEncrypt(dst, data []byte) ([]byte, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, fmt.Errorf("generate chacha20 nonce: %w", err)
 	}
+	// The first four nonce bytes are the block counter's starting value. Drawn
+	// at random it could start within a few blocks of 2^32, and the cipher
+	// PANICS rather than wrap (x/crypto: "chacha20: counter overflow"). The top
+	// bit is cleared so a packet always has 2^31 blocks of room; decryption is
+	// unchanged, so peers on either side of this change still interoperate.
+	nonce[3] &= 0x7F
 
 	stream, err := chacha20.NewUnauthenticatedCipher(c.key, nonce[4:])
 	if err != nil {
@@ -281,6 +287,16 @@ func (c *Codec) chachaDecrypt(dst, data []byte) ([]byte, error) {
 
 	nonce := data[:chachaNonceSize]
 	ciphertext := data[chachaNonceSize:]
+
+	// 🔴 The counter comes off the wire. One whose value is too close to 2^32
+	// for this much ciphertext makes XORKeyStream panic, so a single crafted
+	// query (the server) or reply (the client) could take the process down.
+	// No honest peer produces one; treat it as the garbage it is.
+	counter := binary.LittleEndian.Uint32(nonce[:4])
+	blocks := (uint64(len(ciphertext)) + 63) / 64
+	if uint64(counter)+blocks > 1<<32 {
+		return nil, ErrInvalidCiphertext
+	}
 
 	if cap(dst) < len(ciphertext) {
 		dst = make([]byte, len(ciphertext))

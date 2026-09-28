@@ -35,6 +35,15 @@ type Options struct {
 	UseExternalSOCKS5 bool     // route egress through an upstream SOCKS5
 	ForwardIP         string   // upstream SOCKS5 host (when UseExternalSOCKS5)
 	ForwardPort       int      // upstream SOCKS5 port
+
+	// RequireSessionV2 refuses v1 sessions from registered users. Leave it off
+	// until every client in the field speaks v2 (see package sessioncrypto);
+	// with it off a node serves both.
+	RequireSessionV2 bool
+	// MaxSessionsPerUser caps one subscriber's live sessions; a new one then
+	// replaces their longest-silent one. 0 keeps the default (8); negative
+	// removes the cap.
+	MaxSessionsPerUser int
 }
 
 // Server is a running (or startable) MasterDnsVPN node.
@@ -65,6 +74,13 @@ func New(opts Options) (*Server, error) {
 	cfg.UseExternalSOCKS5 = opts.UseExternalSOCKS5
 	cfg.ForwardIP = opts.ForwardIP
 	cfg.ForwardPort = opts.ForwardPort
+	cfg.RequireSessionV2 = opts.RequireSessionV2
+	switch {
+	case opts.MaxSessionsPerUser > 0:
+		cfg.MaxSessionsPerUser = opts.MaxSessionsPerUser
+	case opts.MaxSessionsPerUser < 0:
+		cfg.MaxSessionsPerUser = 0
+	}
 	if opts.LogLevel != "" {
 		cfg.LogLevel = opts.LogLevel
 	}

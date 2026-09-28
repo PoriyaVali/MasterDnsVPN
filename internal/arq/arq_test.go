@@ -1802,6 +1802,10 @@ func TestARQ_FinHandshakeWaitsForInboundWriteDrain(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Fatal("expected close-read handshake to complete after inbound write drain")
 	}
+	// Done fires when the close begins; the goroutine finishing it still logs
+	// through t afterwards. Wait for it, or that log lands after the test has
+	// returned - a data race on t that fails `go test -race`.
+	a.wg.Wait()
 }
 
 func TestARQ_CloseReadAckTimeoutEscalatesToRST(t *testing.T) {

@@ -11,6 +11,7 @@ import (
 	"container/heap"
 	"context"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -60,6 +61,7 @@ type Server struct {
 	dnsFragmentTimeout       time.Duration
 	resolveDNSQueryFn        func([]byte) ([]byte, error)
 	dialStreamUpstreamFn     func(string, string, time.Duration) (net.Conn, error)
+	lookupTargetIPsFn        func(context.Context, string) ([]netip.Addr, error)
 	uploadCompressionMask    uint8
 	downloadCompressionMask  uint8
 	dropLogIntervalNanos     int64
@@ -125,6 +127,10 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 	sessions := newSessionStore(cfg.EffectiveSessionOrphanQueueInitialCap(), cfg.EffectiveStreamQueueInitialCapacity(), cfg.SessionInitReuseTTL(), cfg.RecentlyClosedStreamTTL(), cfg.RecentlyClosedStreamCap)
 	sessions.maxActiveSessions = cfg.MaxAllowedClientActiveSessions
 	sessions.maxActiveStreams = cfg.MaxAllowedClientActiveStreams
+	sessions.maxSessionsPerUser = cfg.MaxSessionsPerUser
+	if retention := cfg.ClosedSessionRetention(); retention > 0 {
+		sessions.closedRetention = retention
+	}
 	return &Server{
 		cfg:                    cfg,
 		log:                    log,
@@ -176,10 +182,27 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 		deferredInflightIndex: make(map[uint8]map[uint16]map[uint64]struct{}, 64),
 		packetPool: sync.Pool{
 			New: func() any {
-				return make([]byte, cfg.MaxPacketSize)
+				return make([]byte, udpReadBufferSize(cfg.MaxPacketSize))
 			},
 		},
 	}
+}
+
+// maxDNSQueryDatagram bounds the per-read buffer. Every request is a DNS query
+// whose payload rides in a <=255-byte name, so real ones are a few hundred
+// bytes; a larger datagram is truncated, fails to parse and is dropped, as a
+// junk one should be.
+//
+// ⚠️ Each queued request holds its buffer until a worker answers it. At the old
+// 64KB per buffer a full request queue (16384 by default) pinned a gigabyte of
+// memory - reachable by anyone able to send this port a flood of datagrams.
+const maxDNSQueryDatagram = 4096
+
+func udpReadBufferSize(configured int) int {
+	if configured <= 0 || configured > maxDNSQueryDatagram {
+		return maxDNSQueryDatagram
+	}
+	return configured
 }
 
 type throttledLogState struct {
@@ -282,6 +305,11 @@ func (s *throttledLogState) pruneLocked(nowUnixNano int64, interval time.Duratio
 	}
 }
 
+const (
+	minDNSDeferredWorkers = 4
+	maxDNSDeferredWorkers = 32
+)
+
 func splitDeferredSessionPools(totalWorkers int, totalQueue int) (dnsWorkers int, connectWorkers int, dnsQueue int, connectQueue int) {
 	if totalWorkers <= 0 {
 		totalWorkers = 1
@@ -290,9 +318,17 @@ func splitDeferredSessionPools(totalWorkers int, totalQueue int) (dnsWorkers int
 		totalQueue = 256
 	}
 
-	// DNS queries use a dedicated lightweight pool so connect-heavy work keeps
-	// the full user-configured deferred capacity.
-	dnsWorkers = 1
+	// DNS queries use a dedicated pool so connect-heavy work keeps the full
+	// user-configured deferred capacity.
+	//
+	// 🔴 It used to be ONE worker for the whole node. A tunnelled lookup blocks
+	// its worker for the upstream round trip - up to DNS_UPSTREAM_TIMEOUT, twice
+	// over when the host-resolver fallback runs, and up to
+	// DNS_INFLIGHT_WAIT_TIMEOUT when it waits on someone else's lookup - so one
+	// slow or dead name stalled DNS for every user on the node, and throughput
+	// was capped at one upstream round trip at a time. The work is waiting, not
+	// computing, so it takes as many workers as the connect pool.
+	dnsWorkers = min(max(totalWorkers, minDNSDeferredWorkers), maxDNSDeferredWorkers)
 	connectWorkers = totalWorkers
 
 	connectQueue = totalQueue
