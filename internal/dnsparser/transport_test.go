@@ -203,11 +203,155 @@ func TestBuildVPNResponsePacketPreservesOriginalQuestionCaseInAnswerName(t *test
 		t.Fatalf("unexpected parsed answer name: got=%q want=%q", parsed.Answers[0].Name, "anhfwjau21.aa.com")
 	}
 
+	// The answer names the question by pointer, so it carries the question's
+	// exact casing, which a 0x20 resolver checks it against.
 	rawMixedCase := encodeDNSName("ANHfwjAU21.aa.CoM")
 	questionEnd := dnsHeaderSize + len(rawMixedCase) + 4
-	answerStart := questionEnd
-	if !bytes.Equal(response[answerStart:answerStart+len(rawMixedCase)], rawMixedCase) {
-		t.Fatal("answer owner name must preserve original question wire casing")
+	if !bytes.Equal(response[dnsHeaderSize:dnsHeaderSize+len(rawMixedCase)], rawMixedCase) {
+		t.Fatal("question must keep its original wire casing")
+	}
+	if !bytes.Equal(response[questionEnd:questionEnd+2], []byte{0xC0, dnsHeaderSize}) {
+		t.Fatalf("answer owner name must point at the question, got % x", response[questionEnd:questionEnd+2])
+	}
+}
+
+func TestBuildVPNResponsePacketNamesOtherOwnerInFull(t *testing.T) {
+	query, err := BuildTXTQuestionPacket("x.v.example.com", Enums.DNS_RECORD_TYPE_TXT, 4096)
+	if err != nil {
+		t.Fatalf("BuildTXTQuestionPacket returned error: %v", err)
+	}
+	response, err := BuildVPNResponsePacket(query, "y.v.example.com", VpnProto.Packet{
+		SessionID:  9,
+		PacketType: Enums.PACKET_MTU_UP_RES,
+		Payload:    []byte("challenge"),
+	}, false)
+	if err != nil {
+		t.Fatalf("BuildVPNResponsePacket returned error: %v", err)
+	}
+	parsed, err := ParsePacket(response)
+	if err != nil {
+		t.Fatalf("ParsePacket(response) returned error: %v", err)
+	}
+	if len(parsed.Answers) != 1 || parsed.Answers[0].Name != "y.v.example.com" {
+		t.Fatalf("unexpected answers: %+v", parsed.Answers)
+	}
+}
+
+// What a resolver checks before it passes an answer on: the tunnel server is
+// the zone's authority, so its answers carry AA and never RA.
+func TestBuildVPNResponsePacketIsAuthoritative(t *testing.T) {
+	for _, size := range []int{9, 700} {
+		for _, baseEncode := range []bool{false, true} {
+			query, err := BuildTXTQuestionPacket("x.v.example.com", Enums.DNS_RECORD_TYPE_TXT, 4096)
+			if err != nil {
+				t.Fatalf("BuildTXTQuestionPacket returned error: %v", err)
+			}
+			query[3] |= 0x10 // CD
+			response, err := BuildVPNResponsePacket(query, "x.v.example.com", VpnProto.Packet{
+				SessionID:  9,
+				PacketType: Enums.PACKET_MTU_DOWN_RES,
+				Payload:    bytes.Repeat([]byte{0xAB}, size),
+			}, baseEncode)
+			if err != nil {
+				t.Fatalf("BuildVPNResponsePacket returned error: %v", err)
+			}
+			flags := binary.BigEndian.Uint16(response[2:4])
+			if flags&(1<<15) == 0 || flags&(1<<10) == 0 {
+				t.Fatalf("size=%d base=%v: QR and AA must be set, flags=%#04x", size, baseEncode, flags)
+			}
+			if flags&(1<<7) != 0 || flags&(1<<9) != 0 {
+				t.Fatalf("size=%d base=%v: RA and TC must be clear, flags=%#04x", size, baseEncode, flags)
+			}
+			if flags&(1<<8) == 0 || flags&(1<<4) == 0 {
+				t.Fatalf("size=%d base=%v: RD and CD must be copied, flags=%#04x", size, baseEncode, flags)
+			}
+		}
+	}
+}
+
+// A frame over 255 bytes goes in one TXT record of several strings, which
+// clients read by joining the strings; it is smaller than the chunked form.
+func TestBuildVPNResponsePacketUsesOneRecordForLargeFrames(t *testing.T) {
+	for _, baseEncode := range []bool{false, true} {
+		query, err := BuildTXTQuestionPacket("x.v.example.com", Enums.DNS_RECORD_TYPE_TXT, 4096)
+		if err != nil {
+			t.Fatalf("BuildTXTQuestionPacket returned error: %v", err)
+		}
+		payload := make([]byte, 900)
+		for i := range payload {
+			payload[i] = byte(i * 7)
+		}
+		packet := VpnProto.Packet{
+			SessionID:   7,
+			PacketType:  Enums.PACKET_MTU_DOWN_RES,
+			StreamID:    1,
+			SequenceNum: 2,
+			Payload:     payload,
+		}
+		response, err := BuildVPNResponsePacket(query, "x.v.example.com", packet, baseEncode)
+		if err != nil {
+			t.Fatalf("BuildVPNResponsePacket returned error: %v", err)
+		}
+		parsed, err := ParsePacket(response)
+		if err != nil {
+			t.Fatalf("ParsePacket(response) returned error: %v", err)
+		}
+		if len(parsed.Answers) != 1 {
+			t.Fatalf("base=%v: answers = %d, want 1", baseEncode, len(parsed.Answers))
+		}
+		rdata := parsed.Answers[0].RData
+		strs := 0
+		for off := 0; off < len(rdata); off += 1 + int(rdata[off]) {
+			strs++
+		}
+		if strs < 4 {
+			t.Fatalf("base=%v: %d character-strings, want the frame split over several", baseEncode, strs)
+		}
+
+		got, err := ExtractVPNResponse(response, baseEncode)
+		if err != nil {
+			t.Fatalf("base=%v: ExtractVPNResponse returned error: %v", baseEncode, err)
+		}
+		if !bytes.Equal(got.Payload, payload) || got.SequenceNum != 2 || got.StreamID != 1 {
+			t.Fatalf("base=%v: frame did not survive the round trip", baseEncode)
+		}
+
+		rawFrame, err := VpnProto.BuildRaw(VpnProto.BuildOptions{
+			SessionID: 7, PacketType: Enums.PACKET_MTU_DOWN_RES, StreamID: 1, SequenceNum: 2, Payload: payload,
+		})
+		if err != nil {
+			t.Fatalf("BuildRaw returned error: %v", err)
+		}
+		chunks, err := buildTXTAnswerChunks(rawFrame, baseEncode)
+		if err != nil {
+			t.Fatalf("buildTXTAnswerChunks returned error: %v", err)
+		}
+		legacy, err := BuildTXTResponsePacket(query, "x.v.example.com", chunks)
+		if err != nil {
+			t.Fatalf("BuildTXTResponsePacket returned error: %v", err)
+		}
+		if len(response) >= len(legacy) {
+			t.Fatalf("base=%v: one record is %d bytes, chunked %d", baseEncode, len(response), len(legacy))
+		}
+	}
+}
+
+func TestBuildVPNResponsePacketRejectsOversizedFrame(t *testing.T) {
+	query, err := BuildTXTQuestionPacket("x.v.example.com", Enums.DNS_RECORD_TYPE_TXT, 4096)
+	if err != nil {
+		t.Fatalf("BuildTXTQuestionPacket returned error: %v", err)
+	}
+	payload := make([]byte, 70000)
+	for i := range payload {
+		payload[i] = byte(i*31 + i>>8)
+	}
+	_, err = BuildVPNResponsePacket(query, "x.v.example.com", VpnProto.Packet{
+		SessionID:  7,
+		PacketType: Enums.PACKET_MTU_DOWN_RES,
+		Payload:    payload,
+	}, false)
+	if !errors.Is(err, ErrTXTAnswerTooLarge) {
+		t.Fatalf("err = %v, want ErrTXTAnswerTooLarge", err)
 	}
 }
 

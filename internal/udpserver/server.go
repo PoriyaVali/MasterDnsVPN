@@ -46,6 +46,7 @@ type Server struct {
 	authorizerMu             sync.RWMutex
 	authorizer               SessionAuthorizer
 	domainMatcher            *domainMatcher.Matcher
+	nxdomainBelowTunnel      bool
 	sessions                 *sessionStore
 	deferredDNSSession       *deferredSessionProcessor
 	deferredConnectSession   *deferredSessionProcessor
@@ -128,6 +129,7 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 		codec:                  codec,
 		users:                  newUserRegistry([]byte(cfg.NodeSecret)),
 		domainMatcher:          domainMatcher.New(cfg.Domain, cfg.MinVPNLabelLength),
+		nxdomainBelowTunnel:    cfg.NXDomainForNonTXTSubdomains,
 		sessions:               sessions,
 		deferredDNSSession:     newDeferredSessionProcessor(dnsDeferredWorkers, dnsDeferredQueue, log),
 		deferredConnectSession: newDeferredSessionProcessor(connectDeferredWorkers, connectDeferredQueue, log),

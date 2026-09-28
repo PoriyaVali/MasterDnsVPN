@@ -15,6 +15,14 @@
 # Must match client DOMAINS.
 DOMAIN = ["v.domain.com"]
 
+# Answer non-TXT queries for names under DOMAIN (A, AAAA, NS, ...) with
+# NXDOMAIN instead of an empty answer. Resolvers that use QNAME minimisation
+# ask such a query for every label of a tunnel name before the real TXT query;
+# NXDOMAIN stops that walk after the first label, which saves round trips on
+# every request. The domain itself still answers with an empty NOERROR.
+# Set to false only if a resolver on your path stops working with it.
+NXDOMAIN_FOR_NON_TXT_SUBDOMAINS = true
+
 # How this server should handle new connections.
 # Allowed values:
 # "SOCKS5" = the client/program chooses the destination for each connection.

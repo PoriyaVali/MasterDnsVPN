@@ -66,6 +66,7 @@ type ServerConfig struct {
 	ForwardPort                       int      `toml:"FORWARD_PORT"`
 	Domain                            []string `toml:"DOMAIN"`
 	MinVPNLabelLength                 int      `toml:"MIN_VPN_LABEL_LENGTH"`
+	NXDomainForNonTXTSubdomains       bool     `toml:"NXDOMAIN_FOR_NON_TXT_SUBDOMAINS"`
 	SupportedUploadCompressionTypes   []int    `toml:"SUPPORTED_UPLOAD_COMPRESSION_TYPES"`
 	SupportedDownloadCompressionTypes []int    `toml:"SUPPORTED_DOWNLOAD_COMPRESSION_TYPES"`
 	DataEncryptionMethod              int      `toml:"DATA_ENCRYPTION_METHOD"`
@@ -154,6 +155,7 @@ func defaultServerConfig() ServerConfig {
 		ForwardPort:                       1080,
 		Domain:                            nil,
 		MinVPNLabelLength:                 3,
+		NXDomainForNonTXTSubdomains:       true,
 		SupportedUploadCompressionTypes:   []int{0, 1, 2, 3},
 		SupportedDownloadCompressionTypes: []int{0, 1, 2, 3},
 		DataEncryptionMethod:              1,

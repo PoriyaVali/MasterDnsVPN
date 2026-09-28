@@ -53,7 +53,7 @@ func buildNameErrorResponseLite(packet []byte, parsed DnsParser.LitePacket) []by
 }
 
 func buildFormatErrorResponseLite(packet []byte, parsed DnsParser.LitePacket) []byte {
-	response, err := DnsParser.BuildFormatErrorResponseFromLite(packet, parsed)
+	response, err := DnsParser.BuildAuthoritativeFormatErrorResponseFromLite(packet, parsed)
 	if err != nil {
 		return nil
 	}
