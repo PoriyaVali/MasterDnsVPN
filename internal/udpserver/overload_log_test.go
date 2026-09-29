@@ -47,6 +47,7 @@ func TestRefusedSessionInitsAreReportedOncePerIntervalInFull(t *testing.T) {
 	store.maxActiveSessions = 100
 	store.maxSessionsPerUser = 8
 	s := &Server{log: logger.NewWithFile("test", "ERROR", path), sessions: store}
+	t.Cleanup(func() { _ = s.log.Close() }) // before TempDir's cleanup removes the file
 
 	for i := 0; i < 1000; i++ {
 		s.noteRefusedSessionInit(i%4 == 0)
