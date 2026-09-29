@@ -961,10 +961,20 @@ func TestARQ_ReceiveDataClearsQueuedNackWhenMissingDataArrives(t *testing.T) {
 	a.ReceiveData(0, []byte("packet 0"))
 	<-enqueuer.Packets
 
-	enqueuer.mu.Lock()
-	defer enqueuer.mu.Unlock()
-	if len(enqueuer.removedNackSeqs) != 1 || enqueuer.removedNackSeqs[0] != 0 {
-		t.Fatalf("expected queued NACK purge for seq 0, got %#v", enqueuer.removedNackSeqs)
+	// The purge follows the ACK on the receive goroutine, so the ACK can be
+	// seen before it happens: wait for it rather than race it.
+	deadline := time.Now().Add(time.Second)
+	for {
+		enqueuer.mu.Lock()
+		removed := append([]uint16(nil), enqueuer.removedNackSeqs...)
+		enqueuer.mu.Unlock()
+		if len(removed) == 1 && removed[0] == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected queued NACK purge for seq 0, got %#v", removed)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -2196,9 +2206,9 @@ func TestARQ_RxLoopShutdownDrainsPendingInboundQueueAccounting(t *testing.T) {
 	a.pendingInbound = 3
 	a.mu.Unlock()
 
-	a.rxChan <- rxPayload{sn: 10, data: []byte("a")}
-	a.rxChan <- rxPayload{sn: 20, data: []byte("b")}
-	a.rxChan <- rxPayload{sn: 30, data: []byte("c")}
+	a.rxQueue.push(rxPayload{sn: 10, data: []byte("a")})
+	a.rxQueue.push(rxPayload{sn: 20, data: []byte("b")})
+	a.rxQueue.push(rxPayload{sn: 30, data: []byte("c")})
 
 	a.wg.Add(1)
 	go a.rxLoop()

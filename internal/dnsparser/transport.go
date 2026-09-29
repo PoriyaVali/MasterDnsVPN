@@ -257,7 +257,9 @@ func BuildTXTResponsePacket(questionPacket []byte, answerName string, answerPayl
 }
 
 func BuildVPNResponsePacket(questionPacket []byte, answerName string, packet VpnProto.Packet, baseEncode bool) ([]byte, error) {
-	rawFrame, err := VpnProto.BuildRawAuto(VpnProto.BuildOptions{
+	scratch := getResponseScratch()
+	defer putResponseScratch(scratch)
+	rawFrame, err := VpnProto.BuildRawAutoInto(*scratch, VpnProto.BuildOptions{
 		SessionID:       packet.SessionID,
 		PacketType:      packet.PacketType,
 		SessionCookie:   packet.SessionCookie,
@@ -273,30 +275,98 @@ func BuildVPNResponsePacket(questionPacket []byte, answerName string, packet Vpn
 		return nil, err
 	}
 
-	answer, err := buildTXTAnswerRData(rawFrame, baseEncode)
+	*scratch = rawFrame[:0]
+	return buildTXTResponse(questionPacket, answerName, rawFrame, baseEncode)
+}
+
+// responseScratch holds a frame (and its base64 text) while a response is
+// built from it, so building a response allocates only the response. It
+// used to copy the payload four times: frame, (sealed frame,) TXT RDATA,
+// packet.
+var responseScratch = sync.Pool{New: func() any {
+	b := make([]byte, 0, 2048)
+	return &b
+}}
+
+func getResponseScratch() *[]byte { return responseScratch.Get().(*[]byte) }
+
+func putResponseScratch(b *[]byte) {
+	if cap(*b) > 64*1024 {
+		return
+	}
+	*b = (*b)[:0]
+	responseScratch.Put(b)
+}
+
+// buildTXTResponse answers questionPacket with data as one TXT record, split
+// into as many 255-byte character-strings as it needs, written straight
+// into the packet. Clients have always read a single record by joining its
+// strings; against one record per 255 bytes it saves 12 bytes of record
+// header and a chunk byte for every extra string, and a resolver cannot
+// reorder or drop part of it.
+func buildTXTResponse(questionPacket []byte, answerName string, data []byte, baseEncode bool) ([]byte, error) {
+	if baseEncode {
+		scratch := getResponseScratch()
+		defer putResponseScratch(scratch)
+		n := baseCodec.EncodedRawBase64Len(len(data))
+		if cap(*scratch) < n {
+			*scratch = make([]byte, 0, n)
+		}
+		encoded := (*scratch)[:n]
+		baseCodec.EncodeRawBase64Into(encoded, data)
+		data = encoded
+	}
+
+	strings := (len(data) + 254) / 255
+	if strings == 0 {
+		strings = 1
+	}
+	rdataLen := len(data) + strings
+	if rdataLen > 0xFFFF {
+		return nil, ErrTXTAnswerTooLarge
+	}
+	if len(questionPacket) < dnsHeaderSize {
+		return nil, ErrPacketTooShort
+	}
+
+	header := parseHeader(questionPacket)
+	questionBytes, questionCount, questionEndOffset := extractQuestionSection(questionPacket, header)
+	optStart, optLen := findOPTRecordRange(questionPacket, header, questionEndOffset)
+	nameBytes, err := responseAnswerNameBytes(questionPacket, questionBytes, answerName)
 	if err != nil {
 		return nil, err
 	}
-	return buildSingleTXTResponsePacket(questionPacket, answerName, answer)
-}
 
-// buildTXTAnswerRData carries the whole frame in one TXT record, split into
-// as many 255-byte character-strings as it needs. Clients have always read a
-// single record by joining its strings, so this is what they already accept;
-// against one record per 255 bytes it saves 12 bytes of record header and a
-// chunk byte for every extra string, and a resolver cannot reorder or drop
-// part of it.
-func buildTXTAnswerRData(rawFrame []byte, baseEncode bool) ([]byte, error) {
-	data := rawFrame
-	if baseEncode {
-		data = make([]byte, baseCodec.EncodedRawBase64Len(len(rawFrame)))
-		baseCodec.EncodeRawBase64Into(data, rawFrame)
+	response := make([]byte, dnsHeaderSize+len(questionBytes)+len(nameBytes)+10+rdataLen+optLen)
+	binary.BigEndian.PutUint16(response[0:2], header.ID)
+	binary.BigEndian.PutUint16(response[2:4], buildAuthoritativeResponseFlags(header.Flags, Enums.DNSR_CODE_NO_ERROR))
+	binary.BigEndian.PutUint16(response[4:6], questionCount)
+	binary.BigEndian.PutUint16(response[6:8], 1)
+	binary.BigEndian.PutUint16(response[10:12], uint16(getARCount(optLen)))
+
+	offset := dnsHeaderSize
+	offset += copy(response[offset:], questionBytes)
+	offset += copy(response[offset:], nameBytes)
+	binary.BigEndian.PutUint16(response[offset:offset+2], Enums.DNS_RECORD_TYPE_TXT)
+	binary.BigEndian.PutUint16(response[offset+2:offset+4], Enums.DNSQ_CLASS_IN)
+	binary.BigEndian.PutUint32(response[offset+4:offset+8], 0)
+	binary.BigEndian.PutUint16(response[offset+8:offset+10], uint16(rdataLen))
+	offset += 10
+	if len(data) == 0 {
+		response[offset] = 0
+		offset++
 	}
-	rdata := appendLengthPrefixedTXT(data)
-	if len(rdata) > 0xFFFF {
-		return nil, ErrTXTAnswerTooLarge
+	for start := 0; start < len(data); start += 255 {
+		end := min(start+255, len(data))
+		response[offset] = byte(end - start)
+		offset++
+		offset += copy(response[offset:], data[start:end])
 	}
-	return rdata, nil
+
+	if optLen > 0 {
+		copy(response[offset:], questionPacket[optStart:optStart+optLen])
+	}
+	return response, nil
 }
 
 func buildSingleTXTResponsePacket(questionPacket []byte, answerName string, answerPayload []byte) ([]byte, error) {
@@ -430,11 +500,7 @@ func ExtractVPNResponseWith(packet []byte, baseEncoded bool, open func([]byte) (
 // shape v1 answers now have. The sealed bytes are opaque; nothing in them is
 // read here.
 func BuildSealedVPNResponsePacket(questionPacket []byte, answerName string, sealed []byte, baseEncode bool) ([]byte, error) {
-	answer, err := buildTXTAnswerRData(sealed, baseEncode)
-	if err != nil {
-		return nil, err
-	}
-	return buildSingleTXTResponsePacket(questionPacket, answerName, answer)
+	return buildTXTResponse(questionPacket, answerName, sealed, baseEncode)
 }
 
 // assembleSealedBlob reads a sealed answer back: always one record, its

@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -110,6 +111,57 @@ type rtxJob struct {
 type rxPayload struct {
 	sn   uint16
 	data []byte
+}
+
+// rxQueue hands received payloads from the packet workers to rxLoop, in
+// order. It grows with the backlog instead of reserving its whole limit up
+// front: the channel it replaces held 512 payloads, 16 KB on every stream
+// whether it ever received a byte or not.
+type rxQueue struct {
+	mu     sync.Mutex
+	items  []rxPayload
+	limit  int
+	notify chan struct{}
+}
+
+func newRxQueue(limit int) *rxQueue {
+	return &rxQueue{limit: max(limit, 1), notify: make(chan struct{}, 1)}
+}
+
+// push queues p; false when the queue is at its limit.
+func (q *rxQueue) push(p rxPayload) bool {
+	q.mu.Lock()
+	if len(q.items) >= q.limit {
+		q.mu.Unlock()
+		return false
+	}
+	q.items = append(q.items, p)
+	q.mu.Unlock()
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
+	return true
+}
+
+// take moves everything queued into dst (reused) and empties the queue.
+func (q *rxQueue) take(dst []rxPayload) []rxPayload {
+	q.mu.Lock()
+	dst = append(dst[:0], q.items...)
+	clear(q.items)
+	if cap(q.items) > 64 {
+		q.items = nil
+	} else {
+		q.items = q.items[:0]
+	}
+	q.mu.Unlock()
+	return dst
+}
+
+func (q *rxQueue) len() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return len(q.items)
 }
 
 var setupControlPacketTypes = map[uint8]bool{
@@ -219,7 +271,9 @@ type ARQ struct {
 	cancel         context.CancelFunc
 	wg             sync.WaitGroup
 	flushSignal    chan struct{}
-	rxChan         chan rxPayload
+	rtxWake        chan struct{}
+	rtxQuiet       atomic.Bool // retransmitLoop is in its quiet-mode sleep
+	rxQueue        *rxQueue
 	pendingInbound int
 }
 
@@ -361,6 +415,7 @@ func NewARQ(streamID uint16, sessionID uint8, enqueuer PacketEnqueuer, localConn
 		windowNotFull:     make(chan struct{}, 1),
 		writeLock:         sync.Mutex{},
 		flushSignal:       make(chan struct{}, 1),
+		rtxWake:           make(chan struct{}, 1),
 
 		inactivityTimeout:    time.Duration(maxF(120.0, cfg.InactivityTimeout) * float64(time.Second)),
 		dataPacketTTL:        time.Duration(maxF(120.0, cfg.DataPacketTTL) * float64(time.Second)),
@@ -380,7 +435,7 @@ func NewARQ(streamID uint16, sessionID uint8, enqueuer PacketEnqueuer, localConn
 		firstDataNackSeen: make(map[uint16]time.Time),
 		lastDataNackSent:  make(map[uint16]time.Time),
 
-		rxChan: make(chan rxPayload, func() int {
+		rxQueue: newRxQueue(func() int {
 			if cfg.InboundQueueSize > 0 {
 				return cfg.InboundQueueSize
 			}
@@ -557,6 +612,14 @@ const (
 // Flow Control & Shared State Helpers
 // ---------------------------------------------------------------------
 
+// interruptLocalReadLocked wakes ioLoop out of a blocked read of the local
+// connection, so it sees stopLocalRead or closed. Caller holds a.mu.
+func (a *ARQ) interruptLocalReadLocked() {
+	if c, ok := a.localConn.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = c.SetReadDeadline(time.Unix(1, 0))
+	}
+}
+
 func (a *ARQ) signalWindowNotFull() {
 	select {
 	case a.windowNotFull <- struct{}{}:
@@ -564,17 +627,11 @@ func (a *ARQ) signalWindowNotFull() {
 	}
 }
 
-func (a *ARQ) waitWindowNotFull() {
-	timer := time.NewTimer(200 * time.Millisecond)
+// waitWindowNotFull blocks while the send window is full. timer belongs to
+// the caller (ioLoop) and is reused; it used to be a new timer per call, one
+// allocation for every read of the local connection.
+func (a *ARQ) waitWindowNotFull(timer *time.Timer) {
 	waitStarted := time.Time{}
-	defer func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-	}()
 
 	for {
 		a.mu.RLock()
@@ -604,6 +661,19 @@ func (a *ARQ) waitWindowNotFull() {
 		case <-a.ctx.Done():
 			return
 		}
+	}
+}
+
+// wakeRetransmit ends a quiet-mode sleep of retransmitLoop, so a packet sent
+// or received after a long silence is tracked on its normal schedule. On a
+// busy stream the loop is not in quiet mode and this is one atomic load.
+func (a *ARQ) wakeRetransmit() {
+	if !a.rtxQuiet.Load() {
+		return
+	}
+	select {
+	case a.rtxWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -824,6 +894,7 @@ func (a *ARQ) MarkCloseWriteReceived() {
 	}
 	a.closeWriteReceived = true
 	a.stopLocalRead = true
+	a.interruptLocalReadLocked()
 
 	if remover, ok := a.enqueuer.(queuedDataRemover); ok {
 		for sn := range a.sndBuf {
@@ -1077,6 +1148,7 @@ func (a *ARQ) MarkRstReceived() {
 
 	a.rstReceived = true
 	a.stopLocalRead = true
+	a.interruptLocalReadLocked()
 	a.clearOutboundStateLocked(true)
 	a.setState(StateReset)
 	a.mu.Unlock()
@@ -1108,17 +1180,20 @@ func (a *ARQ) ioLoop() {
 
 	buf := make([]byte, max(a.mtu, 1))
 	ioReadyTimer := time.NewTimer(100 * time.Millisecond)
+	windowTimer := time.NewTimer(time.Hour)
 	defer func() {
-		if !ioReadyTimer.Stop() {
-			select {
-			case <-ioReadyTimer.C:
-			default:
+		for _, t := range []*time.Timer{ioReadyTimer, windowTimer} {
+			if !t.Stop() {
+				select {
+				case <-t.C:
+				default:
+				}
 			}
 		}
 	}()
 
 	for !a.isClosed() {
-		a.waitWindowNotFull()
+		a.waitWindowNotFull(windowTimer)
 
 		a.mu.Lock()
 		if a.stopLocalRead || a.closed {
@@ -1153,10 +1228,9 @@ func (a *ARQ) ioLoop() {
 		localConn := a.localConn
 		a.mu.Unlock()
 
-		if c, ok := localConn.(interface{ SetReadDeadline(time.Time) error }); ok {
-			_ = c.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		}
-
+		// The read blocks until data, EOF or close. It used to wake every
+		// 500 ms to look at the stop flags - two syscalls a second on every
+		// idle stream; interruptLocalRead now wakes it when they change.
 		n, err := localConn.Read(buf)
 		if n > 0 {
 			transientReadSince = time.Time{}
@@ -1180,6 +1254,7 @@ func (a *ARQ) ioLoop() {
 				TTL:             0,
 			}
 			a.mu.Unlock()
+			a.wakeRetransmit()
 
 			ok := a.enqueuer.PushTXPacket(
 				Enums.DefaultPacketPriority(Enums.PACKET_STREAM_DATA),
@@ -1275,6 +1350,7 @@ func (a *ARQ) deferTerminalPacket(reason string, packetType uint8) {
 	}
 
 	a.stopLocalRead = true
+	a.interruptLocalReadLocked()
 	a.deferredClose = true
 	a.deferredReason = reason
 	a.deferredPacket = packetType
@@ -1344,6 +1420,7 @@ func (a *ARQ) emitTerminalPacketWithTTL(packetType uint8, reason string, ttl tim
 
 	a.closeReason = reason
 	a.stopLocalRead = true
+	a.interruptLocalReadLocked()
 	a.deferredClose = false
 	a.deferredReason = ""
 	a.deferredDeadline = time.Time{}
@@ -1419,6 +1496,37 @@ func (a *ARQ) emitTerminalPacketWithTTL(packetType uint8, reason string, ttl tim
 // Retransmit Scheduler
 // ---------------------------------------------------------------------
 
+const (
+	// arqQuietAfter is how long an open stream must be silent, with nothing
+	// in flight, before its housekeeping slows down.
+	arqQuietAfter = 5 * time.Second
+	// arqQuietCheckInterval is the housekeeping tick of a quiet stream. A
+	// busy stream checks every RTO/3; an idle one used to check every
+	// 0.2-0.7 s for ever, which on a node with thousands of open, idle
+	// connections was thousands of wakeups a second for nothing. Anything
+	// sent or received wakes it at once (wakeRetransmit).
+	arqQuietCheckInterval = 2 * time.Second
+)
+
+// isQuietLocked reports an open stream with nothing to retransmit, nothing
+// to reorder, no close in progress, and no traffic for arqQuietAfter.
+// Caller holds a.mu.
+func (a *ARQ) isQuietLocked(now time.Time) bool {
+	return a.state == StateOpen &&
+		len(a.rcvBuf) == 0 &&
+		a.pendingInbound == 0 &&
+		!a.deferredClose &&
+		!a.waitingAck &&
+		!a.rstSent &&
+		!a.rstReceived &&
+		!a.closeReadSent &&
+		!a.closeReadReceived &&
+		!a.closeWriteSent &&
+		!a.closeWriteReceived &&
+		a.clientEOFAt.IsZero() &&
+		now.Sub(a.lastActivity) >= arqQuietAfter
+}
+
 func (a *ARQ) retransmitLoop() {
 	defer a.wg.Done()
 
@@ -1442,11 +1550,18 @@ func (a *ARQ) retransmitLoop() {
 		baseInterval := max(rtoFactor/3, 50*time.Millisecond)
 
 		hasPending := len(a.sndBuf) > 0 || (a.enableControlReliability && len(a.controlSndBuf) > 0)
+		quiet := !hasPending && a.isQuietLocked(time.Now())
+		// Set under a.mu: anything added to the buffers after this point is
+		// added after the lock is released, and its wakeRetransmit sees it.
+		a.rtxQuiet.Store(quiet)
 		a.mu.Unlock()
 
 		interval := baseInterval
 		if !hasPending {
 			interval = max(baseInterval*4, 100*time.Millisecond)
+		}
+		if quiet {
+			interval = arqQuietCheckInterval
 		}
 
 		if !timer.Stop() {
@@ -1460,7 +1575,9 @@ func (a *ARQ) retransmitLoop() {
 		case <-a.ctx.Done():
 			return
 		case <-timer.C:
+		case <-a.rtxWake:
 		}
+		a.rtxQuiet.Store(false)
 
 		func() {
 			defer func() {
@@ -1504,44 +1621,42 @@ func (a *ARQ) ReceiveData(sn uint16, data []byte) bool {
 
 	safeData := append([]byte(nil), data...)
 
-	select {
-	case a.rxChan <- rxPayload{sn: sn, data: safeData}:
+	if a.rxQueue.push(rxPayload{sn: sn, data: safeData}) {
 		return true
-	default:
-		a.mu.Lock()
-		if a.pendingInbound > 0 {
-			a.pendingInbound--
-		}
-		a.mu.Unlock()
-		return false
 	}
+	a.mu.Lock()
+	if a.pendingInbound > 0 {
+		a.pendingInbound--
+	}
+	a.mu.Unlock()
+	return false
 }
 
 func (a *ARQ) rxLoop() {
 	defer a.wg.Done()
 
+	var batch []rxPayload
 	for {
 		select {
 		case <-a.ctx.Done():
-			drained := 0
-			for {
-				select {
-				case <-a.rxChan:
-					drained++
-				default:
-					if drained > 0 {
-						a.mu.Lock()
-						a.pendingInbound -= drained
-						if a.pendingInbound < 0 {
-							a.pendingInbound = 0
-						}
-						a.mu.Unlock()
-					}
-					return
+			if drained := len(a.rxQueue.take(nil)); drained > 0 {
+				a.mu.Lock()
+				a.pendingInbound -= drained
+				if a.pendingInbound < 0 {
+					a.pendingInbound = 0
 				}
+				a.mu.Unlock()
 			}
-		case payload := <-a.rxChan:
-			a.processReceivedData(payload.sn, payload.data)
+			return
+		case <-a.rxQueue.notify:
+			batch = a.rxQueue.take(batch)
+			for i := range batch {
+				a.processReceivedData(batch[i].sn, batch[i].data)
+				batch[i] = rxPayload{}
+			}
+			if cap(batch) > 64 {
+				batch = nil
+			}
 		}
 	}
 }
@@ -1598,6 +1713,7 @@ func (a *ARQ) processReceivedData(sn uint16, data []byte) {
 		a.rcvBuf[sn] = data
 	}
 	a.mu.Unlock()
+	a.wakeRetransmit()
 
 	a.enqueuer.PushTXPacket(
 		Enums.DefaultPacketPriority(Enums.PACKET_STREAM_DATA_ACK),
@@ -2157,6 +2273,7 @@ func (a *ARQ) SendControlPacketWithTTL(packetType uint8, sequenceNum uint16, fra
 		lastSentAt = now.Add(-initialRTO)
 	}
 
+	a.wakeRetransmit()
 	a.controlSndBuf[key] = &arqControlItem{
 		PacketType:     packetType,
 		SequenceNum:    sequenceNum,
@@ -2698,8 +2815,8 @@ func (a *ARQ) finalizeClose(reason string) {
 	controlSndBufLen := len(a.controlSndBuf)
 	contiguousReady := a.contiguousReadyLocked()
 	pendingInbound := a.pendingInbound
-	rxQueueLen := len(a.rxChan)
-	rxQueueCap := cap(a.rxChan)
+	rxQueueLen := a.rxQueue.len()
+	rxQueueCap := a.rxQueue.limit
 	prevState := a.state
 	closeReadSent := a.closeReadSent
 	closeReadReceived := a.closeReadReceived

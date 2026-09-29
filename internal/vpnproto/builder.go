@@ -22,6 +22,12 @@ type BuildOptions struct {
 }
 
 func BuildRaw(opts BuildOptions) ([]byte, error) {
+	return BuildRawInto(nil, opts)
+}
+
+// BuildRawInto is BuildRaw writing into dst's storage when it is large
+// enough, so a caller that reuses dst allocates nothing per frame.
+func BuildRawInto(dst []byte, opts BuildOptions) ([]byte, error) {
 	flags := packetFlags[opts.PacketType]
 	if flags&packetFlagValid == 0 {
 		return nil, ErrInvalidPacketType
@@ -41,7 +47,12 @@ func BuildRaw(opts BuildOptions) ([]byte, error) {
 		headerLen++
 	}
 
-	raw := make([]byte, headerLen+len(opts.Payload))
+	var raw []byte
+	if size := headerLen + len(opts.Payload); cap(dst) >= size {
+		raw = dst[:size]
+	} else {
+		raw = make([]byte, size)
+	}
 	raw[0] = opts.SessionID
 	raw[1] = opts.PacketType
 	offset := 2
