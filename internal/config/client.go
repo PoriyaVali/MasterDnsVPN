@@ -112,6 +112,22 @@ type ClientConfig struct {
 	PingWarmThresholdSeconds              float64           `toml:"PING_WARM_THRESHOLD_SECONDS"`
 	PingCoolThresholdSeconds              float64           `toml:"PING_COOL_THRESHOLD_SECONDS"`
 	PingColdThresholdSeconds              float64           `toml:"PING_COLD_THRESHOLD_SECONDS"`
+	// While app connections are open, idle polling stays at this interval for
+	// this long after the last traffic instead of dropping to the cold
+	// interval. A DNS server can only answer a query, so this is how long an
+	// incoming chat message can wait at the server: up to the cold interval
+	// (15 s) without it. A window of 0 turns it off.
+	PingStreamIdleIntervalSeconds         float64           `toml:"PING_STREAM_IDLE_INTERVAL_SECONDS"`
+	PingStreamIdleWindowSeconds           float64           `toml:"PING_STREAM_IDLE_WINDOW_SECONDS"`
+	// Queries kept in flight while the server still has data to send. Every
+	// answer carries one packet, so this is what download speed scales with.
+	// 0 = auto (4 x RX_TX_WORKERS, 32..256), negative = off.
+	PullPipelineDepth                     int               `toml:"PULL_PIPELINE_DEPTH"`
+	// Send a new connection's first bytes right behind its SYN, when the
+	// server says it holds them (servers that predate this never see it).
+	// Saves one tunnel round trip per connection. A connection the server
+	// then cannot open is closed instead of refused with a SOCKS error.
+	EarlyData                             bool              `toml:"EARLY_DATA"`
 	RXChannelSize                         int               `toml:"RX_CHANNEL_SIZE"`
 	DNSResponseFragmentTimeoutSeconds     float64           `toml:"DNS_RESPONSE_FRAGMENT_TIMEOUT_SECONDS"`
 	SOCKSUDPAssociateReadTimeoutSeconds   float64           `toml:"SOCKS_UDP_ASSOCIATE_READ_TIMEOUT_SECONDS"`
@@ -253,6 +269,10 @@ func defaultClientConfig() ClientConfig {
 		PingWarmThresholdSeconds:              8.0,
 		PingCoolThresholdSeconds:              20.0,
 		PingColdThresholdSeconds:              30.0,
+		PingStreamIdleIntervalSeconds:         3.0,
+		PingStreamIdleWindowSeconds:           120.0,
+		PullPipelineDepth:                     0,
+		EarlyData:                             true,
 		RXChannelSize:                         4096,
 		DNSResponseFragmentTimeoutSeconds:     60.0,
 		SOCKSUDPAssociateReadTimeoutSeconds:   30.0,
@@ -555,6 +575,15 @@ func finalizeClientConfigCommon(cfg ClientConfig, requireTunnel bool) (ClientCon
 	cfg.PingWarmThresholdSeconds = clampFloat(defaultFloatAtMostZero(cfg.PingWarmThresholdSeconds, 8.0), 0.1, 600.0)
 	cfg.PingCoolThresholdSeconds = clampFloat(defaultFloatAtMostZero(cfg.PingCoolThresholdSeconds, 20.0), cfg.PingWarmThresholdSeconds, 1800.0)
 	cfg.PingColdThresholdSeconds = clampFloat(defaultFloatAtMostZero(cfg.PingColdThresholdSeconds, 30.0), cfg.PingCoolThresholdSeconds, 3600.0)
+	cfg.PingStreamIdleIntervalSeconds = clampFloat(defaultFloatAtMostZero(cfg.PingStreamIdleIntervalSeconds, 3.0), cfg.PingCooldownIntervalSeconds, cfg.PingColdIntervalSeconds)
+	cfg.PingStreamIdleWindowSeconds = clampFloat(cfg.PingStreamIdleWindowSeconds, 0, 86400.0)
+	if cfg.PullPipelineDepth == 0 {
+		// Auto: scales with the parallelism the profile already asks for
+		// (the Android app's throttled/balanced/clean profiles use 8/24/64
+		// workers), never so low that it does nothing.
+		cfg.PullPipelineDepth = clampInt(4*cfg.RX_TX_Workers, 32, 256)
+	}
+	cfg.PullPipelineDepth = clampInt(cfg.PullPipelineDepth, -1, 256)
 	cfg.RXChannelSize = clampInt(defaultIntBelow(cfg.RXChannelSize, 1, 4096), 64, 65536)
 	cfg.DNSResponseFragmentTimeoutSeconds = clampFloat(defaultFloatAtMostZero(cfg.DNSResponseFragmentTimeoutSeconds, 60.0), 1.0, 600.0)
 	cfg.SOCKSUDPAssociateReadTimeoutSeconds = clampFloat(defaultFloatAtMostZero(cfg.SOCKSUDPAssociateReadTimeoutSeconds, 30.0), 1.0, 3600.0)
@@ -688,6 +717,14 @@ func (c ClientConfig) PingAggressiveInterval() time.Duration {
 
 func (c ClientConfig) PingLazyInterval() time.Duration {
 	return time.Duration(c.PingLazyIntervalSeconds * float64(time.Second))
+}
+
+func (c ClientConfig) PingStreamIdleInterval() time.Duration {
+	return time.Duration(c.PingStreamIdleIntervalSeconds * float64(time.Second))
+}
+
+func (c ClientConfig) PingStreamIdleWindow() time.Duration {
+	return time.Duration(c.PingStreamIdleWindowSeconds * float64(time.Second))
 }
 
 func (c ClientConfig) PingCooldownInterval() time.Duration {

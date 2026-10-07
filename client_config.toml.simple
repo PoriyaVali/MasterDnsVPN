@@ -304,6 +304,26 @@ PING_WARM_THRESHOLD_SECONDS = 8.0
 PING_COOL_THRESHOLD_SECONDS = 20.0
 PING_COLD_THRESHOLD_SECONDS = 30.0
 
+# While app connections are open (chat apps keep theirs open), idle polling
+# stays at this interval for this long after the last traffic, instead of the
+# cold interval above. A DNS server can only answer, so an incoming message
+# waits at the server until the next poll: up to 15 s at the cold interval.
+# Idle polls are sent once, not duplicated. A window of 0 turns this off.
+PING_STREAM_IDLE_INTERVAL_SECONDS = 3.0
+PING_STREAM_IDLE_WINDOW_SECONDS = 120.0
+
+# Queries kept in flight while the server still has data to send. Each answer
+# carries one packet, so download speed scales with this; it does not add
+# traffic (about one query per packet either way), it sends them sooner.
+# 0 = auto (4 x RX_TX_WORKERS, between 32 and 256), negative = off.
+PULL_PIPELINE_DEPTH = 0
+
+# Send a new connection's first bytes (TLS hello, HTTP request) right behind
+# its SYN instead of waiting for CONNECTED: one tunnel round trip less per
+# connection. Used only with servers that offer it. A target the server then
+# cannot reach is closed instead of refused with a SOCKS error.
+EARLY_DATA = true
+
 # ------------------------------------------------------------------------------
 # 8) ARQ Reliability & Packing
 # What this section does:

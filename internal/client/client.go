@@ -177,6 +177,14 @@ type Client struct {
 	// awaitingReplySince is when the oldest send still without any answer
 	// went out (UnixNano), 0 when every send has been answered.
 	awaitingReplySince atomic.Int64
+
+	// Download pipelining (pull.go): queries in flight, and PING frames queued
+	// to pull data but not yet sent.
+	queries     *queryTracker
+	pullsQueued atomic.Int64
+
+	// serverCaps: the live session's SESSION_ACCEPT capabilities.
+	serverCaps atomic.Uint32
 }
 
 // clientStreamTXPacket represents a queued packet pending transmission or retransmission.
@@ -233,6 +241,9 @@ type plannerTask struct {
 	wasPacked bool
 	item      *clientStreamTXPacket
 	selected  *Stream_client
+	// pull: a poll from pull.go, queued here directly rather than through
+	// a stream, so it carries no item.
+	pull bool
 }
 
 type encodedOutboundDatagram struct {
@@ -246,6 +257,7 @@ type writerTask struct {
 	item      *clientStreamTXPacket
 	selected  *Stream_client
 	frames    []encodedOutboundDatagram
+	pull      bool
 }
 
 // Bootstrap initializes a new Client by loading configuration, setting up logging,
@@ -408,6 +420,7 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		orphanQueue:            mlq.New[VpnProto.Packet](cfg.EffectiveOrphanQueueInitialCapacity()),
 		sessionResetSignal:     make(chan struct{}, 1),
 		socksRateLimit:         newSocksRateLimiter(),
+		queries:                newQueryTracker(),
 	}
 
 	if c.streamResolverFailoverResendThreshold < 1 {

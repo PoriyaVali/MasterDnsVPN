@@ -742,6 +742,19 @@ What it does and does not do:
 
 ---
 
+### 3.4.12) 🚀 Speed and Latency
+
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
+| :--- | :--- | :--- | :--- |
+| `EARLY_DATA` | `true` | `true` / `false` | A new connection's first bytes (TLS hello, HTTP request) go right behind its SYN instead of waiting for `CONNECTED`: **one tunnel round trip less per connection** (measured: connect-to-first-byte 448 → 240 ms on a 120 ms path, 1050 → 538 ms on a 400 ms path with 5% loss). Used only with servers that announce it (`EARLY_DATA_ENABLED`); older servers are used as before. A target the server cannot reach is closed instead of refused with a SOCKS error — through the Android TUN that was already the case. |
+| `PULL_PIPELINE_DEPTH` | `0` | `0` = auto (4 × `RX_TX_WORKERS`, 32..256), negative = off, up to 256 | Each DNS answer carries one packet, so download speed is (queries in flight) ÷ RTT. While the server still has data, every data packet that arrives adds one poll until this many queries are in flight. It does not add traffic — a transfer still takes about one query per packet — it sends them sooner. Measured on a 120 ms path with 2% loss: one download 47 → ~178 KiB/s, eight parallel downloads 55 → 113–153 KiB/s. |
+| `PING_STREAM_IDLE_INTERVAL_SECONDS` | `3.0` | between the cooldown and cold intervals | While app connections are open, idle polling stays at this interval instead of dropping to `PING_COLD_INTERVAL_SECONDS` (15 s). A DNS server cannot send until it is asked, so an incoming Telegram/WhatsApp message used to wait up to 15 s; now at most this long. These idle polls go out once, not duplicated. |
+| `PING_STREAM_IDLE_WINDOW_SECONDS` | `120.0` | `0..86400`, `0` = off | How long after the last traffic the interval above applies; after that the tunnel goes cold as before. |
+
+Also changed without a setting: the ARQ's retransmission timeout now follows the measured round trip down to 200 ms (it used to stay at the configured start value, 1 s by default, so every lost packet cost a second or more), and the 100 ms aggressive ping really is 100 ms (it used to come out at 100–200 ms).
+
+---
+
 ## Section 3.5: 📖 Server Configuration (`server_config.toml`)
 
 > ℹ️ Note: the sample server config contains a key named `CONFIG_VERSION`, but the current Go code does not read it into `ServerConfig`. For that reason it is not included in the table below and has no effect on real server behavior.

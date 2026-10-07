@@ -30,7 +30,20 @@ type PingManager struct {
 	wg         sync.WaitGroup
 	wakeCh     chan struct{}
 	lastWokeAt atomic.Int64
+
+	// idle: the current interval is a quiet-tunnel one (cooldown or longer).
+	// Those pings only keep the session alive and poll for pushes, so they
+	// go out once instead of duplicated (see runtimePacketDuplicationCount).
+	idle atomic.Bool
 }
+
+// pingMinWait is the shortest the loop sleeps. Pings themselves are paced
+// by the interval; this only bounds how often the loop wakes to check.
+const pingMinWait = 10 * time.Millisecond
+
+// pingMaxWait: tiers depend on how long the tunnel has been quiet, so the
+// loop looks again at least this often even when the next ping is far off.
+const pingMaxWait = time.Second
 
 func newPingManager(client *Client) *PingManager {
 	now := time.Now().UnixNano()
@@ -128,6 +141,11 @@ func (p *PingManager) nextInterval(nowNano int64) time.Duration {
 		return p.client.cfg.PingLazyInterval()
 	case minIdle < coldThresholdNano:
 		return p.client.cfg.PingCooldownInterval()
+	case minIdle < int64(p.client.cfg.PingStreamIdleWindow()) && p.client.ActiveStreamCount() > 0:
+		// 🔑 A chat app's connection sits open and silent until a message
+		// comes in, and the server cannot send it until this client asks.
+		// At the cold interval that is up to 15 s late; here, a few.
+		return p.client.cfg.PingStreamIdleInterval()
 	default:
 		return p.client.cfg.PingColdInterval()
 	}
@@ -140,6 +158,11 @@ func (p *PingManager) pingLoop() {
 	timer := time.NewTimer(p.client.cfg.PingAggressiveInterval())
 	defer timer.Stop()
 
+	// When this loop last queued a ping. lastPingSentAt is only stamped once
+	// the dispatcher sends it, and judging by that alone, a loop that wakes
+	// sooner than the send would queue the same ping twice.
+	var lastQueued int64
+
 	for {
 		select {
 		case <-p.ctx.Done():
@@ -148,42 +171,28 @@ func (p *PingManager) pingLoop() {
 		case <-timer.C:
 		}
 
-		now := time.Now()
-		nowNano := now.UnixNano()
+		nowNano := time.Now().UnixNano()
 		interval := p.nextInterval(nowNano)
-		lastPing := p.lastPingSentAt.Load()
+		p.idle.Store(interval >= p.client.cfg.PingCooldownInterval())
+		lastPing := max64(p.lastPingSentAt.Load(), lastQueued)
 
-		if nowNano-lastPing >= int64(interval) {
-			if p.client.SessionReady() {
-				payload, err := buildClientPingPayload()
-				if err == nil {
-					// Use Stream 0 for pings
-					p.client.streamsMu.RLock()
-					s0 := p.client.active_streams[0]
-					p.client.streamsMu.RUnlock()
-
-					if s0 != nil {
-						s0.PushTXPacket(
-							Enums.DefaultPacketPriority(Enums.PACKET_PING),
-							Enums.PACKET_PING,
-							p.nextPingSequence(),
-							0,
-							0,
-							0,
-							0,
-							payload,
-						)
-					}
-				}
+		if nowNano-lastPing >= int64(interval) && p.client.SessionReady() {
+			if p.queuePing() {
+				lastQueued = nowNano
+				lastPing = nowNano
 			}
 		}
 
-		checkInterval := interval / 2
-		if checkInterval < 100*time.Millisecond {
-			checkInterval = 100 * time.Millisecond
+		// ⚠️ Sleep until the next ping is due, not a fixed fraction of the
+		// interval. This used to wake every interval/2 but never sooner than
+		// 100 ms, so the 100 ms aggressive interval came out at 100-200 ms -
+		// and a reply waiting at the server waits for the next ping.
+		wait := time.Duration(lastPing + int64(interval) - nowNano)
+		if wait < pingMinWait {
+			wait = pingMinWait
 		}
-		if checkInterval > 1*time.Second {
-			checkInterval = 1 * time.Second
+		if wait > pingMaxWait {
+			wait = pingMaxWait
 		}
 
 		if !timer.Stop() {
@@ -192,8 +201,40 @@ func (p *PingManager) pingLoop() {
 			default:
 			}
 		}
-		timer.Reset(checkInterval)
+		timer.Reset(wait)
 	}
+}
+
+// queuePing puts one PING on stream 0. Every answer to a query carries
+// whatever the server has queued, so a ping also pulls data down.
+func (p *PingManager) queuePing() bool {
+	payload, err := buildClientPingPayload()
+	if err != nil {
+		return false
+	}
+	p.client.streamsMu.RLock()
+	s0 := p.client.active_streams[0]
+	p.client.streamsMu.RUnlock()
+	if s0 == nil {
+		return false
+	}
+	return s0.PushTXPacket(
+		Enums.DefaultPacketPriority(Enums.PACKET_PING),
+		Enums.PACKET_PING,
+		p.nextPingSequence(),
+		0,
+		0,
+		0,
+		0,
+		payload,
+	)
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (p *PingManager) nextPingSequence() uint16 {

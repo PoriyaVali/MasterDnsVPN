@@ -44,6 +44,10 @@ type Options struct {
 	// replaces their longest-silent one. 0 keeps the default (8); negative
 	// removes the cap.
 	MaxSessionsPerUser int
+	// DisableEarlyData stops offering early data (a connection's first bytes
+	// sent right behind its SYN, one round trip sooner). On by default;
+	// clients that predate it never use it.
+	DisableEarlyData bool
 }
 
 // Server is a running (or startable) MasterDnsVPN node.
@@ -75,6 +79,7 @@ func New(opts Options) (*Server, error) {
 	cfg.ForwardIP = opts.ForwardIP
 	cfg.ForwardPort = opts.ForwardPort
 	cfg.RequireSessionV2 = opts.RequireSessionV2
+	cfg.EarlyDataEnabled = !opts.DisableEarlyData
 	switch {
 	case opts.MaxSessionsPerUser > 0:
 		cfg.MaxSessionsPerUser = opts.MaxSessionsPerUser

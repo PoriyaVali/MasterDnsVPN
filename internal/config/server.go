@@ -105,6 +105,11 @@ type ServerConfig struct {
 	ClientMaxARQDataNackMaxGap        int      `toml:"MAX_ALLOWED_CLIENT_ARQ_DATA_NACK_MAX_GAP"`
 	ClientMinCompressionMinSize       int      `toml:"MIN_ALLOWED_CLIENT_COMPRESSION_MIN_SIZE"`
 	ClientMinARQInitialRTOSeconds     float64  `toml:"MIN_ALLOWED_CLIENT_ARQ_INITIAL_RTO_SECONDS"`
+
+	// EarlyDataEnabled lets clients send a connection's first bytes right
+	// behind its SYN (VpnProto.SessionCapEarlyData): data that arrives before
+	// the SYN, or while its connect is in progress, is held for it.
+	EarlyDataEnabled bool `toml:"EARLY_DATA_ENABLED"`
 }
 
 type ServerConfigOverrides struct {
@@ -184,6 +189,7 @@ func defaultServerConfig() ServerConfig {
 		ARQTerminalAckWaitTimeoutSec:      90.0,
 		MaxAllowedClientActiveSessions:    255,
 		MaxSessionsPerUser:                8,
+		EarlyDataEnabled:                  true,
 		RequireSessionV2:                  false,
 		MaxAllowedClientActiveStreams:     2000,
 		ClientMaxPacketDuplicationCount:   5,

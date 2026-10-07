@@ -33,7 +33,7 @@ const (
 	mtuProbeMetaLength  = mtuProbeCodeLength + 2
 	mtuProbeUpMinSize   = 1 + mtuProbeCodeLength
 	mtuProbeDownMinSize = mtuProbeUpMinSize + 2
-	mtuProbeMinDownSize = VpnProto.SessionAcceptPayloadSize
+	mtuProbeMinDownSize = VpnProto.SessionAcceptWireSize
 	mtuProbeMaxDownSize = 4096
 )
 
@@ -92,6 +92,8 @@ type Server struct {
 	refusedInitsTableFull    atomic.Int64
 	refusedInitsUserLimit    atomic.Int64
 	refusedInitsReportArmed  atomic.Bool
+	// earlyData: hold stream data that overtakes its SYN (early_data.go).
+	earlyData bool
 }
 
 type request struct {
@@ -171,6 +173,7 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 		invalidCookieWindowNanos: invalidCookieWindow.Nanoseconds(),
 		invalidCookieThreshold:   cfg.InvalidCookieErrorThreshold,
 		socksConnectTimeout:      socksConnectTimeout,
+		earlyData:                cfg.EarlyDataEnabled,
 		useExternalSOCKS5:        cfg.UseExternalSOCKS5,
 		externalSOCKS5Address:    net.JoinHostPort(cfg.ForwardIP, strconv.Itoa(cfg.ForwardPort)),
 		externalSOCKS5Auth:       cfg.SOCKS5Auth,

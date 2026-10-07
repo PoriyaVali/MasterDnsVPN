@@ -63,6 +63,10 @@ type Stream_client struct {
 
 	controlCount atomic.Int32
 
+	// earlyReplied: the local app was told "connected" before the server
+	// confirmed it (early data); a late failure must close, not reply.
+	earlyReplied atomic.Bool
+
 	txQueueMu     sync.Mutex
 	statusMu      sync.RWMutex
 	terminalSince time.Time

@@ -33,7 +33,7 @@ const (
 	mtuProbeBase64Reply = 1
 	defaultUploadMaxCap = 512
 	minUploadMTUFloor   = 10
-	minDownloadMTUFloor = VpnProto.SessionAcceptPayloadSize
+	minDownloadMTUFloor = VpnProto.SessionAcceptWireSize
 )
 
 var (

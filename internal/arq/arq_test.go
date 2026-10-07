@@ -2675,3 +2675,27 @@ func BenchmarkARQ_WriteLoopFlushContiguousReceiveBuffer(b *testing.B) {
 	_, writeCount, _ := conn.snapshot()
 	b.ReportMetric(float64(writeCount)/float64(b.N), "writes/op")
 }
+
+func TestAdaptiveRTOFallsBelowTheConfiguredStart(t *testing.T) {
+	// A 1 s configured RTO is where the estimate starts, not a floor: on a
+	// 150 ms path a lost packet must not wait a second.
+	state := adaptiveRTOState{currentBase: time.Second}
+	for i := 0; i < 20; i++ {
+		state = updateAdaptiveRTO(state, 150*time.Millisecond, adaptiveFloor(time.Second), 5*time.Second)
+	}
+	if state.currentBase >= time.Second || state.currentBase < adaptiveRTOFloor {
+		t.Fatalf("RTO after steady 150 ms samples = %v, want between %v and 1s", state.currentBase, adaptiveRTOFloor)
+	}
+	if state.srtt < 140*time.Millisecond || state.srtt > 160*time.Millisecond {
+		t.Fatalf("srtt = %v, want ~150ms (samples must not be clamped up)", state.srtt)
+	}
+}
+
+func TestAdaptiveFloorKeepsALowerConfiguredRTO(t *testing.T) {
+	if got := adaptiveFloor(100 * time.Millisecond); got != 100*time.Millisecond {
+		t.Fatalf("adaptiveFloor(100ms) = %v", got)
+	}
+	if got := adaptiveFloor(time.Second); got != adaptiveRTOFloor {
+		t.Fatalf("adaptiveFloor(1s) = %v", got)
+	}
+}

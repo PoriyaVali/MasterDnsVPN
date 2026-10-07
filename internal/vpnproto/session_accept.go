@@ -13,6 +13,23 @@ const (
 
 	SessionPolicyScaledMin = 0.05
 	SessionPolicyScaledMax = 1.0
+
+	// SessionAcceptCapsSize is the optional capabilities byte after the
+	// policy. Clients that predate it read the first SessionAcceptPayloadSize
+	// bytes and ignore the rest; a server that predates it sends none, which
+	// reads as "no capabilities".
+	SessionAcceptCapsSize = 1
+	// SessionAcceptWireSize is the most a SESSION_ACCEPT payload carries.
+	SessionAcceptWireSize = SessionAcceptPayloadSize + SessionAcceptCapsSize
+)
+
+// Server capabilities (SESSION_ACCEPT byte 20).
+const (
+	// SessionCapEarlyData: stream data that reaches the server before its
+	// SYN, or while the SYN's upstream connect is still in progress, is held
+	// for that stream instead of being answered with a reset. A client may
+	// then send a connection's first bytes right behind its SYN.
+	SessionCapEarlyData uint8 = 1 << 0
 )
 
 // SessionAcceptPayload defines the full SESSION_ACCEPT payload:
@@ -31,6 +48,7 @@ const (
 //	byte 16     : max ARQ data NACK max gap
 //	bytes 17-18 : min compression min size
 //	byte 19     : min ARQ initial RTO (scaled 0..255 => 0.05..1.00s)
+//	byte 20     : capabilities (SessionCap*), optional
 type SessionAcceptPayload struct {
 	SessionID           uint8
 	SessionCookie       uint8
@@ -38,6 +56,8 @@ type SessionAcceptPayload struct {
 	VerifyCode          [4]byte
 	ClientPolicy        SessionAcceptClientPolicy
 	HasClientPolicySync bool
+	// Caps is sent only with the policy, and only when non-zero.
+	Caps uint8
 }
 
 type SessionAcceptClientSettings struct {
@@ -90,6 +110,9 @@ func EncodeSessionAcceptPayload(payload SessionAcceptPayload) []byte {
 	size := SessionAcceptBasePayloadSize
 	if payload.HasClientPolicySync {
 		size = SessionAcceptPayloadSize
+		if payload.Caps != 0 {
+			size = SessionAcceptWireSize
+		}
 	}
 
 	buf := make([]byte, size)
@@ -101,6 +124,9 @@ func EncodeSessionAcceptPayload(payload SessionAcceptPayload) []byte {
 	if payload.HasClientPolicySync {
 		policy := EncodeSessionAcceptClientPolicy(payload.ClientPolicy)
 		copy(buf[SessionAcceptBasePayloadSize:], policy[:])
+		if payload.Caps != 0 {
+			buf[SessionAcceptPayloadSize] = payload.Caps
+		}
 	}
 
 	return buf
@@ -125,6 +151,9 @@ func DecodeSessionAcceptPayload(payload []byte) (SessionAcceptPayload, error) {
 		}
 		result.ClientPolicy = policy
 		result.HasClientPolicySync = true
+		if len(payload) >= SessionAcceptWireSize {
+			result.Caps = payload[SessionAcceptPayloadSize]
+		}
 	}
 
 	return result, nil

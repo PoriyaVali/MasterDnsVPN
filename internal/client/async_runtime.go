@@ -55,6 +55,10 @@ func (c *Client) runtimePacketDuplicationCount(packetType uint8) int {
 	}
 
 	if packetType == Enums.PACKET_PING {
+		if c.pingManager != nil && c.pingManager.idle.Load() {
+			// A quiet tunnel's keepalive: one lost costs one interval.
+			return 1
+		}
 		return min(count, 2)
 	}
 
@@ -65,6 +69,8 @@ func (c *Client) runtimePacketDuplicationCount(packetType uint8) int {
 // It ensures the UDP socket is closed and all goroutines exit.
 func (c *Client) StopAsyncRuntime() {
 	c.runtimeReady.Store(false)
+	c.queries.reset()
+	c.pullsQueued.Store(0)
 	if c.asyncCancel != nil {
 		c.log.Debugf("\U0001F6D1 <yellow>Stopping Async Runtime...</yellow>")
 		c.asyncCancel()
@@ -245,6 +251,7 @@ func (c *Client) resetSessionState(resetSessionCookie bool) {
 	c.sessionReady = false
 	c.sessionID = 0
 	c.sessionKeys.Store(nil)
+	c.serverCaps.Store(0)
 	if resetSessionCookie {
 		c.sessionCookie = 0
 	}
@@ -578,17 +585,8 @@ func (c *Client) asyncPlanEncodeWorker(ctx context.Context, id int) {
 			}
 
 			frames, err = c.buildPlannedOutboundFrames(task, conns, defaultDomain, packetByDomain, preparedDomainByName, frames)
-			if err != nil {
-				if !task.wasPacked && task.selected != nil {
-					task.selected.ReleaseTXPacket(task.item)
-				}
-				continue
-			}
-
-			if len(frames) == 0 {
-				if !task.wasPacked && task.selected != nil {
-					task.selected.ReleaseTXPacket(task.item)
-				}
+			if err != nil || len(frames) == 0 {
+				c.releasePlannerTask(task)
 				continue
 			}
 
@@ -600,6 +598,7 @@ func (c *Client) asyncPlanEncodeWorker(ctx context.Context, id int) {
 				wasPacked: task.wasPacked,
 				item:      task.item,
 				selected:  task.selected,
+				pull:      task.pull,
 				frames:    append([]encodedOutboundDatagram(nil), frames...),
 			}
 
@@ -652,6 +651,9 @@ func (c *Client) requeuePlannerTaskForRetry(task plannerTask) {
 }
 
 func (c *Client) releasePlannerTask(task plannerTask) {
+	if task.pull {
+		c.notePullSent()
+	}
 	if !task.wasPacked && task.selected != nil {
 		task.selected.ReleaseTXPacket(task.item)
 	}
@@ -807,6 +809,7 @@ func (c *Client) asyncWriterWorker(ctx context.Context, id int, conn *net.UDPCon
 					continue
 				}
 				if _, err := conn.WriteToUDP(frame.packet, frame.addr); err == nil {
+					c.queries.sent(frame.packet, now)
 					c.balancer.TrackResolverSend(
 						frame.packet,
 						frame.addr.String(),
@@ -816,6 +819,9 @@ func (c *Client) asyncWriterWorker(ctx context.Context, id int, conn *net.UDPCon
 						c.tunnelPacketTimeout,
 					)
 				}
+			}
+			if task.pull {
+				c.notePullSent()
 			}
 			if !task.wasPacked && task.selected != nil {
 				task.selected.ReleaseTXPacket(task.item)
@@ -895,6 +901,8 @@ func (c *Client) asyncProcessorWorker(ctx context.Context, id int) {
 // handleInboundPacket is the central entry point for all received tunnel packets.
 func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr, localAddr string) {
 	// c.log.Debugf("Inbound packet from %v (%d bytes)", addr, len(data))
+	now := time.Now()
+	c.queries.answered(data, now)
 
 	// 1. Extract VPN Packet from DNS Response
 	vpnPacket, trusted, err := c.decodeInbound(data)
@@ -948,6 +956,7 @@ func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr, localAddr s
 
 	// 2. Notify activity monitor (PingManager)
 	c.NotifyPacket(vpnPacket.PacketType, true)
+	c.notePulledData(vpnPacket.PacketType, now)
 
 	// 3. Queue deterministic non-data ACKs before any handler logic runs.
 	if handled := c.preprocessInboundPacket(vpnPacket); handled {

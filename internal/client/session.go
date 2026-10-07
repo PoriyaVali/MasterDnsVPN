@@ -256,6 +256,7 @@ func (c *Client) applySessionInitPacket(packet VpnProto.Packet, sealed bool, ini
 			c.v2Proven.Store(true)
 			c.v2InitFailures = 0
 		}
+		c.serverCaps.Store(uint32(sessionAccept.Caps))
 		c.uploadCompression, c.downloadCompression = compression.SplitPair(sessionAccept.CompressionPair)
 		if sessionAccept.HasClientPolicySync {
 			c.applySessionClientPolicy(sessionAccept.ClientPolicy)
@@ -323,6 +324,11 @@ func (c *Client) applySessionClientPolicy(policy VpnProto.SessionAcceptClientPol
 	c.cfg.CompressionMinSize = settings.CompressionMinSize
 	c.cfg.ARQInitialRTOSeconds = settings.ARQInitialRTOSeconds
 	c.cfg.ARQControlInitialRTOSeconds = settings.ARQControlInitialRTOSeconds
+	if c.cfg.RX_TX_Workers < before.RXTXWorkers && c.cfg.PullPipelineDepth > 4*c.cfg.RX_TX_Workers {
+		// The server limits how many queries a client keeps going at once
+		// through its worker cap; pulling scales down with it.
+		c.cfg.PullPipelineDepth = 4 * c.cfg.RX_TX_Workers
+	}
 	c.cfg.TunnelProcessWorkers = deriveSessionPolicyTunnelProcessWorkers(c.cfg.TunnelProcessWorkers, c.cfg.RX_TX_Workers)
 	c.tunnelProcessWorkers = c.cfg.TunnelProcessWorkers
 
