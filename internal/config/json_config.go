@@ -110,6 +110,14 @@ func decodeJSONFieldInto(target reflect.Value, raw json.RawMessage) error {
 			}
 			target.Set(reflect.ValueOf(value))
 			return nil
+		case reflect.Map:
+			// SERVERS: a list of objects, each read later as a config of its own.
+			var value []map[string]any
+			if err := json.Unmarshal(raw, &value); err != nil {
+				return err
+			}
+			target.Set(reflect.ValueOf(value))
+			return nil
 		default:
 			return fmt.Errorf("unsupported slice type %s", target.Type())
 		}

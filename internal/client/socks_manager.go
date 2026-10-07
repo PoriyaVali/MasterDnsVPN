@@ -331,6 +331,21 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 		return
 	}
 
+	// Load balanced: this client only read the SOCKS request. The stream goes
+	// to whichever server the pool picks for this destination.
+	if c.pool != nil {
+		if target := c.pool.memberForTarget(addr); target != nil && target != c {
+			target.openSOCKSConnectStream(conn, addr, port, atyp, socksVersion)
+			return
+		}
+	}
+
+	c.openSOCKSConnectStream(conn, addr, port, atyp, socksVersion)
+}
+
+// openSOCKSConnectStream opens the tunnel stream for a SOCKS CONNECT whose
+// request has been read, and owns conn from here on.
+func (c *Client) openSOCKSConnectStream(conn net.Conn, addr string, port uint16, atyp byte, socksVersion byte) {
 	streamID, ok := c.get_new_stream_id()
 	if !ok {
 		c.log.Errorf("❌ <red>Failed to get new Stream ID for SOCKS CONNECT</red>")
@@ -339,6 +354,9 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 		} else {
 			_ = c.sendSocksReply(conn, SOCKS5_REPLY_GENERAL_FAILURE, SOCKS5_ATYP_IPV4, net.IPv4zero, 0)
 		}
+		// Nobody else owns this socket yet: without the close it stayed open
+		// until the application gave up on it.
+		_ = conn.Close()
 		return
 	}
 
@@ -392,6 +410,7 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 		} else {
 			_ = c.sendSocksReply(conn, SOCKS5_REPLY_GENERAL_FAILURE, SOCKS5_ATYP_IPV4, net.IPv4zero, 0)
 		}
+		_ = conn.Close()
 		return
 	}
 

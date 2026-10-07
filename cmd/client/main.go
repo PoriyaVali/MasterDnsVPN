@@ -21,6 +21,7 @@ import (
 
 	"masterdnsvpn-go/internal/client"
 	"masterdnsvpn-go/internal/config"
+	"masterdnsvpn-go/internal/logger"
 	"masterdnsvpn-go/internal/runtimepath"
 	"masterdnsvpn-go/internal/version"
 )
@@ -83,6 +84,14 @@ func printClientUsage(fs *flag.FlagSet) {
 	fmt.Fprintf(fs.Output(), "  %s -config ./client_config.toml -d domain1.com,domain2.com -k my-secret-key\n\n", bin)
 	fmt.Fprintf(fs.Output(), "Flags:\n")
 	fs.PrintDefaults()
+}
+
+// clientRuntime is a single-server client or the multi-server load balancer.
+type clientRuntime interface {
+	PrintBanner()
+	Log() *logger.Logger
+	ConnectionCount() int
+	Run(ctx context.Context) error
 }
 
 type clientCLIOptions struct {
@@ -216,26 +225,29 @@ func main() {
 
 	resolvedConfigPath := runtimepath.Resolve(opts.configPath)
 
-	var app *client.Client
+	var cfg config.ClientConfig
 	switch {
 	case opts.jsonBase64 != "":
-		// err is the function's, not a new one: the bootstrap error below
-		// must reach the check after the switch, or a failed bootstrap goes
-		// on with a nil client.
-		var cfg config.ClientConfig
 		cfg, err = config.LoadClientConfigFromJSONBase64WithOverrides(opts.jsonBase64, overrides)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Client startup failed: %v\n", err)
-			waitForExitInput()
-			os.Exit(1)
-		}
-		app, err = client.BootstrapLoadedConfig(cfg, opts.logPath)
 		resolvedConfigPath = cfg.ConfigPath
 	case opts.jsonPath != "":
-		app, err = client.Bootstrap(runtimepath.Resolve(opts.jsonPath), opts.logPath, overrides)
 		resolvedConfigPath = runtimepath.Resolve(opts.jsonPath)
+		cfg, err = config.LoadClientConfigWithOverrides(resolvedConfigPath, overrides)
 	default:
-		app, err = client.Bootstrap(resolvedConfigPath, opts.logPath, overrides)
+		cfg, err = config.LoadClientConfigWithOverrides(resolvedConfigPath, overrides)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Client startup failed: %v\n", err)
+		waitForExitInput()
+		os.Exit(1)
+	}
+
+	// SERVERS in the config: several servers at once, behind one listener.
+	var app clientRuntime
+	if cfg.IsLoadBalanced() {
+		app, err = client.BootstrapPool(cfg, opts.logPath)
+	} else {
+		app, err = client.BootstrapLoadedConfig(cfg, opts.logPath)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Client startup failed: %v\n", err)
@@ -249,7 +261,7 @@ func main() {
 	if log != nil {
 		log.Infof("\U0001F680 <green>MasterDnsVPN Client Started</green>")
 		log.Infof("\U0001F4C4 <green>Configuration loaded from: <cyan>%s</cyan></green>", resolvedConfigPath)
-		log.Infof("\U0001F5C2  <green>Connection Catalog: <cyan>%d</cyan> domain-resolver pairs</green>", app.Balancer().TotalCount())
+		log.Infof("\U0001F5C2  <green>Connection Catalog: <cyan>%d</cyan> domain-resolver pairs</green>", app.ConnectionCount())
 	}
 
 	// Wait for termination signal

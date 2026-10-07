@@ -699,6 +699,49 @@ These settings are critical on the server:
 
 ---
 
+### 3.4.11) ⚖️ Multi-Server Load Balancing (`SERVERS`)
+
+One client can use several MasterDnsVPN servers **at the same time** behind a single local SOCKS5/TCP port. Each `[[SERVERS]]` entry is one server; any key the entry leaves out is inherited from the top of the file. The client opens a separate session to every server (its own resolvers, MTU scan and streams) and gives each **new connection** to one of the servers that is up.
+
+```toml
+# Shared by every server: the local proxy, logging, tuning...
+LISTEN_PORT = 18000
+ENCRYPTION_KEY = "shared-key"        # inherited by entries that do not set one
+LOAD_BALANCER_STRATEGY = "least_load"
+LOAD_BALANCER_STICKY = true
+
+[[SERVERS]]
+NAME = "de-1"
+DOMAINS = ["v.server1.com"]
+UUID = "..."
+NODE_SECRET = "..."
+
+[[SERVERS]]
+NAME = "nl-1"
+DOMAINS = ["v.server2.com"]
+ENCRYPTION_KEY = "another-key"
+WEIGHT = 2                           # gets twice the share of new connections
+RESOLVERS = ["8.8.8.8", "1.1.1.1"]   # optional; otherwise the resolver file is used
+```
+
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
+| :--- | :--- | :--- | :--- |
+| `SERVERS` | array of tables | 1 to 16 entries | Turns load balancing on. Every entry is validated like a full client config (it needs `DOMAINS` and `ENCRYPTION_KEY`, its own or inherited).<br>Keys describing the shared local proxy (`LISTEN_*`, `PROTOCOL_TYPE`, `SOCKS5_*`, `LOCAL_DNS_*`, `BYPASS_*`, `PROTECT_PATH`, `LOG_LEVEL`) cannot be changed per server and are ignored inside an entry. |
+| `LOAD_BALANCER_STRATEGY` | `"least_load"` | `least_load`, `round_robin`, `random`, `failover` | `least_load`: fewest open streams per unit of weight.<br>`round_robin` / `random`: share new connections by `WEIGHT`.<br>`failover`: always the first server (in file order) that is up; the rest are hot standbys.<br>An unknown value is read as `least_load`. |
+| `LOAD_BALANCER_STICKY` | `true` | `true` / `false` | Keeps every destination (host name or IP) on the server it was first given. Each server reaches the internet from its own IP, and many sites (logins, banks, captchas, video CDNs) break when one visitor's connections come from different IPs. |
+| `LOAD_BALANCER_STICKY_SECONDS` | `600` | clamped to `10..86400` | How long a destination stays on its server after its last new connection. |
+| `NAME` | `"de-1"` | any string (per server) | Label used in log lines (`[de-1] ...`). Defaults to the server's first domain. |
+| `WEIGHT` | `1` | clamped to `1..100` (per server) | Relative share of new connections. |
+| `RESOLVERS` | `["8.8.8.8"]` | resolver-file syntax, one entry per element | Inline resolver list. When set it wins over any resolver file, at the top level or per server. |
+
+What it does and does not do:
+- The unit of balancing is a **connection**, not a packet. One download runs on one server; a browser's many parallel connections run on all of them, so the total throughput is roughly the sum of the servers.
+- A server that stops answering (12 s with no reply) gets no new connections while another one answers; its open connections are lost, new ones go elsewhere. Servers that lose their session are skipped until they reopen it.
+- **No server-side change is needed.** Each server just sees an ordinary client session. Every server must still have its own domain/NS delegation: a single domain must never point at more than one server.
+- The local listener opens as soon as the first server is up. `Session initialization failed` is only logged when **every** server is failing.
+
+---
+
 ## Section 3.5: 📖 Server Configuration (`server_config.toml`)
 
 > ℹ️ Note: the sample server config contains a key named `CONFIG_VERSION`, but the current Go code does not read it into `ServerConfig`. For that reason it is not included in the table below and has no effect on real server behavior.

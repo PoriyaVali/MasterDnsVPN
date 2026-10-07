@@ -64,6 +64,7 @@ func (c *Client) runtimePacketDuplicationCount(packetType uint8) int {
 // StopAsyncRuntime stops all running workers (Readers, Writers, Processors).
 // It ensures the UDP socket is closed and all goroutines exit.
 func (c *Client) StopAsyncRuntime() {
+	c.runtimeReady.Store(false)
 	if c.asyncCancel != nil {
 		c.log.Debugf("\U0001F6D1 <yellow>Stopping Async Runtime...</yellow>")
 		c.asyncCancel()
@@ -345,15 +346,18 @@ func (c *Client) StartAsyncRuntime(parentCtx context.Context) error {
 	c.log.Infof("\U0001F4E1 <cyan>Async Runtime Initialized: <green>%d RX/TX Workers</green>, <green>%d Processors</green></cyan>",
 		c.tunnelRX_TX_Workers, c.tunnelProcessWorkers)
 
-	// Start TCP/SOCKS Proxy Listener
-	c.tcpListener = NewTCPListener(c, c.cfg.ProtocolType)
-	if err := c.tcpListener.Start(runtimeCtx, c.cfg.ListenIP, c.cfg.ListenPort); err != nil {
-		c.log.Errorf("<red>❌ Failed to start %s proxy: %v</red>", c.cfg.ProtocolType, err)
-		return err
+	// Start TCP/SOCKS Proxy Listener. A load-balanced server has none: the
+	// pool listens once, for every server.
+	if c.pool == nil {
+		c.tcpListener = NewTCPListener(c, c.cfg.ProtocolType)
+		if err := c.tcpListener.Start(runtimeCtx, c.cfg.ListenIP, c.cfg.ListenPort); err != nil {
+			c.log.Errorf("<red>❌ Failed to start %s proxy: %v</red>", c.cfg.ProtocolType, err)
+			return err
+		}
 	}
 
 	// Start DNS Listener if enabled
-	if c.cfg.LocalDNSEnabled {
+	if c.cfg.LocalDNSEnabled && c.pool == nil {
 		c.dnsListener = NewDNSListener(c)
 		if err := c.dnsListener.Start(runtimeCtx, c.cfg.LocalDNSIP, c.cfg.LocalDNSPort); err != nil {
 			c.log.Errorf("<red>❌ Failed to start DNS resolver: %v</red>", err)

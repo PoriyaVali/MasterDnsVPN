@@ -16,6 +16,7 @@
 # Must match server DOMAIN values exactly.
 # At least one domain is required.
 # All domains must be handled by the same server. Do not use different domains across multiple servers.
+# To use several servers at once, list them under [[SERVERS]] (section 10).
 DOMAINS = ["v.domain.com"]
 
 # Encryption method for tunnel payloads.
@@ -349,3 +350,45 @@ ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS = 90.0
 
 # Typical values: DEBUG, INFO, WARN, ERROR
 LOG_LEVEL = "INFO"
+
+# ------------------------------------------------------------------------------
+# 10) Multi-Server Load Balancing (optional)
+# What this section does:
+# - Runs several servers at once behind the one local proxy above.
+# - Each [[SERVERS]] entry is one server. Keys it leaves out are inherited from
+#   the top of this file; LISTEN_*, PROTOCOL_TYPE, SOCKS5_*, LOCAL_DNS_*,
+#   BYPASS_*, PROTECT_PATH and LOG_LEVEL are shared and cannot be set per server.
+# - Each new connection goes to one server that is up. One download stays on one
+#   server; many parallel connections use all of them. No server change needed.
+# - Every server needs its own domain (NS delegation). Never point one domain at
+#   more than one server.
+# - Without any [[SERVERS]] entry the client uses DOMAINS above, as before.
+# ------------------------------------------------------------------------------
+
+# least_load  = fewest open streams per unit of WEIGHT (default)
+# round_robin = take turns, by WEIGHT
+# random      = random, by WEIGHT
+# failover    = always the first server (in file order) that is up
+LOAD_BALANCER_STRATEGY = "least_load"
+
+# Keep each destination (host name / IP) on the server it was first given, so a
+# site does not see one visitor jump between server IPs (logins, banks, CDNs).
+LOAD_BALANCER_STICKY = true
+LOAD_BALANCER_STICKY_SECONDS = 600
+
+# TOML rule: [[SERVERS]] tables must come after every top-level key above.
+#
+# [[SERVERS]]
+# NAME = "server-1"                 # label in logs; default = first domain
+# DOMAINS = ["v.server1.com"]
+# ENCRYPTION_KEY = "key-1"
+# UUID = ""
+# NODE_SECRET = ""
+# WEIGHT = 1                        # 1..100, share of new connections
+#
+# [[SERVERS]]
+# NAME = "server-2"
+# DOMAINS = ["v.server2.com"]
+# ENCRYPTION_KEY = "key-2"
+# DATA_ENCRYPTION_METHOD = 2
+# RESOLVERS = ["8.8.8.8", "1.1.1.1"] # optional inline resolvers for this server

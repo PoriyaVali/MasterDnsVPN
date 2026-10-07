@@ -347,7 +347,7 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 			finalPayload = item.Payload
 		}
 
-		c.pingManager.NotifyPacket(finalPacketType, false)
+		c.NotifyPacket(finalPacketType, false)
 
 		opts := VpnProto.BuildOptions{
 			SessionID:     c.sessionID,

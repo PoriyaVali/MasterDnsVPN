@@ -164,6 +164,19 @@ type Client struct {
 
 	// SOCKS5 brute-force rate limiter
 	socksRateLimit *socksRateLimiter
+
+	// Load balancing (pool.go). pool is nil for a client running on its own;
+	// a pool member opens no local listeners - the pool owns them - and may
+	// hand a new connection to another member.
+	pool *Pool
+	// runtimeReady: a session is open and the async runtime is running, so a
+	// new stream started on this client will be carried.
+	runtimeReady atomic.Bool
+	// sessionInitFailures counts failed session init rounds since start.
+	sessionInitFailures atomic.Uint64
+	// awaitingReplySince is when the oldest send still without any answer
+	// went out (UnixNano), 0 when every send has been answered.
+	awaitingReplySince atomic.Int64
 }
 
 // clientStreamTXPacket represents a queued packet pending transmission or retransmission.
@@ -501,7 +514,17 @@ func (c *Client) Run(ctx context.Context) error {
 				if err := c.InitializeSession(retries); err != nil {
 					sessionInitRetryFailures++
 					sessionInitRetryDelay = c.nextSessionInitRetryDelay(sessionInitRetryFailures)
-					c.log.Errorf("<red>❌ Session initialization failed: %v</red>", err)
+					c.sessionInitFailures.Add(1)
+					if c.pool != nil {
+						// ⚠️ Not the words below. The Android app stops the
+						// whole core after three "Session initialization
+						// failed" lines, and one dead server must not take the
+						// others down with it. The pool says those words
+						// itself once every server is failing.
+						c.log.Errorf("<red>❌ Server session setup failed: %v</red>", err)
+					} else {
+						c.log.Errorf("<red>❌ Session initialization failed: %v</red>", err)
+					}
 					c.log.Warnf("<yellow>Session init retry backoff: %s</yellow>", sessionInitRetryDelay)
 					select {
 					case <-ctx.Done():
@@ -528,6 +551,8 @@ func (c *Client) Run(ctx context.Context) error {
 				}
 
 				c.ensureLocalDNSCachePersistence(ctx)
+				c.awaitingReplySince.Store(0)
+				c.runtimeReady.Store(true)
 			}
 
 			select {

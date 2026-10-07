@@ -149,6 +149,46 @@ type ClientConfig struct {
 	ARQTerminalAckWaitTimeoutSec          float64           `toml:"ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS"`
 	Resolvers                             []ResolverAddress `toml:"-"`
 	ResolverMap                           map[string]int    `toml:"-"`
+
+	// Resolvers given inline instead of in a file. When set it wins over any
+	// resolver file, so one SERVERS entry can carry its own list.
+	ResolverList []string `toml:"RESOLVERS" flag:"-"`
+
+	// Multi-server load balancing. Each SERVERS entry is one MasterDnsVPN
+	// server (its own DOMAINS, ENCRYPTION_KEY, UUID, NODE_SECRET, ...); every
+	// key it leaves out is inherited from the top level. The client opens one
+	// session per server and spreads new connections across those that are
+	// up. Without SERVERS the client talks to one server exactly as before.
+	Servers                   []map[string]any `toml:"SERVERS"`
+	LoadBalancerStrategy      string           `toml:"LOAD_BALANCER_STRATEGY"`
+	LoadBalancerSticky        bool             `toml:"LOAD_BALANCER_STICKY"`
+	LoadBalancerStickySeconds float64          `toml:"LOAD_BALANCER_STICKY_SECONDS"`
+	// Per-server only: a label for logs and a share of new connections.
+	ServerName   string `toml:"NAME" flag:"-"`
+	ServerWeight int    `toml:"WEIGHT" flag:"-"`
+
+	// ServerProfiles are the finalized SERVERS entries; empty in single-server
+	// mode.
+	ServerProfiles []ClientConfig `toml:"-"`
+}
+
+// Load balancer strategies (LOAD_BALANCER_STRATEGY).
+const (
+	LoadBalancerLeastLoad  = "least_load"
+	LoadBalancerRoundRobin = "round_robin"
+	LoadBalancerRandom     = "random"
+	LoadBalancerFailover   = "failover"
+)
+
+// IsLoadBalanced reports whether this config runs several servers at once.
+func (c ClientConfig) IsLoadBalanced() bool {
+	return len(c.ServerProfiles) > 0
+}
+
+// LoadBalancerStickyTTL is how long a destination stays on the server that
+// first carried it.
+func (c ClientConfig) LoadBalancerStickyTTL() time.Duration {
+	return time.Duration(c.LoadBalancerStickySeconds * float64(time.Second))
 }
 
 type ClientConfigOverrides struct {
@@ -248,6 +288,9 @@ func defaultClientConfig() ClientConfig {
 		ARQDataNackRepeatSeconds:              1.0,
 		ARQTerminalDrainTimeoutSec:            120.0,
 		ARQTerminalAckWaitTimeoutSec:          90.0,
+		LoadBalancerStrategy:                  LoadBalancerLeastLoad,
+		LoadBalancerSticky:                    true,
+		LoadBalancerStickySeconds:             600.0,
 	}
 }
 
@@ -363,6 +406,26 @@ func LoadClientConfigFromJSONBase64WithOverrides(encoded string, overrides Clien
 }
 
 func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
+	if len(cfg.Servers) == 0 {
+		cfg.ServerProfiles = nil
+		return finalizeClientConfigCommon(cfg, true)
+	}
+
+	// Expanded from the config as written, before the top level is
+	// normalized: each entry is finalized on its own, with its own values.
+	profiles, err := expandServerProfiles(cfg)
+	if err != nil {
+		return cfg, err
+	}
+	cfg, err = finalizeClientConfigCommon(cfg, false)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ServerProfiles = profiles
+	return cfg, nil
+}
+
+func finalizeClientConfigCommon(cfg ClientConfig, requireTunnel bool) (ClientConfig, error) {
 	cfg.ProtocolType = strings.ToUpper(strings.TrimSpace(cfg.ProtocolType))
 	cfg.LogLevel = strings.TrimSpace(cfg.LogLevel)
 	cfg.DeviceID = strings.TrimSpace(cfg.DeviceID)
@@ -510,19 +573,38 @@ func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 	cfg.MTUAddedServerLogFormat = strings.TrimSpace(cfg.MTUAddedServerLogFormat)
 	cfg.MTUReactiveAddedServerLogFormat = strings.TrimSpace(cfg.MTUReactiveAddedServerLogFormat)
 
+	cfg.LoadBalancerStrategy = normalizeLoadBalancerStrategy(cfg.LoadBalancerStrategy)
+	cfg.LoadBalancerStickySeconds = clampFloat(defaultFloatAtMostZero(cfg.LoadBalancerStickySeconds, 600.0), 10.0, 86400.0)
+	cfg.ServerName = strings.TrimSpace(cfg.ServerName)
+	cfg.ServerWeight = clampInt(defaultIntBelow(cfg.ServerWeight, 1, 1), 1, 100)
+
 	cfg.EncryptionKey = strings.TrimSpace(cfg.EncryptionKey)
+	cfg.Domains = normalizeClientDomains(cfg.Domains)
+	cfg.ResolversFilePath = strings.TrimSpace(cfg.ResolversFilePath)
+	if !requireTunnel {
+		// A load-balanced top level only carries what its servers share; each
+		// server is checked for a key, domains and resolvers on its own.
+		return cfg, nil
+	}
+
 	if cfg.EncryptionKey == "" {
 		return cfg, fmt.Errorf("ENCRYPTION_KEY is required in client config")
 	}
 
-	cfg.Domains = normalizeClientDomains(cfg.Domains)
 	if len(cfg.Domains) == 0 {
 		return cfg, fmt.Errorf("DOMAINS must contain at least one domain")
 	}
 
-	cfg.ResolversFilePath = strings.TrimSpace(cfg.ResolversFilePath)
-
-	resolvers, resolverMap, err := LoadClientResolvers(cfg.ResolversPath())
+	var (
+		resolvers   []ResolverAddress
+		resolverMap map[string]int
+		err         error
+	)
+	if len(cfg.ResolverList) > 0 {
+		resolvers, resolverMap, err = ParseClientResolvers(cfg.ResolverList, "RESOLVERS")
+	} else {
+		resolvers, resolverMap, err = LoadClientResolvers(cfg.ResolversPath())
+	}
 	if err != nil {
 		return cfg, err
 	}
@@ -833,7 +915,7 @@ func NewClientConfigFlagBinder(fs *flag.FlagSet) (*ClientConfigFlagBinder, error
 	for i := 0; i < valueType.NumField(); i++ {
 		field := valueType.Field(i)
 		tomlTag := field.Tag.Get("toml")
-		if tomlTag == "" || tomlTag == "-" {
+		if tomlTag == "" || tomlTag == "-" || field.Tag.Get("flag") == "-" {
 			continue
 		}
 

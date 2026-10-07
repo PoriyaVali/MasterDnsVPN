@@ -246,3 +246,64 @@ func TestApplySessionInitPacketPreservesHigherTunnelProcessWorkers(t *testing.T)
 		t.Fatalf("higher process workers should be preserved: cfg=%d runtime=%d", c.cfg.TunnelProcessWorkers, c.tunnelProcessWorkers)
 	}
 }
+
+func TestSessionInitRaceTargetsAreDistinctAndHonourRacingCount(t *testing.T) {
+	cases := []struct {
+		name      string
+		racing    int
+		resolvers []string
+		want      int
+	}{
+		{"more resolvers than racers", 3, []string{"a", "b", "c", "d", "e"}, 3},
+		{"fewer resolvers than racers", 3, []string{"a", "b"}, 2},
+		{"racing count one", 1, []string{"a", "b", "c"}, 1},
+		{"racing count five", 5, []string{"a", "b", "c", "d", "e", "f"}, 5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := buildTestClientWithResolvers(config.ClientConfig{SessionInitRacingCount: tc.racing}, tc.resolvers...)
+			connections := make([]*Connection, 0, len(tc.resolvers))
+			for i, key := range tc.resolvers {
+				connections = append(connections, &Connection{
+					Key:           key,
+					Domain:        "v.example.com",
+					Resolver:      "127.0.0.1",
+					ResolverPort:  5300 + i,
+					ResolverLabel: "127.0.0.1:" + key,
+				})
+			}
+			c.balancer.SetConnections(connections)
+			for _, conn := range connections {
+				c.balancer.SetConnectionMTU(conn.Key, 120, 180, 220)
+				c.balancer.SetConnectionValidity(conn.Key, true)
+			}
+
+			targets, payload, _, _, err := c.sessionInitRaceTargets()
+			if err != nil {
+				t.Fatalf("sessionInitRaceTargets: %v", err)
+			}
+			if len(targets) != tc.want {
+				t.Fatalf("got %d targets, want %d", len(targets), tc.want)
+			}
+			seen := map[string]bool{}
+			for _, target := range targets {
+				if seen[target.Key] {
+					t.Fatalf("resolver %s raced twice in one round", target.Key)
+				}
+				seen[target.Key] = true
+			}
+			if len(payload) < sessionInitPayloadSize {
+				t.Fatalf("init payload too short: %d", len(payload))
+			}
+
+			// The next round continues the rotation instead of starting over.
+			next, _, _, _, err := c.sessionInitRaceTargets()
+			if err != nil {
+				t.Fatalf("second round: %v", err)
+			}
+			if len(tc.resolvers) > tc.want && next[0].Key == targets[0].Key {
+				t.Fatalf("second round restarted at %s instead of rotating", next[0].Key)
+			}
+		})
+	}
+}
