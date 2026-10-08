@@ -168,6 +168,28 @@ func (c *Client) SessionReady() bool {
 	return c.sessionReady
 }
 
+// RuntimeReady reports whether a session is open and its runtime running, so
+// a stream started now will be carried. Safe from any goroutine.
+func (c *Client) RuntimeReady() bool {
+	return c != nil && c.runtimeReady.Load()
+}
+
+// ActiveStreamCount is the number of local streams this client is carrying,
+// stream 0 (control) not counted.
+func (c *Client) ActiveStreamCount() int {
+	if c == nil {
+		return 0
+	}
+	c.streamsMu.RLock()
+	n := len(c.active_streams)
+	_, hasControl := c.active_streams[0]
+	c.streamsMu.RUnlock()
+	if hasControl {
+		n--
+	}
+	return n
+}
+
 func (c *Client) SessionID() uint8 {
 	return c.sessionID
 }
@@ -181,9 +203,28 @@ func (c *Client) ResponseMode() uint8 {
 }
 
 func (c *Client) NotifyPacket(packetType uint8, isInbound bool) {
+	if isInbound {
+		c.awaitingReplySince.Store(0)
+	} else if c.awaitingReplySince.Load() == 0 {
+		c.awaitingReplySince.CompareAndSwap(0, time.Now().UnixNano())
+	}
 	if c.pingManager != nil {
 		c.pingManager.NotifyPacket(packetType, isInbound)
 	}
+}
+
+// unansweredFor is how long this client has been sending without hearing
+// anything back; 0 when it is not waiting. An idle tunnel still pings, so a
+// server that died shows here within one ping interval even with no traffic.
+func (c *Client) unansweredFor(now time.Time) time.Duration {
+	since := c.awaitingReplySince.Load()
+	if since == 0 {
+		return 0
+	}
+	if d := now.Sub(time.Unix(0, since)); d > 0 {
+		return d
+	}
+	return 0
 }
 
 func (c *Client) Log() *logger.Logger {
@@ -548,16 +589,25 @@ func (c *Client) Balancer() *Balancer {
 	return c.balancer
 }
 
+// ConnectionCount is the number of domain-resolver pairs this client tests.
+func (c *Client) ConnectionCount() int {
+	return c.balancer.TotalCount()
+}
+
 func (c *Client) ShortPrintBanner() {
-	if c.log == nil {
+	printShortBanner(c.log)
+}
+
+func printShortBanner(log *logger.Logger) {
+	if log == nil {
 		return
 	}
 
-	c.log.Infof("============================================================")
-	c.log.Infof("<cyan>GitHub:</cyan> <yellow>https://github.com/masterking32/MasterDnsVPN</yellow>")
-	c.log.Infof("<cyan>Telegram:</cyan> <yellow>@MasterDnsVPN</yellow>")
-	c.log.Infof("<cyan>Build Version:</cyan> <yellow>%s</yellow>", version.GetVersion())
-	c.log.Infof("============================================================")
+	log.Infof("============================================================")
+	log.Infof("<cyan>GitHub:</cyan> <yellow>https://github.com/masterking32/MasterDnsVPN</yellow>")
+	log.Infof("<cyan>Telegram:</cyan> <yellow>@MasterDnsVPN</yellow>")
+	log.Infof("<cyan>Build Version:</cyan> <yellow>%s</yellow>", version.GetVersion())
+	log.Infof("============================================================")
 }
 
 func (c *Client) PrintBanner() {

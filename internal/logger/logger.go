@@ -17,6 +17,9 @@ import (
 )
 
 type Logger struct {
+	// parent, when set, does all the writing: see Named.
+	parent         *Logger
+	prefix         string
 	name           string
 	level          int
 	mu             sync.Mutex
@@ -110,6 +113,21 @@ func parseLevel(raw string) int {
 	}
 }
 
+// Named returns a logger that writes through this one, with every line
+// prefixed by "[name] ". Several tunnels in one process (the load balancer)
+// share one console and one log file this way, and their lines stay apart.
+func (l *Logger) Named(name string) *Logger {
+	if l == nil {
+		return nil
+	}
+	return &Logger{
+		parent: l,
+		prefix: "[" + name + "] ",
+		name:   name,
+		level:  l.level,
+	}
+}
+
 func (l *Logger) logf(level int, format string, args ...any) {
 	if l == nil || level < l.level {
 		return
@@ -118,6 +136,16 @@ func (l *Logger) logf(level int, format string, args ...any) {
 	msg := format
 	if len(args) != 0 {
 		msg = fmt.Sprintf(format, args...)
+	}
+
+	l.write(level, msg)
+}
+
+// write emits an already formatted message.
+func (l *Logger) write(level int, msg string) {
+	if l.parent != nil {
+		l.parent.write(level, l.prefix+msg)
+		return
 	}
 
 	plainMsg := msg
@@ -170,7 +198,7 @@ func (l *Logger) Enabled(level int) bool {
 // Close closes the log file, if any; later lines still go to the console.
 // Windows cannot delete a file that is still open.
 func (l *Logger) Close() error {
-	if l == nil {
+	if l == nil || l.parent != nil {
 		return nil
 	}
 	l.mu.Lock()

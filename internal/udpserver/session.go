@@ -94,6 +94,9 @@ type sessionRecord struct {
 	MaxActiveStreamsPerSession      int
 	closedFlag                      uint32
 	streamCleanup                   func(uint8, uint16)
+
+	// early holds data for streams whose SYN has not arrived (early_data.go).
+	early earlyDataBuffer
 }
 
 type recentlyClosedStreamRecord struct {

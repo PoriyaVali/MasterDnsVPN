@@ -55,6 +55,12 @@ func (c *Client) HandleTCPConnect(_ context.Context, conn net.Conn) {
 		nil,
 		120*time.Second,
 	)
+
+	// Early data (see replySOCKSEarly): the first bytes follow the SYN.
+	if c.earlyDataActive() {
+		arqObj.SetIOReady(true)
+		s.SetStatus(streamStatusActive)
+	}
 }
 
 func (c *Client) streamResultAllowed(s *Stream_client) bool {

@@ -25,6 +25,7 @@ import (
 	fragmentStore "masterdnsvpn-go/internal/fragmentstore"
 	"masterdnsvpn-go/internal/logger"
 	"masterdnsvpn-go/internal/mlq"
+	"masterdnsvpn-go/internal/netutil"
 	"masterdnsvpn-go/internal/security"
 	"masterdnsvpn-go/internal/sessioncrypto"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
@@ -164,6 +165,29 @@ type Client struct {
 
 	// SOCKS5 brute-force rate limiter
 	socksRateLimit *socksRateLimiter
+
+	// Load balancing (pool.go). pool is nil for a client running on its own;
+	// a pool member opens no local listeners - the pool owns them - and may
+	// hand a new connection to another member.
+	pool *Pool
+	// runtimeReady: a session is open and the async runtime is running, so a
+	// new stream started on this client will be carried.
+	runtimeReady atomic.Bool
+	// startFailures counts failed attempts to come up since start: MTU scans
+	// that found nothing usable and session inits that were not answered.
+	// The pool reports a failed start only once every server has some.
+	startFailures atomic.Uint64
+	// awaitingReplySince is when the oldest send still without any answer
+	// went out (UnixNano), 0 when every send has been answered.
+	awaitingReplySince atomic.Int64
+
+	// Download pipelining (pull.go): queries in flight, and PING frames queued
+	// to pull data but not yet sent.
+	queries     *queryTracker
+	pullsQueued atomic.Int64
+
+	// serverCaps: the live session's SESSION_ACCEPT capabilities.
+	serverCaps atomic.Uint32
 }
 
 // clientStreamTXPacket represents a queued packet pending transmission or retransmission.
@@ -220,6 +244,9 @@ type plannerTask struct {
 	wasPacked bool
 	item      *clientStreamTXPacket
 	selected  *Stream_client
+	// pull: a poll from pull.go, queued here directly rather than through
+	// a stream, so it carries no item.
+	pull bool
 }
 
 type encodedOutboundDatagram struct {
@@ -233,6 +260,7 @@ type writerTask struct {
 	item      *clientStreamTXPacket
 	selected  *Stream_client
 	frames    []encodedOutboundDatagram
+	pull      bool
 }
 
 // Bootstrap initializes a new Client by loading configuration, setting up logging,
@@ -395,6 +423,7 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		orphanQueue:            mlq.New[VpnProto.Packet](cfg.EffectiveOrphanQueueInitialCapacity()),
 		sessionResetSignal:     make(chan struct{}, 1),
 		socksRateLimit:         newSocksRateLimiter(),
+		queries:                newQueryTracker(),
 	}
 
 	if c.streamResolverFailoverResendThreshold < 1 {
@@ -423,6 +452,43 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 	return c
 }
 
+var protectRefusalWarned atomic.Bool
+
+// warnProtectRefusals says once per process that the VPN app could not
+// protect some of our sockets. They still work while the app keeps this
+// process off the tunnel by uid; if it ever stops doing that, this line is
+// what explains a tunnel that captures its own packets.
+func warnProtectRefusals(log *logger.Logger) {
+	n := netutil.ProtectRefusals()
+	if n == 0 || log == nil || !protectRefusalWarned.CompareAndSwap(false, true) {
+		return
+	}
+	log.Warnf("<yellow>The VPN app could not protect %d socket(s); relying on it keeping this process off the tunnel</yellow>", n)
+}
+
+// loadBalancedRescanAfter: a load-balanced server whose session init fails
+// this many times in a row measures its resolvers again.
+const loadBalancedRescanAfter = 3
+
+// mtuRescanDelay is the pause after an MTU scan that found nothing usable.
+//
+// On its own a client rescans every 5 s: nothing works until it finds a
+// resolver, and the network may have just come back. A load-balanced server
+// is different - the others carry the traffic, and a server that a network
+// blocks would rescan its whole list every few seconds for as long as the app
+// runs - so it backs off, to at most a minute.
+func (c *Client) mtuRescanDelay(failures int) time.Duration {
+	const base = 5 * time.Second
+	if c.pool == nil || failures <= 1 {
+		return base
+	}
+	delay := base << min(failures-1, 4)
+	if delay > time.Minute {
+		delay = time.Minute
+	}
+	return delay
+}
+
 func (c *Client) nextSessionInitRetryDelay(failures int) time.Duration {
 	if failures <= 0 {
 		return 0
@@ -441,11 +507,19 @@ func (c *Client) nextSessionInitRetryDelay(failures int) time.Duration {
 }
 
 // Run starts the main execution loop of the client.
-func (c *Client) Run(ctx context.Context) error {
+func (c *Client) Run(parent context.Context) error {
+	// Everything started here - the resolver health loop above all - ends
+	// with this call. A load-balanced server whose Run fails is restarted by
+	// the pool, and its old health loop must not keep probing meanwhile.
+	ctx, cancelRun := context.WithCancel(parent)
+	defer c.resolverHealthStarted.Store(false) // runs after cancelRun
+	defer cancelRun()
+
 	c.successMTUChecks = false
 	c.log.Infof("\U0001F504 <cyan>Starting main runtime loop...</cyan>")
 	sessionInitRetryDelay := time.Duration(0)
 	sessionInitRetryFailures := 0
+	mtuScanFailures := 0
 
 	// Ensure local DNS cache is loaded from file if persistence is enabled
 	c.ensureLocalDNSCacheLoaded()
@@ -458,34 +532,32 @@ func (c *Client) Run(ctx context.Context) error {
 			return nil
 		default:
 			if !c.successMTUChecks {
-				if err := c.RunInitialMTUTests(ctx); err != nil {
-					c.log.Errorf("<red>MTU tests failed: %v</red>", err)
+				scanErr := c.RunInitialMTUTests(ctx)
+				if scanErr == nil && (c.syncedUploadMTU <= 0 || c.syncedDownloadMTU <= 0) {
+					scanErr = fmt.Errorf("Upload MTU: %d, Download MTU: %d", c.syncedUploadMTU, c.syncedDownloadMTU)
+				}
+				if scanErr != nil {
+					if ctx.Err() != nil {
+						c.StopAsyncRuntime()
+						return nil
+					}
+					c.log.Errorf("<red>MTU tests failed: %v</red>", scanErr)
 					c.successMTUChecks = false
-					// Wait a bit before retrying or exiting if critical
+					mtuScanFailures++
+					c.startFailures.Add(1)
 					select {
 					case <-ctx.Done():
 						c.notifySessionCloseBurst(time.Second)
 						c.StopAsyncRuntime()
 						return nil
-					case <-time.After(5 * time.Second):
+					case <-time.After(c.mtuRescanDelay(mtuScanFailures)):
 					}
 					continue
 				}
 
-				if c.syncedUploadMTU <= 0 || c.syncedDownloadMTU <= 0 {
-					c.successMTUChecks = false
-					c.log.Errorf("<red>❌ MTU tests failed: Upload MTU: %d, Download MTU: %d</red>", c.syncedUploadMTU, c.syncedDownloadMTU)
-					select {
-					case <-ctx.Done():
-						c.notifySessionCloseBurst(time.Second)
-						c.StopAsyncRuntime()
-						return nil
-					case <-time.After(5 * time.Second):
-					}
-					continue
-				}
-
+				mtuScanFailures = 0
 				c.successMTUChecks = true
+				warnProtectRefusals(c.log)
 				if c.resolverHealthStarted.CompareAndSwap(false, true) {
 					go c.runResolverHealthLoop(ctx)
 				}
@@ -501,7 +573,25 @@ func (c *Client) Run(ctx context.Context) error {
 				if err := c.InitializeSession(retries); err != nil {
 					sessionInitRetryFailures++
 					sessionInitRetryDelay = c.nextSessionInitRetryDelay(sessionInitRetryFailures)
-					c.log.Errorf("<red>❌ Session initialization failed: %v</red>", err)
+					if c.pool != nil && sessionInitRetryFailures%loadBalancedRescanAfter == 0 {
+						// The resolvers that passed the scan may be the ones
+						// that died: a load-balanced server keeps its process
+						// alive through the others, so nothing else would
+						// ever measure them again.
+						c.log.Warnf("<yellow>Session init failed %d times; measuring the resolvers again</yellow>", sessionInitRetryFailures)
+						c.successMTUChecks = false
+					}
+					c.startFailures.Add(1)
+					if c.pool != nil {
+						// ⚠️ Not the words below. The Android app stops the
+						// whole core after three "Session initialization
+						// failed" lines, and one dead server must not take the
+						// others down with it. The pool says those words
+						// itself once every server is failing.
+						c.log.Errorf("<red>❌ Server session setup failed: %v</red>", err)
+					} else {
+						c.log.Errorf("<red>❌ Session initialization failed: %v</red>", err)
+					}
 					c.log.Warnf("<yellow>Session init retry backoff: %s</yellow>", sessionInitRetryDelay)
 					select {
 					case <-ctx.Done():
@@ -518,6 +608,10 @@ func (c *Client) Run(ctx context.Context) error {
 				sessionInitRetryDelay = 0
 				if err := c.StartAsyncRuntime(ctx); err != nil {
 					c.log.Errorf("<red>❌ Async Runtime failed to launch: %v</red>", err)
+					// The session was opened for a runtime that never ran; a
+					// later Run (the pool restarts its servers) must open a
+					// new one rather than believe it has one.
+					c.resetSessionState(true)
 					return err
 				}
 
@@ -528,6 +622,8 @@ func (c *Client) Run(ctx context.Context) error {
 				}
 
 				c.ensureLocalDNSCachePersistence(ctx)
+				c.awaitingReplySince.Store(0)
+				c.runtimeReady.Store(true)
 			}
 
 			select {

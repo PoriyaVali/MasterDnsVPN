@@ -21,6 +21,7 @@ import (
 	dnsParser "masterdnsvpn-go/internal/dnsparser"
 	"masterdnsvpn-go/internal/dnstcp"
 	Enums "masterdnsvpn-go/internal/enums"
+	"masterdnsvpn-go/internal/logger"
 	"masterdnsvpn-go/internal/netutil"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
@@ -125,7 +126,8 @@ func (c *Client) expireDNSWaitersLocked(now time.Time) {
 }
 
 type DNSListener struct {
-	client   *Client
+	log      *logger.Logger
+	process  func(query []byte, addr net.Addr, respond func([]byte)) bool
 	conn     *net.UDPConn
 	tcp      net.Listener
 	stopChan chan struct{}
@@ -133,8 +135,15 @@ type DNSListener struct {
 }
 
 func NewDNSListener(c *Client) *DNSListener {
+	return newDNSListenerWithHandler(c.log, c.ProcessDNSQuery)
+}
+
+// newDNSListenerWithHandler is a listener whose queries go to process - the
+// load balancer's, which picks a tunnel per query.
+func newDNSListenerWithHandler(log *logger.Logger, process func(query []byte, addr net.Addr, respond func([]byte)) bool) *DNSListener {
 	return &DNSListener{
-		client:   c,
+		log:      log,
+		process:  process,
 		stopChan: make(chan struct{}),
 	}
 }
@@ -150,14 +159,14 @@ func (l *DNSListener) Start(ctx context.Context, ip string, port int) error {
 	}
 	l.conn = conn
 
-	l.client.log.Infof("🚀 <green>DNS server is listening on <cyan>%s:%d</cyan></green>", ip, port)
+	l.log.Infof("🚀 <green>DNS server is listening on <cyan>%s:%d</cyan></green>", ip, port)
 	actualPort := port
 	if localAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && localAddr != nil && localAddr.Port > 0 {
 		actualPort = localAddr.Port
 	}
 
 	if hint := netutil.FormatListenHint(ip, actualPort); hint != "" {
-		l.client.log.Infof("🌐 <green>DNS Server %s</green>", hint)
+		l.log.Infof("🌐 <green>DNS Server %s</green>", hint)
 	}
 
 	go func() {
@@ -178,8 +187,8 @@ func (l *DNSListener) Start(ctx context.Context, ip string, port int) error {
 						time.Sleep(100 * time.Millisecond)
 						continue
 					}
-					if l.client != nil && l.client.log != nil {
-						l.client.log.Warnf("⚠️ <yellow>DNS listener stopped after read error: %v</yellow>", err)
+					if l.log != nil {
+						l.log.Warnf("⚠️ <yellow>DNS listener stopped after read error: %v</yellow>", err)
 					}
 					return
 				}
@@ -209,8 +218,8 @@ const (
 func (l *DNSListener) startTCP(ctx context.Context, ip string, port int) {
 	ln, err := net.Listen("tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
 	if err != nil {
-		if l.client != nil && l.client.log != nil {
-			l.client.log.Warnf("⚠️ <yellow>DNS over TCP not available on %s:%d: %v</yellow>", ip, port, err)
+		if l.log != nil {
+			l.log.Warnf("⚠️ <yellow>DNS over TCP not available on %s:%d: %v</yellow>", ip, port, err)
 		}
 		return
 	}
@@ -270,8 +279,8 @@ func (l *DNSListener) serveTCPConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 		query := append([]byte(nil), buf[:n]...)
-		if l.client != nil {
-			l.client.ProcessDNSQuery(query, conn.RemoteAddr(), func(resp []byte) { writer.Send(resp) })
+		if l.process != nil {
+			l.process(query, conn.RemoteAddr(), func(resp []byte) { writer.Send(resp) })
 		}
 	}
 }
@@ -301,9 +310,12 @@ func (l *DNSListener) Stop() {
 	}
 	l.stopOnce.Do(func() {
 		close(l.stopChan)
+		// ⚠️ Closed, never set to nil: answers come back from the tunnel long
+		// after the query, on other goroutines that still hold this listener,
+		// and nil-ing the field under them was a data race. A write to a
+		// closed socket just fails.
 		if l.conn != nil {
 			_ = l.conn.Close()
-			l.conn = nil
 		}
 		if l.tcp != nil {
 			_ = l.tcp.Close()
@@ -313,13 +325,14 @@ func (l *DNSListener) Stop() {
 
 // handleQuery manages incoming DNS queries by checking the local cache or redirecting to the tunnel.
 func (l *DNSListener) handleQuery(ctx context.Context, data []byte, addr *net.UDPAddr) {
-	if l.client == nil {
+	if l.process == nil {
 		return
 	}
 
-	l.client.ProcessDNSQuery(data, addr, func(resp []byte) {
-		if l.conn != nil {
-			_, _ = l.conn.WriteToUDP(resp, addr)
+	conn := l.conn
+	l.process(data, addr, func(resp []byte) {
+		if conn != nil {
+			_, _ = conn.WriteToUDP(resp, addr)
 		}
 	})
 }

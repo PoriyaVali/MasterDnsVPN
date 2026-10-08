@@ -289,6 +289,12 @@ MAX_SESSIONS_PER_USER = 8
 # client in the field speaks v2 (SESSION_V2 = "auto" or "on").
 REQUIRE_SESSION_V2 = false
 
+# Early data: hold a connection's first bytes when they arrive before (or
+# while) its SYN opens the upstream connection, so clients may send them
+# without waiting for CONNECTED - one round trip less per new connection.
+# Clients that predate it never use it.
+EARLY_DATA_ENABLED = true
+
 # ------------------------------------------------------------------------------
 # 8.1) Client Policy Sync Limits
 # What this section does:

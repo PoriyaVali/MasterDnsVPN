@@ -922,6 +922,7 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 			MinARQInitialRTOSeconds:   s.cfg.ClientMinARQInitialRTOSeconds,
 		},
 		HasClientPolicySync: true,
+		Caps:                s.sessionCaps(),
 	})
 
 	acceptPacket := VpnProto.Packet{

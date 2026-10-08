@@ -585,8 +585,25 @@ func clampDuration(v, minV, maxV time.Duration) time.Duration {
 	return v
 }
 
+// adaptiveRTOFloor is how low a measured RTO may go. The configured RTO is
+// only the starting point, used before the first round trip is measured.
+//
+// ⚠️ It used to be the floor as well, and every sample was clamped up to it
+// before being averaged, so on a 150 ms path the "adaptive" RTO stayed at the
+// configured 1 s: each lost packet cost a second or more. A lost chat message
+// or TLS record is exactly that kind of loss - the last packet of a burst,
+// with nothing after it to reveal the gap - and only the timer recovers it.
+const adaptiveRTOFloor = 200 * time.Millisecond
+
+func adaptiveFloor(configured time.Duration) time.Duration {
+	if configured < adaptiveRTOFloor {
+		return configured
+	}
+	return adaptiveRTOFloor
+}
+
 func updateAdaptiveRTO(state adaptiveRTOState, sample, minRTO, maxRTO time.Duration) adaptiveRTOState {
-	sample = clampDuration(sample, minRTO, maxRTO)
+	sample = clampDuration(sample, time.Millisecond, maxRTO)
 
 	if !state.initialized {
 		state.srtt = sample
@@ -778,7 +795,7 @@ func (a *ARQ) currentDataBaseRTO() time.Duration {
 	if base <= 0 {
 		return a.rto
 	}
-	return clampDuration(base, a.rto, a.maxRTO)
+	return clampDuration(base, adaptiveFloor(a.rto), a.maxRTO)
 }
 
 func (a *ARQ) currentControlBaseRTO() time.Duration {
@@ -786,18 +803,18 @@ func (a *ARQ) currentControlBaseRTO() time.Duration {
 	if base <= 0 {
 		return a.controlRto
 	}
-	return clampDuration(base, a.controlRto, a.controlMaxRto)
+	return clampDuration(base, adaptiveFloor(a.controlRto), a.controlMaxRto)
 }
 
 func (a *ARQ) noteSuccessfulDataSample(sample time.Duration) {
 	a.mu.Lock()
-	a.dataAdaptiveRTO = updateAdaptiveRTO(a.dataAdaptiveRTO, sample, a.rto, a.maxRTO)
+	a.dataAdaptiveRTO = updateAdaptiveRTO(a.dataAdaptiveRTO, sample, adaptiveFloor(a.rto), a.maxRTO)
 	a.mu.Unlock()
 }
 
 func (a *ARQ) noteSuccessfulControlSample(sample time.Duration) {
 	a.mu.Lock()
-	a.controlAdaptiveRTO = updateAdaptiveRTO(a.controlAdaptiveRTO, sample, a.controlRto, a.controlMaxRto)
+	a.controlAdaptiveRTO = updateAdaptiveRTO(a.controlAdaptiveRTO, sample, adaptiveFloor(a.controlRto), a.controlMaxRto)
 	a.mu.Unlock()
 }
 
@@ -1542,9 +1559,13 @@ func (a *ARQ) retransmitLoop() {
 
 	for {
 		a.mu.Lock()
-		rtoFactor := a.rto
-		if a.enableControlReliability && a.controlRto < rtoFactor {
-			rtoFactor = a.controlRto
+		// The measured RTOs, not the configured ones: a timer checked every
+		// configured-RTO/3 fired up to a third of a second late.
+		rtoFactor := a.currentDataBaseRTO()
+		if a.enableControlReliability {
+			if c := a.currentControlBaseRTO(); c < rtoFactor {
+				rtoFactor = c
+			}
 		}
 
 		baseInterval := max(rtoFactor/3, 50*time.Millisecond)

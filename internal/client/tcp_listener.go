@@ -16,11 +16,13 @@ import (
 	"sync"
 	"time"
 
+	"masterdnsvpn-go/internal/logger"
 	"masterdnsvpn-go/internal/netutil"
 )
 
 type TCPListener struct {
-	client       *Client
+	log          *logger.Logger
+	handle       func(ctx context.Context, conn net.Conn)
 	protocolType string
 	listeners    []net.Listener
 	stopChan     chan struct{}
@@ -28,8 +30,21 @@ type TCPListener struct {
 }
 
 func NewTCPListener(c *Client, protocolType string) *TCPListener {
+	return newTCPListenerWithHandler(c.log, protocolType, func(ctx context.Context, conn net.Conn) {
+		if protocolType == "SOCKS5" {
+			c.HandleSOCKS5(ctx, conn)
+			return
+		}
+		c.HandleTCPConnect(ctx, conn)
+	})
+}
+
+// newTCPListenerWithHandler is a listener whose connections go to handle -
+// the load balancer's, which picks a tunnel per connection.
+func newTCPListenerWithHandler(log *logger.Logger, protocolType string, handle func(ctx context.Context, conn net.Conn)) *TCPListener {
 	return &TCPListener{
-		client:       c,
+		log:          log,
+		handle:       handle,
 		protocolType: protocolType,
 		stopChan:     make(chan struct{}),
 	}
@@ -51,8 +66,8 @@ func (l *TCPListener) Start(ctx context.Context, ip string, port int) error {
 				}
 				return err
 			}
-			if l.client != nil && l.client.log != nil {
-				l.client.log.Debugf("Skipping optional listener bind on %s: %v", addr, err)
+			if l.log != nil {
+				l.log.Debugf("Skipping optional listener bind on %s: %v", addr, err)
 			}
 			continue
 		}
@@ -65,8 +80,8 @@ func (l *TCPListener) Start(ctx context.Context, ip string, port int) error {
 
 	l.listeners = listeners
 	for _, listener := range listeners {
-		if l.client != nil && l.client.log != nil {
-			l.client.log.Infof("🚀 <green>%s Proxy server is listening on <cyan>%s</cyan></green>", l.protocolType, listener.Addr().String())
+		if l.log != nil {
+			l.log.Infof("🚀 <green>%s Proxy server is listening on <cyan>%s</cyan></green>", l.protocolType, listener.Addr().String())
 		}
 
 		go func(activeListener net.Listener) {
@@ -86,18 +101,18 @@ func (l *TCPListener) Start(ctx context.Context, ip string, port int) error {
 							time.Sleep(100 * time.Millisecond)
 							continue
 						}
-						if l.client != nil && l.client.log != nil {
-							l.client.log.Debugf("⚠️ <yellow>%s listener stopped after accept error: %v</yellow>", l.protocolType, err)
+						if l.log != nil {
+							l.log.Debugf("⚠️ <yellow>%s listener stopped after accept error: %v</yellow>", l.protocolType, err)
 						}
 						return
 					}
 				}
-				go l.handleConnection(ctx, conn, l.protocolType)
+				go l.handle(ctx, conn)
 			}
 		}(listener)
 	}
 
-	if l.client != nil && l.client.log != nil {
+	if l.log != nil {
 		actualPort := port
 		if len(listeners) > 0 {
 			if localAddr, ok := listeners[0].Addr().(*net.TCPAddr); ok && localAddr != nil && localAddr.Port > 0 {
@@ -106,7 +121,7 @@ func (l *TCPListener) Start(ctx context.Context, ip string, port int) error {
 		}
 
 		if hint := netutil.FormatListenHint(ip, actualPort); hint != "" {
-			l.client.log.Infof("🌐 <green>%s Proxy %s</green>", l.protocolType, hint)
+			l.log.Infof("🌐 <green>%s Proxy %s</green>", l.protocolType, hint)
 		}
 	}
 
@@ -165,14 +180,4 @@ func listenerShouldRetryAccept(err error) bool {
 		}
 	}
 	return false
-}
-
-// handleConnection manages the local proxy/TCP forwarding handshake and requests.
-func (l *TCPListener) handleConnection(ctx context.Context, conn net.Conn, protocolType string) {
-	if protocolType == "SOCKS5" {
-		l.client.HandleSOCKS5(ctx, conn)
-		return
-	}
-
-	l.client.HandleTCPConnect(ctx, conn)
 }

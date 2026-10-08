@@ -89,23 +89,55 @@ func (c *Client) noteV2InitRoundFailed() {
 	}
 }
 
+// sessionInitStagger spaces the racing SESSION_INIT queries apart.
+const sessionInitStagger = 100 * time.Millisecond
+
+// sessionInitRaceTargets picks the resolvers one init round races on: up to
+// SESSION_INIT_RACING_COUNT distinct ones, in the init cursor's rotation.
+//
+// ⚠️ Distinct, not the same one three times. The three copies used to go to
+// one resolver with the same name, and a resolver merges identical in-flight
+// queries (and may answer the later ones from cache), so the extra copies
+// bought almost nothing - and one slow resolver stalled the whole round. The
+// server keys sessions on the init's signature, so the same init arriving
+// through several resolvers still opens one session.
+func (c *Client) sessionInitRaceTargets() ([]Connection, []byte, [4]byte, *sessioncrypto.Keys, error) {
+	racing := c.cfg.SessionInitRacingCount
+	if racing < 1 {
+		racing = 1
+	}
+
+	var (
+		targets    []Connection
+		initBytes  []byte
+		verifyCode [4]byte
+		initKeys   *sessioncrypto.Keys
+	)
+	seen := make(map[string]struct{}, racing)
+	for len(targets) < racing {
+		conn, payload, verify, keys, err := c.nextSessionInitAttempt()
+		if err != nil {
+			if len(targets) > 0 {
+				break
+			}
+			return nil, nil, verifyCode, nil, err
+		}
+		if _, dup := seen[conn.Key]; dup {
+			// The rotation came back round: fewer resolvers than racers.
+			break
+		}
+		seen[conn.Key] = struct{}{}
+		targets = append(targets, conn)
+		initBytes, verifyCode, initKeys = payload, verify, keys
+	}
+	return targets, initBytes, verifyCode, initKeys, nil
+}
+
 func (c *Client) initializeSessionRequest() error {
-	conn, initPayload, verifyCode, initKeys, err := c.nextSessionInitAttempt()
+	targets, initPayload, verifyCode, initKeys, err := c.sessionInitRaceTargets()
 	if err != nil {
 		return err
 	}
-
-	c.log.Infof("<green>Session init attempt with <cyan>%s</cyan> and resolver <cyan>%s</cyan>", conn.Domain, conn.Resolver)
-
-	query, err := c.buildSessionQuery(conn.Domain, Enums.PACKET_SESSION_INIT, initPayload)
-	if err != nil {
-		return ErrSessionInitFailed
-	}
-
-	// Intra-Resolver Racing: Send 3 parallel requests to the same selected resolver.
-	// We staggered each attempt by 100ms.
-	const racingCount = 3
-	const staggerDelay = 100 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -116,18 +148,27 @@ func (c *Client) initializeSessionRequest() error {
 		sealed bool
 	}
 
-	resChan := make(chan result, racingCount)
+	resChan := make(chan result, len(targets))
+	launched := 0
 
-	for i := range racingCount {
+launch:
+	for i, conn := range targets {
 		if i > 0 {
 			select {
-			case <-time.After(staggerDelay):
+			case <-time.After(sessionInitStagger):
 			case <-ctx.Done():
-				goto waitPhase
+				break launch
 			}
 		}
 
-		go func() {
+		c.log.Infof("<green>Session init attempt with <cyan>%s</cyan> and resolver <cyan>%s</cyan>", conn.Domain, conn.Resolver)
+		query, err := c.buildSessionQuery(conn.Domain, Enums.PACKET_SESSION_INIT, initPayload)
+		if err != nil {
+			continue
+		}
+
+		launched++
+		go func(conn Connection, query []byte) {
 			// The answer is decoded the way this init asked for it, not by
 			// c.responseMode: a session reset zeroes that, which made every
 			// re-init in base64 mode unreadable.
@@ -136,36 +177,41 @@ func (c *Client) initializeSessionRequest() error {
 			case resChan <- result{err: err, packet: packet, sealed: sealed}:
 			case <-ctx.Done():
 			}
-		}()
+		}(conn, query)
 	}
 
-waitPhase:
+	if launched == 0 {
+		return ErrSessionInitFailed
+	}
+
 	var lastErr error
 	responsesReceived := 0
+	safety := time.NewTimer(30 * time.Second) // Hard safety timeout
+	defer safety.Stop()
 	for {
 		select {
 		case res := <-resChan:
 			responsesReceived++
 			if res.err == nil {
-				if err := c.applySessionInitPacket(res.packet, res.sealed, initPayload, verifyCode, initKeys); err == nil {
-					cancel()
+				err := c.applySessionInitPacket(res.packet, res.sealed, initPayload, verifyCode, initKeys)
+				if err == nil {
 					return nil
-				} else if errors.Is(err, ErrSessionInitBusy) {
-					cancel()
+				}
+				if errors.Is(err, ErrSessionInitBusy) {
 					return err
 				}
-				lastErr = res.err
+				lastErr = err
 			} else {
 				lastErr = res.err
 			}
 
-			if responsesReceived >= racingCount {
+			if responsesReceived >= launched {
 				if lastErr == nil {
 					return ErrSessionInitFailed
 				}
 				return lastErr
 			}
-		case <-time.After(30 * time.Second): // Hard safety timeout
+		case <-safety.C:
 			return ErrSessionInitFailed
 		}
 	}
@@ -210,6 +256,7 @@ func (c *Client) applySessionInitPacket(packet VpnProto.Packet, sealed bool, ini
 			c.v2Proven.Store(true)
 			c.v2InitFailures = 0
 		}
+		c.serverCaps.Store(uint32(sessionAccept.Caps))
 		c.uploadCompression, c.downloadCompression = compression.SplitPair(sessionAccept.CompressionPair)
 		if sessionAccept.HasClientPolicySync {
 			c.applySessionClientPolicy(sessionAccept.ClientPolicy)
@@ -277,6 +324,11 @@ func (c *Client) applySessionClientPolicy(policy VpnProto.SessionAcceptClientPol
 	c.cfg.CompressionMinSize = settings.CompressionMinSize
 	c.cfg.ARQInitialRTOSeconds = settings.ARQInitialRTOSeconds
 	c.cfg.ARQControlInitialRTOSeconds = settings.ARQControlInitialRTOSeconds
+	if c.cfg.RX_TX_Workers < before.RXTXWorkers && c.cfg.PullPipelineDepth > 4*c.cfg.RX_TX_Workers {
+		// The server limits how many queries a client keeps going at once
+		// through its worker cap; pulling scales down with it.
+		c.cfg.PullPipelineDepth = 4 * c.cfg.RX_TX_Workers
+	}
 	c.cfg.TunnelProcessWorkers = deriveSessionPolicyTunnelProcessWorkers(c.cfg.TunnelProcessWorkers, c.cfg.RX_TX_Workers)
 	c.tunnelProcessWorkers = c.cfg.TunnelProcessWorkers
 

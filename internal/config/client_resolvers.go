@@ -46,15 +46,26 @@ func LoadClientResolvers(filename string) ([]ResolverAddress, map[string]int, er
 	}
 	defer file.Close()
 
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, nil, fmt.Errorf("failed to read resolver file %s: %w", path, err)
+	}
+	return ParseClientResolvers(lines, path)
+}
+
+// ParseClientResolvers reads resolver entries in the resolver file's format,
+// one per element; source names them in errors.
+func ParseClientResolvers(lines []string, source string) ([]ResolverAddress, map[string]int, error) {
 	endpoints := make([]ResolverAddress, 0, 64)
 	resolverMap := make(map[string]int, 64)
 	seenIPs := make(map[string]struct{}, 64)
 
-	scanner := bufio.NewScanner(file)
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		line := strings.TrimSpace(scanner.Text())
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -77,11 +88,8 @@ func LoadClientResolvers(filename string) ([]ResolverAddress, map[string]int, er
 		appendPrefixResolvers(&endpoints, resolverMap, seenIPs, target.prefix, port)
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, nil, fmt.Errorf("failed to read resolver file %s: %w", path, err)
-	}
 	if len(endpoints) == 0 {
-		return nil, nil, fmt.Errorf("no valid resolvers found in %s", path)
+		return nil, nil, fmt.Errorf("no valid resolvers found in %s", source)
 	}
 
 	sort.Slice(endpoints, func(i, j int) bool {

@@ -93,3 +93,32 @@ func TestShouldUseColorHonorsNoColor(t *testing.T) {
 		t.Fatal("NO_COLOR should disable colors even when FORCE_COLOR is set")
 	}
 }
+
+func TestNamedLoggerPrefixesAndSharesOutput(t *testing.T) {
+	var buf bytes.Buffer
+	parent := &Logger{
+		name:          "test",
+		level:         levelInfo,
+		consoleWriter: &buf,
+		appNameText:   "[test]",
+	}
+	child := parent.Named("srv-1")
+
+	child.Infof("ready %d%%", 100)
+	child.Debugf("hidden")
+	parent.Infof("plain")
+
+	output := buf.String()
+	if !strings.Contains(output, "[test] [INFO] [srv-1] ready 100%") {
+		t.Fatalf("child line missing or unprefixed: %q", output)
+	}
+	if strings.Contains(output, "hidden") {
+		t.Fatal("child must keep the parent's level")
+	}
+	if !strings.Contains(output, "[test] [INFO] plain") {
+		t.Fatalf("parent line changed: %q", output)
+	}
+	if err := child.Close(); err != nil {
+		t.Fatalf("child Close: %v", err)
+	}
+}

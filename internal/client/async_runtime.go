@@ -55,6 +55,10 @@ func (c *Client) runtimePacketDuplicationCount(packetType uint8) int {
 	}
 
 	if packetType == Enums.PACKET_PING {
+		if c.pingManager != nil && c.pingManager.idle.Load() {
+			// A quiet tunnel's keepalive: one lost costs one interval.
+			return 1
+		}
 		return min(count, 2)
 	}
 
@@ -64,6 +68,9 @@ func (c *Client) runtimePacketDuplicationCount(packetType uint8) int {
 // StopAsyncRuntime stops all running workers (Readers, Writers, Processors).
 // It ensures the UDP socket is closed and all goroutines exit.
 func (c *Client) StopAsyncRuntime() {
+	c.runtimeReady.Store(false)
+	c.queries.reset()
+	c.pullsQueued.Store(0)
 	if c.asyncCancel != nil {
 		c.log.Debugf("\U0001F6D1 <yellow>Stopping Async Runtime...</yellow>")
 		c.asyncCancel()
@@ -244,6 +251,7 @@ func (c *Client) resetSessionState(resetSessionCookie bool) {
 	c.sessionReady = false
 	c.sessionID = 0
 	c.sessionKeys.Store(nil)
+	c.serverCaps.Store(0)
 	if resetSessionCookie {
 		c.sessionCookie = 0
 	}
@@ -345,15 +353,18 @@ func (c *Client) StartAsyncRuntime(parentCtx context.Context) error {
 	c.log.Infof("\U0001F4E1 <cyan>Async Runtime Initialized: <green>%d RX/TX Workers</green>, <green>%d Processors</green></cyan>",
 		c.tunnelRX_TX_Workers, c.tunnelProcessWorkers)
 
-	// Start TCP/SOCKS Proxy Listener
-	c.tcpListener = NewTCPListener(c, c.cfg.ProtocolType)
-	if err := c.tcpListener.Start(runtimeCtx, c.cfg.ListenIP, c.cfg.ListenPort); err != nil {
-		c.log.Errorf("<red>❌ Failed to start %s proxy: %v</red>", c.cfg.ProtocolType, err)
-		return err
+	// Start TCP/SOCKS Proxy Listener. A load-balanced server has none: the
+	// pool listens once, for every server.
+	if c.pool == nil {
+		c.tcpListener = NewTCPListener(c, c.cfg.ProtocolType)
+		if err := c.tcpListener.Start(runtimeCtx, c.cfg.ListenIP, c.cfg.ListenPort); err != nil {
+			c.log.Errorf("<red>❌ Failed to start %s proxy: %v</red>", c.cfg.ProtocolType, err)
+			return err
+		}
 	}
 
 	// Start DNS Listener if enabled
-	if c.cfg.LocalDNSEnabled {
+	if c.cfg.LocalDNSEnabled && c.pool == nil {
 		c.dnsListener = NewDNSListener(c)
 		if err := c.dnsListener.Start(runtimeCtx, c.cfg.LocalDNSIP, c.cfg.LocalDNSPort); err != nil {
 			c.log.Errorf("<red>❌ Failed to start DNS resolver: %v</red>", err)
@@ -574,17 +585,8 @@ func (c *Client) asyncPlanEncodeWorker(ctx context.Context, id int) {
 			}
 
 			frames, err = c.buildPlannedOutboundFrames(task, conns, defaultDomain, packetByDomain, preparedDomainByName, frames)
-			if err != nil {
-				if !task.wasPacked && task.selected != nil {
-					task.selected.ReleaseTXPacket(task.item)
-				}
-				continue
-			}
-
-			if len(frames) == 0 {
-				if !task.wasPacked && task.selected != nil {
-					task.selected.ReleaseTXPacket(task.item)
-				}
+			if err != nil || len(frames) == 0 {
+				c.releasePlannerTask(task)
 				continue
 			}
 
@@ -596,6 +598,7 @@ func (c *Client) asyncPlanEncodeWorker(ctx context.Context, id int) {
 				wasPacked: task.wasPacked,
 				item:      task.item,
 				selected:  task.selected,
+				pull:      task.pull,
 				frames:    append([]encodedOutboundDatagram(nil), frames...),
 			}
 
@@ -648,6 +651,9 @@ func (c *Client) requeuePlannerTaskForRetry(task plannerTask) {
 }
 
 func (c *Client) releasePlannerTask(task plannerTask) {
+	if task.pull {
+		c.notePullSent()
+	}
 	if !task.wasPacked && task.selected != nil {
 		task.selected.ReleaseTXPacket(task.item)
 	}
@@ -803,6 +809,7 @@ func (c *Client) asyncWriterWorker(ctx context.Context, id int, conn *net.UDPCon
 					continue
 				}
 				if _, err := conn.WriteToUDP(frame.packet, frame.addr); err == nil {
+					c.queries.sent(frame.packet, now)
 					c.balancer.TrackResolverSend(
 						frame.packet,
 						frame.addr.String(),
@@ -812,6 +819,9 @@ func (c *Client) asyncWriterWorker(ctx context.Context, id int, conn *net.UDPCon
 						c.tunnelPacketTimeout,
 					)
 				}
+			}
+			if task.pull {
+				c.notePullSent()
 			}
 			if !task.wasPacked && task.selected != nil {
 				task.selected.ReleaseTXPacket(task.item)
@@ -891,6 +901,8 @@ func (c *Client) asyncProcessorWorker(ctx context.Context, id int) {
 // handleInboundPacket is the central entry point for all received tunnel packets.
 func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr, localAddr string) {
 	// c.log.Debugf("Inbound packet from %v (%d bytes)", addr, len(data))
+	now := time.Now()
+	c.queries.answered(data, now)
 
 	// 1. Extract VPN Packet from DNS Response
 	vpnPacket, trusted, err := c.decodeInbound(data)
@@ -944,6 +956,7 @@ func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr, localAddr s
 
 	// 2. Notify activity monitor (PingManager)
 	c.NotifyPacket(vpnPacket.PacketType, true)
+	c.notePulledData(vpnPacket.PacketType, now)
 
 	// 3. Queue deterministic non-data ACKs before any handler logic runs.
 	if handled := c.preprocessInboundPacket(vpnPacket); handled {

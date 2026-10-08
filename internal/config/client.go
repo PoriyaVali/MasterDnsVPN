@@ -112,6 +112,22 @@ type ClientConfig struct {
 	PingWarmThresholdSeconds              float64           `toml:"PING_WARM_THRESHOLD_SECONDS"`
 	PingCoolThresholdSeconds              float64           `toml:"PING_COOL_THRESHOLD_SECONDS"`
 	PingColdThresholdSeconds              float64           `toml:"PING_COLD_THRESHOLD_SECONDS"`
+	// While app connections are open, idle polling stays at this interval for
+	// this long after the last traffic instead of dropping to the cold
+	// interval. A DNS server can only answer a query, so this is how long an
+	// incoming chat message can wait at the server: up to the cold interval
+	// (15 s) without it. A window of 0 turns it off.
+	PingStreamIdleIntervalSeconds         float64           `toml:"PING_STREAM_IDLE_INTERVAL_SECONDS"`
+	PingStreamIdleWindowSeconds           float64           `toml:"PING_STREAM_IDLE_WINDOW_SECONDS"`
+	// Queries kept in flight while the server still has data to send. Every
+	// answer carries one packet, so this is what download speed scales with.
+	// 0 = auto (4 x RX_TX_WORKERS, 32..256), negative = off.
+	PullPipelineDepth                     int               `toml:"PULL_PIPELINE_DEPTH"`
+	// Send a new connection's first bytes right behind its SYN, when the
+	// server says it holds them (servers that predate this never see it).
+	// Saves one tunnel round trip per connection. A connection the server
+	// then cannot open is closed instead of refused with a SOCKS error.
+	EarlyData                             bool              `toml:"EARLY_DATA"`
 	RXChannelSize                         int               `toml:"RX_CHANNEL_SIZE"`
 	DNSResponseFragmentTimeoutSeconds     float64           `toml:"DNS_RESPONSE_FRAGMENT_TIMEOUT_SECONDS"`
 	SOCKSUDPAssociateReadTimeoutSeconds   float64           `toml:"SOCKS_UDP_ASSOCIATE_READ_TIMEOUT_SECONDS"`
@@ -149,6 +165,46 @@ type ClientConfig struct {
 	ARQTerminalAckWaitTimeoutSec          float64           `toml:"ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS"`
 	Resolvers                             []ResolverAddress `toml:"-"`
 	ResolverMap                           map[string]int    `toml:"-"`
+
+	// Resolvers given inline instead of in a file. When set it wins over any
+	// resolver file, so one SERVERS entry can carry its own list.
+	ResolverList []string `toml:"RESOLVERS" flag:"-"`
+
+	// Multi-server load balancing. Each SERVERS entry is one MasterDnsVPN
+	// server (its own DOMAINS, ENCRYPTION_KEY, UUID, NODE_SECRET, ...); every
+	// key it leaves out is inherited from the top level. The client opens one
+	// session per server and spreads new connections across those that are
+	// up. Without SERVERS the client talks to one server exactly as before.
+	Servers                   []map[string]any `toml:"SERVERS"`
+	LoadBalancerStrategy      string           `toml:"LOAD_BALANCER_STRATEGY"`
+	LoadBalancerSticky        bool             `toml:"LOAD_BALANCER_STICKY"`
+	LoadBalancerStickySeconds float64          `toml:"LOAD_BALANCER_STICKY_SECONDS"`
+	// Per-server only: a label for logs and a share of new connections.
+	ServerName   string `toml:"NAME" flag:"-"`
+	ServerWeight int    `toml:"WEIGHT" flag:"-"`
+
+	// ServerProfiles are the finalized SERVERS entries; empty in single-server
+	// mode.
+	ServerProfiles []ClientConfig `toml:"-"`
+}
+
+// Load balancer strategies (LOAD_BALANCER_STRATEGY).
+const (
+	LoadBalancerLeastLoad  = "least_load"
+	LoadBalancerRoundRobin = "round_robin"
+	LoadBalancerRandom     = "random"
+	LoadBalancerFailover   = "failover"
+)
+
+// IsLoadBalanced reports whether this config runs several servers at once.
+func (c ClientConfig) IsLoadBalanced() bool {
+	return len(c.ServerProfiles) > 0
+}
+
+// LoadBalancerStickyTTL is how long a destination stays on the server that
+// first carried it.
+func (c ClientConfig) LoadBalancerStickyTTL() time.Duration {
+	return time.Duration(c.LoadBalancerStickySeconds * float64(time.Second))
 }
 
 type ClientConfigOverrides struct {
@@ -213,6 +269,10 @@ func defaultClientConfig() ClientConfig {
 		PingWarmThresholdSeconds:              8.0,
 		PingCoolThresholdSeconds:              20.0,
 		PingColdThresholdSeconds:              30.0,
+		PingStreamIdleIntervalSeconds:         3.0,
+		PingStreamIdleWindowSeconds:           120.0,
+		PullPipelineDepth:                     0,
+		EarlyData:                             true,
 		RXChannelSize:                         4096,
 		DNSResponseFragmentTimeoutSeconds:     60.0,
 		SOCKSUDPAssociateReadTimeoutSeconds:   30.0,
@@ -248,6 +308,9 @@ func defaultClientConfig() ClientConfig {
 		ARQDataNackRepeatSeconds:              1.0,
 		ARQTerminalDrainTimeoutSec:            120.0,
 		ARQTerminalAckWaitTimeoutSec:          90.0,
+		LoadBalancerStrategy:                  LoadBalancerLeastLoad,
+		LoadBalancerSticky:                    true,
+		LoadBalancerStickySeconds:             600.0,
 	}
 }
 
@@ -363,6 +426,26 @@ func LoadClientConfigFromJSONBase64WithOverrides(encoded string, overrides Clien
 }
 
 func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
+	if len(cfg.Servers) == 0 {
+		cfg.ServerProfiles = nil
+		return finalizeClientConfigCommon(cfg, true)
+	}
+
+	// Expanded from the config as written, before the top level is
+	// normalized: each entry is finalized on its own, with its own values.
+	profiles, err := expandServerProfiles(cfg)
+	if err != nil {
+		return cfg, err
+	}
+	cfg, err = finalizeClientConfigCommon(cfg, false)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.ServerProfiles = profiles
+	return cfg, nil
+}
+
+func finalizeClientConfigCommon(cfg ClientConfig, requireTunnel bool) (ClientConfig, error) {
 	cfg.ProtocolType = strings.ToUpper(strings.TrimSpace(cfg.ProtocolType))
 	cfg.LogLevel = strings.TrimSpace(cfg.LogLevel)
 	cfg.DeviceID = strings.TrimSpace(cfg.DeviceID)
@@ -492,6 +575,15 @@ func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 	cfg.PingWarmThresholdSeconds = clampFloat(defaultFloatAtMostZero(cfg.PingWarmThresholdSeconds, 8.0), 0.1, 600.0)
 	cfg.PingCoolThresholdSeconds = clampFloat(defaultFloatAtMostZero(cfg.PingCoolThresholdSeconds, 20.0), cfg.PingWarmThresholdSeconds, 1800.0)
 	cfg.PingColdThresholdSeconds = clampFloat(defaultFloatAtMostZero(cfg.PingColdThresholdSeconds, 30.0), cfg.PingCoolThresholdSeconds, 3600.0)
+	cfg.PingStreamIdleIntervalSeconds = clampFloat(defaultFloatAtMostZero(cfg.PingStreamIdleIntervalSeconds, 3.0), cfg.PingCooldownIntervalSeconds, cfg.PingColdIntervalSeconds)
+	cfg.PingStreamIdleWindowSeconds = clampFloat(cfg.PingStreamIdleWindowSeconds, 0, 86400.0)
+	if cfg.PullPipelineDepth == 0 {
+		// Auto: scales with the parallelism the profile already asks for
+		// (the Android app's throttled/balanced/clean profiles use 8/24/64
+		// workers), never so low that it does nothing.
+		cfg.PullPipelineDepth = clampInt(4*cfg.RX_TX_Workers, 32, 256)
+	}
+	cfg.PullPipelineDepth = clampInt(cfg.PullPipelineDepth, -1, 256)
 	cfg.RXChannelSize = clampInt(defaultIntBelow(cfg.RXChannelSize, 1, 4096), 64, 65536)
 	cfg.DNSResponseFragmentTimeoutSeconds = clampFloat(defaultFloatAtMostZero(cfg.DNSResponseFragmentTimeoutSeconds, 60.0), 1.0, 600.0)
 	cfg.SOCKSUDPAssociateReadTimeoutSeconds = clampFloat(defaultFloatAtMostZero(cfg.SOCKSUDPAssociateReadTimeoutSeconds, 30.0), 1.0, 3600.0)
@@ -510,19 +602,38 @@ func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 	cfg.MTUAddedServerLogFormat = strings.TrimSpace(cfg.MTUAddedServerLogFormat)
 	cfg.MTUReactiveAddedServerLogFormat = strings.TrimSpace(cfg.MTUReactiveAddedServerLogFormat)
 
+	cfg.LoadBalancerStrategy = normalizeLoadBalancerStrategy(cfg.LoadBalancerStrategy)
+	cfg.LoadBalancerStickySeconds = clampFloat(defaultFloatAtMostZero(cfg.LoadBalancerStickySeconds, 600.0), 10.0, 86400.0)
+	cfg.ServerName = strings.TrimSpace(cfg.ServerName)
+	cfg.ServerWeight = clampInt(defaultIntBelow(cfg.ServerWeight, 1, 1), 1, 100)
+
 	cfg.EncryptionKey = strings.TrimSpace(cfg.EncryptionKey)
+	cfg.Domains = normalizeClientDomains(cfg.Domains)
+	cfg.ResolversFilePath = strings.TrimSpace(cfg.ResolversFilePath)
+	if !requireTunnel {
+		// A load-balanced top level only carries what its servers share; each
+		// server is checked for a key, domains and resolvers on its own.
+		return cfg, nil
+	}
+
 	if cfg.EncryptionKey == "" {
 		return cfg, fmt.Errorf("ENCRYPTION_KEY is required in client config")
 	}
 
-	cfg.Domains = normalizeClientDomains(cfg.Domains)
 	if len(cfg.Domains) == 0 {
 		return cfg, fmt.Errorf("DOMAINS must contain at least one domain")
 	}
 
-	cfg.ResolversFilePath = strings.TrimSpace(cfg.ResolversFilePath)
-
-	resolvers, resolverMap, err := LoadClientResolvers(cfg.ResolversPath())
+	var (
+		resolvers   []ResolverAddress
+		resolverMap map[string]int
+		err         error
+	)
+	if len(cfg.ResolverList) > 0 {
+		resolvers, resolverMap, err = ParseClientResolvers(cfg.ResolverList, "RESOLVERS")
+	} else {
+		resolvers, resolverMap, err = LoadClientResolvers(cfg.ResolversPath())
+	}
 	if err != nil {
 		return cfg, err
 	}
@@ -606,6 +717,14 @@ func (c ClientConfig) PingAggressiveInterval() time.Duration {
 
 func (c ClientConfig) PingLazyInterval() time.Duration {
 	return time.Duration(c.PingLazyIntervalSeconds * float64(time.Second))
+}
+
+func (c ClientConfig) PingStreamIdleInterval() time.Duration {
+	return time.Duration(c.PingStreamIdleIntervalSeconds * float64(time.Second))
+}
+
+func (c ClientConfig) PingStreamIdleWindow() time.Duration {
+	return time.Duration(c.PingStreamIdleWindowSeconds * float64(time.Second))
 }
 
 func (c ClientConfig) PingCooldownInterval() time.Duration {
@@ -833,7 +952,7 @@ func NewClientConfigFlagBinder(fs *flag.FlagSet) (*ClientConfigFlagBinder, error
 	for i := 0; i < valueType.NumField(); i++ {
 		field := valueType.Field(i)
 		tomlTag := field.Tag.Get("toml")
-		if tomlTag == "" || tomlTag == "-" {
+		if tomlTag == "" || tomlTag == "-" || field.Tag.Get("flag") == "-" {
 			continue
 		}
 

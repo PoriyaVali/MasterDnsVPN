@@ -699,6 +699,66 @@ These settings are critical on the server:
 
 ---
 
+### 3.4.11) ⚖️ Multi-Server Load Balancing (`SERVERS`)
+
+One client can use several MasterDnsVPN servers **at the same time** behind a single local SOCKS5/TCP port. Each `[[SERVERS]]` entry is one server; any key the entry leaves out is inherited from the top of the file. The client opens a separate session to every server (its own resolvers, MTU scan and streams) and gives each **new connection** to one of the servers that is up.
+
+```toml
+# Shared by every server: the local proxy, logging, tuning...
+LISTEN_PORT = 18000
+ENCRYPTION_KEY = "shared-key"        # inherited by entries that do not set one
+LOAD_BALANCER_STRATEGY = "least_load"
+LOAD_BALANCER_STICKY = true
+
+[[SERVERS]]
+NAME = "de-1"
+DOMAINS = ["v.server1.com"]
+UUID = "..."
+NODE_SECRET = "..."
+
+[[SERVERS]]
+NAME = "nl-1"
+DOMAINS = ["v.server2.com"]
+ENCRYPTION_KEY = "another-key"
+WEIGHT = 2                           # gets twice the share of new connections
+RESOLVERS = ["8.8.8.8", "1.1.1.1"]   # optional; otherwise the resolver file is used
+```
+
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
+| :--- | :--- | :--- | :--- |
+| `SERVERS` | array of tables | 1 to 16 entries | Turns load balancing on. Every entry is validated like a full client config (it needs `DOMAINS` and `ENCRYPTION_KEY`, its own or inherited).<br>Keys describing the shared local proxy (`LISTEN_*`, `PROTOCOL_TYPE`, `SOCKS5_*`, `LOCAL_DNS_*`, `BYPASS_*`, `PROTECT_PATH`, `LOG_LEVEL`) cannot be changed per server and are ignored inside an entry. |
+| `LOAD_BALANCER_STRATEGY` | `"least_load"` | `least_load`, `round_robin`, `random`, `failover` | `least_load`: fewest open streams per unit of weight.<br>`round_robin` / `random`: share new connections by `WEIGHT`.<br>`failover`: always the first server (in file order) that is up; the rest are hot standbys.<br>An unknown value is read as `least_load`. |
+| `LOAD_BALANCER_STICKY` | `true` | `true` / `false` | Keeps every destination (host name or IP) on the server it was first given. Each server reaches the internet from its own IP, and many sites (logins, banks, captchas, video CDNs) break when one visitor's connections come from different IPs. |
+| `LOAD_BALANCER_STICKY_SECONDS` | `600` | clamped to `10..86400` | How long a destination stays on its server after its last new connection. |
+| `NAME` | `"de-1"` | any string (per server) | Label used in log lines (`[de-1] ...`). Defaults to the server's first domain. |
+| `WEIGHT` | `1` | clamped to `1..100` (per server) | Relative share of new connections. |
+| `RESOLVERS` | `["8.8.8.8"]` | resolver-file syntax, one entry per element | Inline resolver list. When set it wins over any resolver file, at the top level or per server. |
+
+What it does and does not do:
+- The unit of balancing is a **connection**, not a packet. One download runs on one server; a browser's many parallel connections run on all of them, so the total throughput is roughly the sum of the servers.
+- A server that stops answering (12 s with no reply) gets no new connections while another one answers; its open connections are lost, new ones go elsewhere. Servers that lose their session are skipped until they reopen it.
+- **No server-side change is needed.** Each server just sees an ordinary client session. Every server must still have its own domain/NS delegation: a single domain must never point at more than one server.
+- The local listener opens as soon as the first server is up. `Session initialization failed` is only logged when **every** server is failing (an MTU scan that finds no usable resolver counts as failing).
+- **Resolvers are measured per server.** Each server scans every resolver in its list against its own domain and keeps its own verdicts: a resolver can work for one server and not another. Give each `[[SERVERS]]` entry the resolvers known to work for it with `RESOLVERS`; entries without one all scan the shared resolver file.
+- All servers scan inside one shared budget of `MTU_TEST_PARALLELISM` probes, not N times it. A server whose scan finds nothing rescans with a growing pause (up to a minute) while the others carry traffic.
+- New connections are shared by `WEIGHT` × the server's working resolvers (counting up to 4): a server that got through on one resolver gets a quarter of the share of a healthy one.
+- A server silent for 45 s has its session restarted; if it then cannot open a session three times, it measures its resolvers again. A server whose runtime fails to start is restarted with backoff.
+
+---
+
+### 3.4.12) 🚀 Speed and Latency
+
+| Parameter | Sample Value | Allowed Values / Real Behavior | Full Explanation |
+| :--- | :--- | :--- | :--- |
+| `EARLY_DATA` | `true` | `true` / `false` | A new connection's first bytes (TLS hello, HTTP request) go right behind its SYN instead of waiting for `CONNECTED`: **one tunnel round trip less per connection** (measured: connect-to-first-byte 448 → 240 ms on a 120 ms path, 1050 → 538 ms on a 400 ms path with 5% loss). Used only with servers that announce it (`EARLY_DATA_ENABLED`); older servers are used as before. A target the server cannot reach is closed instead of refused with a SOCKS error — through the Android TUN that was already the case. |
+| `PULL_PIPELINE_DEPTH` | `0` | `0` = auto (4 × `RX_TX_WORKERS`, 32..256), negative = off, up to 256 | Each DNS answer carries one packet, so download speed is (queries in flight) ÷ RTT. While the server still has data, every data packet that arrives adds one poll until this many queries are in flight. It does not add traffic — a transfer still takes about one query per packet — it sends them sooner. Measured on a 120 ms path with 2% loss: one download 47 → ~178 KiB/s, eight parallel downloads 55 → 113–153 KiB/s. |
+| `PING_STREAM_IDLE_INTERVAL_SECONDS` | `3.0` | between the cooldown and cold intervals | While app connections are open, idle polling stays at this interval instead of dropping to `PING_COLD_INTERVAL_SECONDS` (15 s). A DNS server cannot send until it is asked, so an incoming Telegram/WhatsApp message used to wait up to 15 s; now at most this long. These idle polls go out once, not duplicated. |
+| `PING_STREAM_IDLE_WINDOW_SECONDS` | `120.0` | `0..86400`, `0` = off | How long after the last traffic the interval above applies; after that the tunnel goes cold as before. |
+
+Also changed without a setting: the ARQ's retransmission timeout now follows the measured round trip down to 200 ms (it used to stay at the configured start value, 1 s by default, so every lost packet cost a second or more), and the 100 ms aggressive ping really is 100 ms (it used to come out at 100–200 ms).
+
+---
+
 ## Section 3.5: 📖 Server Configuration (`server_config.toml`)
 
 > ℹ️ Note: the sample server config contains a key named `CONFIG_VERSION`, but the current Go code does not read it into `ServerConfig`. For that reason it is not included in the table below and has no effect on real server behavior.

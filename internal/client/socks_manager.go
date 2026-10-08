@@ -331,6 +331,21 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 		return
 	}
 
+	// Load balanced: this client only read the SOCKS request. The stream goes
+	// to whichever server the pool picks for this destination.
+	if c.pool != nil {
+		if target := c.pool.memberForTarget(addr); target != nil && target != c {
+			target.openSOCKSConnectStream(conn, addr, port, atyp, socksVersion)
+			return
+		}
+	}
+
+	c.openSOCKSConnectStream(conn, addr, port, atyp, socksVersion)
+}
+
+// openSOCKSConnectStream opens the tunnel stream for a SOCKS CONNECT whose
+// request has been read, and owns conn from here on.
+func (c *Client) openSOCKSConnectStream(conn net.Conn, addr string, port uint16, atyp byte, socksVersion byte) {
 	streamID, ok := c.get_new_stream_id()
 	if !ok {
 		c.log.Errorf("❌ <red>Failed to get new Stream ID for SOCKS CONNECT</red>")
@@ -339,6 +354,9 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 		} else {
 			_ = c.sendSocksReply(conn, SOCKS5_REPLY_GENERAL_FAILURE, SOCKS5_ATYP_IPV4, net.IPv4zero, 0)
 		}
+		// Nobody else owns this socket yet: without the close it stayed open
+		// until the application gave up on it.
+		_ = conn.Close()
 		return
 	}
 
@@ -392,6 +410,7 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 		} else {
 			_ = c.sendSocksReply(conn, SOCKS5_REPLY_GENERAL_FAILURE, SOCKS5_ATYP_IPV4, net.IPv4zero, 0)
 		}
+		_ = conn.Close()
 		return
 	}
 
@@ -419,6 +438,37 @@ func (c *Client) handleSOCKSConnect(ctx context.Context, conn net.Conn, addr str
 			120*time.Second,
 		)
 	}
+
+	if c.earlyDataActive() {
+		c.replySOCKSEarly(s, arqObj)
+	}
+}
+
+// earlyDataActive: this session's server holds data that arrives before its
+// stream's SYN, so a connection's first bytes need not wait for CONNECTED.
+func (c *Client) earlyDataActive() bool {
+	return c.cfg.EarlyData && uint8(c.serverCaps.Load())&VpnProto.SessionCapEarlyData != 0
+}
+
+// replySOCKSEarly tells the app its CONNECT succeeded as soon as the SYN is
+// queued, and starts reading what it sends.
+//
+// 🔑 Every new connection used to wait one full tunnel round trip - SYN up,
+// CONNECTED down - before the app could send a byte, and only then did its
+// TLS handshake or HTTP request start its own round trip. Now that first
+// request travels right behind the SYN. Through the Android TUN this changes
+// nothing else: the TUN already accepted the app's TCP connection locally, so
+// a target that cannot be reached was always a reset, never a SOCKS error.
+func (c *Client) replySOCKSEarly(s *Stream_client, arqObj *arq.ARQ) {
+	s.socksResultMu.Lock()
+	s.earlyReplied.Store(true)
+	err := c.writeSocksConnectResultLocked(s, SOCKS5_REPLY_SUCCESS)
+	s.socksResultMu.Unlock()
+	if err != nil {
+		s.earlyReplied.Store(false)
+		return
+	}
+	arqObj.SetIOReady(true)
 }
 
 func (c *Client) writeSocksConnectResult(streamID uint16, rep byte) error {
@@ -723,7 +773,10 @@ func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, cli
 			continue
 		}
 
-		c.log.Infof("📡 <green>Received DNS Query from SOCKS5 UDP: <cyan>%d bytes</cyan>, Target: <cyan>%s:%d</cyan></green>", n-payloadOffset, targetAddr, targetPort)
+		// Debug, not Info: one line per lookup, and a feed or a page does
+		// hundreds. On Android every line is read off a pipe, sent to logcat
+		// and written to a flushed log file.
+		c.log.Debugf("📡 <green>Received DNS Query from SOCKS5 UDP: <cyan>%d bytes</cyan>, Target: <cyan>%s:%d</cyan></green>", n-payloadOffset, targetAddr, targetPort)
 
 		dnsQuery := buf[payloadOffset:n]
 
@@ -841,6 +894,17 @@ func (c *Client) HandleSocksFailure(packet VpnProto.Packet) error {
 		arqObj, err := c.getStreamARQ(packet.StreamID)
 		if err == nil {
 			arqObj.Close("SOCKS failure received after local cancellation", arq.CloseOptions{SendRST: true})
+		}
+		return nil
+	}
+
+	if s.earlyReplied.Load() {
+		// The app was already told "connected" and may be reading the
+		// connection: a SOCKS reply now would land in its data. Close it.
+		s.SetStatus(streamStatusSocksFailed)
+		s.socksResultMu.Unlock()
+		if arqObj, err := c.getStreamARQ(packet.StreamID); err == nil {
+			arqObj.Close("SOCKS failure after early reply", arq.CloseOptions{Force: true})
 		}
 		return nil
 	}
