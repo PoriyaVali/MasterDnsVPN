@@ -24,6 +24,9 @@ import (
 // app relies on excluding itself from the tunnel instead.
 const protectTimeout = 2 * time.Second
 
+// protectAckRefused is the app's answer when VpnService.protect() failed.
+const protectAckRefused = 1
+
 // SendFD asks the listener at path to protect fd.
 func SendFD(path string, fd uintptr) error {
 	if path == "" {
@@ -52,6 +55,15 @@ func SendFD(path string, fd uintptr) error {
 	ack := make([]byte, 1)
 	if _, err := unixConn.Read(ack); err != nil {
 		return fmt.Errorf("protect: no acknowledgement: %w", err)
+	}
+	// ⚠️ The byte is the answer, not just a receipt: the app writes 0 when
+	// VpnService.protect() succeeded and 1 when it did not, and this used to
+	// read it and throw it away. A refusal is counted, not turned into an
+	// error: the app also keeps its own uid - this process - off the tunnel,
+	// and protect is its second line, so the socket still works. Failing it
+	// would reject a resolver for a reason that has nothing to do with it.
+	if ack[0] == protectAckRefused {
+		protectRefusals.Add(1)
 	}
 	return nil
 }

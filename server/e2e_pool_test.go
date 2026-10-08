@@ -163,3 +163,88 @@ func TestE2E_LoadBalancerRoutesAroundADeadServer(t *testing.T) {
 		t.Fatalf("node-2 did not carry the fetch after node-1 died (+%d bytes)", grew)
 	}
 }
+
+// Resolver lists that work for one server and not another: node-2's only
+// resolver leads nowhere, so its scan finds nothing, for as long as the test
+// runs. node-1 must carry everything, and node-2 must not hold the pool up.
+func TestE2E_LoadBalancerWorksWhenOneServerHasNoUsableResolver(t *testing.T) {
+	body := e2eBody(t)
+	a := startNode(t, body)
+
+	dead, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadAddr := dead.LocalAddr().(*net.UDPAddr)
+	_ = dead.Close() // nothing answers here
+
+	b := &e2eNode{relay: deadAddr}
+	port := startPoolClient(t, config.LoadBalancerRoundRobin, a, b)
+	for i := 0; i < 3; i++ {
+		if got := fetch(t, port); !bytes.Equal(got, body) {
+			t.Fatalf("fetch %d: body differs", i)
+		}
+	}
+}
+
+// When no server can come up - here no resolver answers for any of them - the
+// pool must still say "Session initialization failed", the line the Android
+// app counts to give up and try something else. A server whose scan finds
+// nothing used to never count as failing, and blocked that line for ever.
+func TestE2E_LoadBalancerReportsFailureWhenNoServerHasAResolver(t *testing.T) {
+	dead := func() *e2eNode {
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := pc.LocalAddr().(*net.UDPAddr)
+		_ = pc.Close()
+		return &e2eNode{relay: addr}
+	}
+	dir := t.TempDir()
+	cfg := fmt.Sprintf(`DOMAINS = [%q]
+ENCRYPTION_KEY = %q
+LISTEN_IP = "127.0.0.1"
+LISTEN_PORT = %d
+LOCAL_DNS_CACHE_PERSIST_TO_FILE = false
+MTU_TEST_TIMEOUT = 0.3
+MTU_TEST_RETRIES = 1
+LOG_LEVEL = "INFO"
+
+[[SERVERS]]
+NAME = "one"
+RESOLVERS = [%q]
+
+[[SERVERS]]
+NAME = "two"
+RESOLVERS = [%q]
+`, e2eDomain, e2eKey, freeTCPPort(t), dead().relay.String(), dead().relay.String())
+	path := filepath.Join(dir, "client_config.toml")
+	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := config.LoadClientConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(dir, "client.log")
+	pool, err := client.BootstrapPool(loaded, logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = pool.Run(ctx) }()
+	defer func() { cancel(); <-done; _ = pool.Log().Close() }()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		raw, _ := os.ReadFile(logPath)
+		if strings.Contains(string(raw), "Session initialization failed") {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	raw, _ := os.ReadFile(logPath)
+	t.Fatalf("no pool failure line after 30s; log:\n%s", raw)
+}

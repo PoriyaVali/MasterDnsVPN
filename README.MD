@@ -738,7 +738,11 @@ What it does and does not do:
 - The unit of balancing is a **connection**, not a packet. One download runs on one server; a browser's many parallel connections run on all of them, so the total throughput is roughly the sum of the servers.
 - A server that stops answering (12 s with no reply) gets no new connections while another one answers; its open connections are lost, new ones go elsewhere. Servers that lose their session are skipped until they reopen it.
 - **No server-side change is needed.** Each server just sees an ordinary client session. Every server must still have its own domain/NS delegation: a single domain must never point at more than one server.
-- The local listener opens as soon as the first server is up. `Session initialization failed` is only logged when **every** server is failing.
+- The local listener opens as soon as the first server is up. `Session initialization failed` is only logged when **every** server is failing (an MTU scan that finds no usable resolver counts as failing).
+- **Resolvers are measured per server.** Each server scans every resolver in its list against its own domain and keeps its own verdicts: a resolver can work for one server and not another. Give each `[[SERVERS]]` entry the resolvers known to work for it with `RESOLVERS`; entries without one all scan the shared resolver file.
+- All servers scan inside one shared budget of `MTU_TEST_PARALLELISM` probes, not N times it. A server whose scan finds nothing rescans with a growing pause (up to a minute) while the others carry traffic.
+- New connections are shared by `WEIGHT` × the server's working resolvers (counting up to 4): a server that got through on one resolver gets a quarter of the share of a healthy one.
+- A server silent for 45 s has its session restarted; if it then cannot open a session three times, it measures its resolvers again. A server whose runtime fails to start is restarted with backoff.
 
 ---
 

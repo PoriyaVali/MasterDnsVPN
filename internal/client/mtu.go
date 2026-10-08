@@ -611,6 +611,10 @@ func (c *Client) recheckInactiveResolver(ctx context.Context, conn Connection) {
 	if c == nil || c.balancer == nil || conn.Key == "" {
 		return
 	}
+	if !c.acquireScanSlot(ctx) {
+		return
+	}
+	defer c.releaseScanSlot()
 
 	transport, err := newUDPQueryTransport(conn.ResolverLabel)
 	if err != nil {
@@ -781,6 +785,12 @@ func (c *Client) confirmResolverDown(conn *Connection, window time.Duration) boo
 }
 
 func (c *Client) runConnectionMTUTest(ctx context.Context, conn Connection, serverID int, total int, maxUploadPayload int, counters *mtuScanCounters) {
+	// Load-balanced: every server scans at once, inside one shared budget.
+	if !c.acquireScanSlot(ctx) {
+		return
+	}
+	defer c.releaseScanSlot()
+
 	if conn.Key == "" {
 		return
 	}

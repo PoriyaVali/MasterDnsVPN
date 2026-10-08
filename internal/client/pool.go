@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -58,6 +59,13 @@ type Pool struct {
 	tcpListener *TCPListener
 	dnsListener *DNSListener
 
+	// scanSlots bounds MTU probes in flight across ALL servers. Each server
+	// measures every resolver for itself - a resolver can serve one server's
+	// domain and not another's - so N servers are N scans; together they get
+	// the budget one client would have, not N times it. Each probe opens a
+	// socket that the Android app must protect, one at a time.
+	scanSlots chan struct{}
+
 	nowFn func() time.Time
 }
 
@@ -82,10 +90,24 @@ const (
 	poolSuperviseInterval = 200 * time.Millisecond
 	// poolUnresponsiveAfter: a server that has been sending this long without
 	// any answer gets no new connections while another server is answering.
-	// Its session still counts as open - it may be a slow patch, and the
-	// server's own client resets the session if it is really gone - but new
+	// Its session still counts as open - it may be a slow patch - but new
 	// work should not wait on it.
 	poolUnresponsiveAfter = 12 * time.Second
+	// poolStallRestartAfter: a server silent this long has its session
+	// restarted. Its resolvers may all have died; auto-disable keeps the
+	// last few active whatever happens to them, so without this the server
+	// would keep sending into them for as long as the app runs.
+	poolStallRestartAfter = 45 * time.Second
+	// poolStallRestartGap spaces those restarts out.
+	poolStallRestartGap = 60 * time.Second
+	// poolMemberRestartMax caps the backoff for restarting a server whose
+	// runtime failed to start.
+	poolMemberRestartMax = time.Minute
+	// poolHealthyResolvers: a server with this many working resolvers or
+	// more gets its full weight; with fewer, proportionally less.
+	poolHealthyResolvers = 4
+	// poolMinScanSlots is the least the shared scan budget is allowed.
+	poolMinScanSlots = 8
 )
 
 // BootstrapPool builds the load balancer from a config with SERVERS.
@@ -102,6 +124,7 @@ func BootstrapPool(cfg config.ClientConfig, logPath string) (*Pool, error) {
 	}
 
 	p := newPool(cfg, log)
+	p.scanSlots = make(chan struct{}, max(cfg.MTUTestParallelism, poolMinScanSlots))
 	for i, profile := range cfg.ServerProfiles {
 		codec, err := security.NewCodec(profile.DataEncryptionMethod, profile.EncryptionKey)
 		if err != nil {
@@ -115,6 +138,11 @@ func BootstrapPool(cfg config.ClientConfig, logPath string) (*Pool, error) {
 			// One cache file in the config directory; two writers would
 			// overwrite each other.
 			profile.LocalDNSCachePersist = false
+		}
+		if profile.SaveMTUServersToFile {
+			// Every server would otherwise write - and truncate - the same
+			// file in the same config directory.
+			profile.MTUServersFileName = perServerFileName(profile.MTUServersFileName, profile.ServerName)
 		}
 
 		c := New(profile, log.Named(profile.ServerName), codec)
@@ -188,48 +216,68 @@ func (p *Pool) Run(ctx context.Context) error {
 	defer cancel()
 
 	var wg sync.WaitGroup
-	exited := make(chan struct{}, len(p.members))
 	for _, m := range p.members {
 		wg.Add(1)
 		go func(m *poolMember) {
 			defer wg.Done()
-			defer func() { exited <- struct{}{} }()
-			if err := m.client.Run(runCtx); err != nil && p.log != nil {
-				p.log.Errorf("<red>❌ Server <cyan>%s</cyan> stopped: %v</red>", m.name, err)
-			}
+			p.runMember(runCtx, m)
 		}(m)
 	}
 
-	err := p.supervise(runCtx, exited)
+	err := p.supervise(runCtx)
 	cancel()
 	p.stopListeners()
 	wg.Wait()
 	return err
 }
 
-// supervise opens the shared listeners once the first server is up and
-// reports the pool's state as servers come and go.
-func (p *Pool) supervise(ctx context.Context, exited <-chan struct{}) error {
+// runMember keeps one server running until ctx ends.
+//
+// ⚠️ Client.Run returns early only when its runtime could not start - a
+// socket that could not be opened, say during another server's scan. On its
+// own the process would exit and the app would start it again; here the
+// other servers keep the process alive, so the pool restarts it instead of
+// carrying on one server short for the rest of the session.
+func (p *Pool) runMember(ctx context.Context, m *poolMember) {
+	delay := time.Second
+	for {
+		err := m.client.Run(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		if p.log != nil {
+			p.log.Errorf("<red>❌ Server <cyan>%s</cyan> stopped: %v - restarting in %s</red>", m.name, err, delay)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		if delay *= 2; delay > poolMemberRestartMax {
+			delay = poolMemberRestartMax
+		}
+	}
+}
+
+// supervise opens the shared listeners once the first server is up, reports
+// the pool's state as servers come and go, and restarts servers that went
+// silent.
+func (p *Pool) supervise(ctx context.Context) error {
 	ticker := time.NewTicker(poolSuperviseInterval)
 	defer ticker.Stop()
 
 	listening := false
 	lastState := ""
-	stopped := 0
 	failMarks := make([]uint64, len(p.members))
+	lastStallRestart := make([]time.Time, len(p.members))
 
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-exited:
-			stopped++
-			if stopped >= len(p.members) {
-				return errors.New("every load-balanced server stopped")
-			}
-			continue
 		case <-ticker.C:
 		}
+		p.restartStalledMembers(lastStallRestart)
 
 		ready := p.readyCount()
 		if ready > 0 && !listening {
@@ -245,6 +293,25 @@ func (p *Pool) supervise(ctx context.Context, exited <-chan struct{}) error {
 		if ready == 0 {
 			p.reportAllServersFailing(failMarks)
 		}
+	}
+}
+
+// restartStalledMembers restarts the session of every server that has had no
+// answer for poolStallRestartAfter, at most once per poolStallRestartGap.
+//
+// A restart opens a new session through the server's resolvers; if that
+// fails a few times the server measures its resolvers again (Client.Run).
+func (p *Pool) restartStalledMembers(last []time.Time) {
+	now := p.nowFn()
+	for i, m := range p.members {
+		if !m.client.RuntimeReady() || m.client.unansweredFor(now) < poolStallRestartAfter {
+			continue
+		}
+		if !last[i].IsZero() && now.Sub(last[i]) < poolStallRestartGap {
+			continue
+		}
+		last[i] = now
+		m.client.requestSessionRestart(fmt.Sprintf("no answer from this server for %s", poolStallRestartAfter))
 	}
 }
 
@@ -295,7 +362,7 @@ func (p *Pool) logReadyState(ready int) {
 func (p *Pool) reportAllServersFailing(marks []uint64) {
 	current := make([]uint64, len(p.members))
 	for i, m := range p.members {
-		current[i] = m.client.sessionInitFailures.Load()
+		current[i] = m.client.startFailures.Load()
 		if current[i] <= marks[i] {
 			return
 		}
@@ -470,38 +537,89 @@ func (p *Pool) choose(ready []*poolMember) *poolMember {
 	}
 }
 
-// leastLoaded is the server with the fewest streams for its weight. Ties are
-// broken by rotation, so equally idle servers take turns instead of the first
-// one getting everything.
+// effectiveWeight is a server's WEIGHT scaled by how many of its resolvers
+// work. A server that got through on one resolver is as "up" as one with a
+// hundred, but every connection on it shares that one resolver and dies
+// with it; it should not get the same share.
+func (m *poolMember) effectiveWeight() int {
+	healthy := poolHealthyResolvers
+	if b := m.client.Balancer(); b != nil {
+		healthy = min(max(b.ActiveCount(), 1), poolHealthyResolvers)
+	}
+	return m.weight * healthy
+}
+
+// leastLoaded is the server with the fewest streams for its effective
+// weight. Ties are broken by rotation, so equally idle servers take turns
+// instead of the first one getting everything.
 func (p *Pool) leastLoaded(ready []*poolMember) *poolMember {
 	start := int((p.rr.Add(1) - 1) % uint64(len(ready)))
 	best := ready[start]
-	bestLoad := best.client.ActiveStreamCount()
+	bestLoad, bestWeight := best.client.ActiveStreamCount(), best.effectiveWeight()
 	for i := 1; i < len(ready); i++ {
 		m := ready[(start+i)%len(ready)]
-		load := m.client.ActiveStreamCount()
-		// load/weight < bestLoad/best.weight, without division.
-		if load*best.weight < bestLoad*m.weight {
-			best, bestLoad = m, load
+		load, weight := m.client.ActiveStreamCount(), m.effectiveWeight()
+		// load/weight < bestLoad/bestWeight, without division.
+		if load*bestWeight < bestLoad*weight {
+			best, bestLoad, bestWeight = m, load, weight
 		}
 	}
 	return best
 }
 
-// weightedSlot maps n onto the servers, each taking weight consecutive slots.
+// weightedSlot maps n onto the servers, each taking effective-weight
+// consecutive slots.
 func weightedSlot(ready []*poolMember, n uint64) *poolMember {
+	weights := make([]int, len(ready))
 	total := 0
-	for _, m := range ready {
-		total += m.weight
+	for i, m := range ready {
+		weights[i] = m.effectiveWeight()
+		total += weights[i]
 	}
 	slot := int(n % uint64(total))
-	for _, m := range ready {
-		if slot < m.weight {
+	for i, m := range ready {
+		if slot < weights[i] {
 			return m
 		}
-		slot -= m.weight
+		slot -= weights[i]
 	}
 	return ready[len(ready)-1]
+}
+
+// acquireScanSlot takes one slot of the pool's shared scan budget, or
+// returns false if ctx ends first. A client outside a pool has no budget.
+func (c *Client) acquireScanSlot(ctx context.Context) bool {
+	if c.pool == nil || c.pool.scanSlots == nil {
+		return true
+	}
+	select {
+	case c.pool.scanSlots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (c *Client) releaseScanSlot() {
+	if c.pool == nil || c.pool.scanSlots == nil {
+		return
+	}
+	<-c.pool.scanSlots
+}
+
+// perServerFileName puts a server's name before a file name's extension:
+// "mtu_{time}.log" -> "mtu_{time}_de-1.log".
+func perServerFileName(name, server string) string {
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			return r
+		default:
+			return '_'
+		}
+	}, server)
+	ext := filepath.Ext(name)
+	return strings.TrimSuffix(name, ext) + "_" + safe + ext
 }
 
 func (p *Pool) pruneAffinityLocked(now time.Time) {

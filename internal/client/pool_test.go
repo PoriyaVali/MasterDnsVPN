@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -224,22 +225,151 @@ func TestPoolReportsAllServersFailingOnlyWhenEveryOneFailed(t *testing.T) {
 	p := testPool(t, config.LoadBalancerLeastLoad, false, 1, 1)
 	marks := make([]uint64, 2)
 
-	p.members[0].client.sessionInitFailures.Add(3)
+	p.members[0].client.startFailures.Add(3)
 	p.reportAllServersFailing(marks)
 	if marks[0] != 0 {
 		t.Fatal("reported a pool failure while one server had not failed yet")
 	}
 
-	p.members[1].client.sessionInitFailures.Add(1)
+	p.members[1].client.startFailures.Add(1)
 	p.reportAllServersFailing(marks)
 	if marks[0] != 3 || marks[1] != 1 {
 		t.Fatalf("all servers failed but marks are %v", marks)
 	}
 
 	// The next report needs a fresh failure from every server again.
-	p.members[0].client.sessionInitFailures.Add(1)
+	p.members[0].client.startFailures.Add(1)
 	p.reportAllServersFailing(marks)
 	if marks[0] != 3 {
 		t.Fatal("reported again after only one server failed")
+	}
+}
+
+func setActiveResolvers(t *testing.T, c *Client, n int) {
+	t.Helper()
+	keys := make([]string, 0, 8)
+	conns := make([]*Connection, 0, 8)
+	for i := 0; i < 8; i++ {
+		key := "r" + itoaSafe(i)
+		keys = append(keys, key)
+		conns = append(conns, &Connection{Key: key, Domain: "v.example.com", Resolver: "127.0.0.1", ResolverPort: 5300 + i, ResolverLabel: "127.0.0.1:" + itoaSafe(5300+i)})
+	}
+	c.balancer.SetConnections(conns)
+	for i, key := range keys {
+		c.balancer.SetConnectionMTU(key, 120, 180, 220)
+		c.balancer.SetConnectionValidity(key, i < n)
+	}
+	if got := c.balancer.ActiveCount(); got != n {
+		t.Fatalf("active resolvers = %d, want %d", got, n)
+	}
+}
+
+func TestPoolPrefersServersWithMoreWorkingResolvers(t *testing.T) {
+	p := testPool(t, config.LoadBalancerRoundRobin, false, 1, 1)
+	setActiveResolvers(t, p.members[0].client, 1)
+	setActiveResolvers(t, p.members[1].client, 8) // counts as poolHealthyResolvers
+	counts := pickCounts(p, 500, func(int) string { return "" })
+	if counts["A"] != 100 || counts["B"] != 400 {
+		t.Fatalf("1 vs 4+ working resolvers should share 1:4, got %v", counts)
+	}
+
+	q := testPool(t, config.LoadBalancerLeastLoad, false, 1, 1)
+	setActiveResolvers(t, q.members[0].client, 1)
+	setActiveResolvers(t, q.members[1].client, 4)
+	addStreams(q.members[0].client, 1)
+	addStreams(q.members[1].client, 3)
+	// 1 stream on 1 resolver (1.0 per unit) vs 3 on 4 (0.75 per unit).
+	if m := q.pick(""); m.name != "B" {
+		t.Fatalf("least load picked %s, want the healthier B", m.name)
+	}
+}
+
+func TestPoolRestartsAServerThatWentSilent(t *testing.T) {
+	p := testPool(t, config.LoadBalancerLeastLoad, false, 1, 1)
+	now := p.nowFn()
+	silent := p.members[0].client
+	silent.awaitingReplySince.Store(now.Add(-time.Minute).UnixNano())
+	p.members[1].client.awaitingReplySince.Store(now.Add(-time.Second).UnixNano())
+
+	last := make([]time.Time, 2)
+	p.restartStalledMembers(last)
+	select {
+	case <-silent.sessionResetSignal:
+	default:
+		t.Fatal("a server silent for a minute was not restarted")
+	}
+	select {
+	case <-p.members[1].client.sessionResetSignal:
+		t.Fatal("a server one second into a round trip was restarted")
+	default:
+	}
+
+	// Not again within the gap.
+	silent.clearRuntimeResetRequest()
+	p.restartStalledMembers(last)
+	select {
+	case <-silent.sessionResetSignal:
+		t.Fatal("restarted again inside poolStallRestartGap")
+	default:
+	}
+}
+
+func TestPoolScanBudgetIsShared(t *testing.T) {
+	p := testPool(t, config.LoadBalancerLeastLoad, false, 1, 1)
+	p.scanSlots = make(chan struct{}, 2)
+	a, b := p.members[0].client, p.members[1].client
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if !a.acquireScanSlot(ctx) || !b.acquireScanSlot(ctx) {
+		t.Fatal("could not take the first two slots")
+	}
+	short, cancelShort := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancelShort()
+	if a.acquireScanSlot(short) {
+		t.Fatal("a third probe ran inside a budget of two")
+	}
+	b.releaseScanSlot()
+	if !a.acquireScanSlot(ctx) {
+		t.Fatal("a freed slot was not reusable")
+	}
+
+	// Outside a pool there is no budget.
+	solo := buildTestClientWithResolvers(config.ClientConfig{}, "r")
+	for i := 0; i < 10; i++ {
+		if !solo.acquireScanSlot(short) {
+			t.Fatal("a client outside a pool was limited")
+		}
+		solo.releaseScanSlot()
+	}
+}
+
+func TestMTURescanBacksOffOnlyInAPool(t *testing.T) {
+	solo := buildTestClientWithResolvers(config.ClientConfig{}, "r")
+	for _, n := range []int{1, 2, 5, 50} {
+		if got := solo.mtuRescanDelay(n); got != 5*time.Second {
+			t.Fatalf("single client rescan after %d failures = %v, want 5s", n, got)
+		}
+	}
+	p := testPool(t, config.LoadBalancerLeastLoad, false, 1)
+	member := p.members[0].client
+	want := []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second, time.Minute, time.Minute}
+	for i, w := range want {
+		if got := member.mtuRescanDelay(i + 1); got != w {
+			t.Fatalf("pool member rescan after %d failures = %v, want %v", i+1, got, w)
+		}
+	}
+}
+
+func TestPerServerFileName(t *testing.T) {
+	cases := map[[2]string]string{
+		{"mtu_{time}.log", "de-1"}:     "mtu_{time}_de-1.log",
+		{"servers", "a b/c"}:           "servers_a_b_c",
+		{"x.y.txt", "v.example.com#2"}: "x.y_v.example.com_2.txt",
+	}
+	for in, want := range cases {
+		if got := perServerFileName(in[0], in[1]); got != want {
+			t.Errorf("perServerFileName(%q, %q) = %q, want %q", in[0], in[1], got, want)
+		}
 	}
 }
