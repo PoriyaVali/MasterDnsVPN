@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,9 +41,23 @@ import (
 // 0.02) and MDNS_PERF_IDLE (s, default 40) change the path.
 
 type perfPath struct {
-	delay  time.Duration
-	jitter time.Duration
-	loss   float64
+	delay          time.Duration
+	jitter         time.Duration
+	loss           float64
+	seed           uint64
+	maxQueryBytes  int
+	maxAnswerBytes int
+	blackout       *atomic.Bool
+	counts         *perfPathCounts
+}
+
+type perfPathCounts struct {
+	dropped     atomic.Uint64
+	oversized   atomic.Uint64
+	upBytes     atomic.Uint64
+	downBytes   atomic.Uint64
+	upPackets   atomic.Uint64
+	downPackets atomic.Uint64
 }
 
 // startLossyRelay is a resolver on a bad path: each datagram, either way, is
@@ -56,8 +71,18 @@ func startLossyRelay(t *testing.T, node *net.UDPAddr, path perfPath) *net.UDPAdd
 	t.Cleanup(func() { _ = front.Close() })
 
 	var rngMu sync.Mutex
-	rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 7))
-	later := func(b []byte, send func([]byte)) {
+	seed := path.seed
+	if seed == 0 {
+		seed = uint64(time.Now().UnixNano())
+	}
+	rng := rand.New(rand.NewPCG(seed, 7))
+	later := func(b []byte, limit int, send func([]byte)) {
+		if limit > 0 && len(b) > limit {
+			if path.counts != nil {
+				path.counts.oversized.Add(1)
+			}
+			return
+		}
 		rngMu.Lock()
 		drop := rng.Float64() < path.loss
 		var j time.Duration
@@ -65,7 +90,10 @@ func startLossyRelay(t *testing.T, node *net.UDPAddr, path perfPath) *net.UDPAdd
 			j = time.Duration(rng.Int64N(int64(path.jitter)))
 		}
 		rngMu.Unlock()
-		if drop {
+		if drop || (path.blackout != nil && path.blackout.Load()) {
+			if path.counts != nil {
+				path.counts.dropped.Add(1)
+			}
 			return
 		}
 		cp := append([]byte(nil), b...)
@@ -80,6 +108,10 @@ func startLossyRelay(t *testing.T, node *net.UDPAddr, path perfPath) *net.UDPAdd
 			n, from, err := front.ReadFromUDP(buf)
 			if err != nil {
 				return
+			}
+			if path.counts != nil {
+				path.counts.upBytes.Add(uint64(n))
+				path.counts.upPackets.Add(1)
 			}
 			mu.Lock()
 			conn := back[from.String()]
@@ -97,12 +129,16 @@ func startLossyRelay(t *testing.T, node *net.UDPAddr, path perfPath) *net.UDPAdd
 						if err != nil {
 							return
 						}
-						later(rb[:m], func(b []byte) { _, _ = front.WriteToUDP(b, client) })
+						if path.counts != nil {
+							path.counts.downBytes.Add(uint64(m))
+							path.counts.downPackets.Add(1)
+						}
+						later(rb[:m], path.maxAnswerBytes, func(b []byte) { _, _ = front.WriteToUDP(b, client) })
 					}
 				}(conn, from)
 			}
 			mu.Unlock()
-			later(buf[:n], func(b []byte) { _, _ = conn.Write(b) })
+			later(buf[:n], path.maxQueryBytes, func(b []byte) { _, _ = conn.Write(b) })
 		}
 	}()
 	t.Cleanup(func() {
@@ -233,9 +269,14 @@ LOG_LEVEL = "ERROR"
 
 func startPerfClient(t *testing.T, relays []*net.UDPAddr, extra string) int {
 	t.Helper()
+	return startPerfClientProfile(t, relays, perfClientConfig, extra)
+}
+
+func startPerfClientProfile(t *testing.T, relays []*net.UDPAddr, profile, extra string) int {
+	t.Helper()
 	dir := t.TempDir()
 	socksPort := freeTCPPort(t)
-	cfg := fmt.Sprintf(perfClientConfig, e2eDomain, e2eKey, e2eUUID, e2eSecret, socksPort, extra)
+	cfg := fmt.Sprintf(profile, e2eDomain, e2eKey, e2eUUID, e2eSecret, socksPort, extra)
 	path := filepath.Join(dir, "client_config.toml")
 	if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)

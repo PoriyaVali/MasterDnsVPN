@@ -10,8 +10,6 @@
 package client
 
 import (
-	"encoding/binary"
-	"sync"
 	"time"
 
 	Enums "masterdnsvpn-go/internal/enums"
@@ -31,127 +29,6 @@ import (
 // - measured, the same ~2400 datagrams for 512 KiB at every depth - they are
 // just sent sooner. On a 120 ms path with 2% loss, depth 128 took the same
 // download from ~45 to ~92 KiB/s.
-
-const (
-	queryTrackerMinExpiry = 300 * time.Millisecond
-	queryTrackerMaxExpiry = 5 * time.Second
-	queryTrackerSweepGap  = 50 * time.Millisecond
-	// queryTrackerMaxEntries bounds the table on a path that loses everything.
-	queryTrackerMaxEntries = 4096
-)
-
-type queryEntry struct {
-	sentAt int64 // UnixNano
-	copies int   // one built query can go to several resolvers
-}
-
-// queryTracker counts tunnel queries that have not been answered yet. A query
-// unanswered for a few round trips is taken as lost and stops counting.
-type queryTracker struct {
-	mu          sync.Mutex
-	pending     map[uint16]queryEntry
-	outstanding int
-	srtt        time.Duration
-	nextSweep   int64
-}
-
-func newQueryTracker() *queryTracker {
-	return &queryTracker{pending: make(map[uint16]queryEntry, 64)}
-}
-
-func (q *queryTracker) sent(packet []byte, now time.Time) {
-	if q == nil || len(packet) < 2 {
-		return
-	}
-	id := binary.BigEndian.Uint16(packet[:2])
-	q.mu.Lock()
-	if len(q.pending) >= queryTrackerMaxEntries {
-		q.sweepLocked(now.UnixNano(), true)
-	}
-	e := q.pending[id]
-	e.sentAt = now.UnixNano()
-	e.copies++
-	q.pending[id] = e
-	q.outstanding++
-	q.mu.Unlock()
-}
-
-func (q *queryTracker) answered(packet []byte, now time.Time) {
-	if q == nil || len(packet) < 2 {
-		return
-	}
-	id := binary.BigEndian.Uint16(packet[:2])
-	q.mu.Lock()
-	e, ok := q.pending[id]
-	if ok {
-		if rtt := time.Duration(now.UnixNano() - e.sentAt); rtt > 0 {
-			if q.srtt == 0 {
-				q.srtt = rtt
-			} else {
-				q.srtt += (rtt - q.srtt) / 8
-			}
-		}
-		e.copies--
-		q.outstanding--
-		if e.copies <= 0 {
-			delete(q.pending, id)
-		} else {
-			q.pending[id] = e
-		}
-	}
-	q.mu.Unlock()
-}
-
-// inFlight is the number of queries sent and not yet answered or given up on.
-func (q *queryTracker) inFlight(now time.Time) int {
-	if q == nil {
-		return 0
-	}
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.sweepLocked(now.UnixNano(), false)
-	return q.outstanding
-}
-
-func (q *queryTracker) expiryLocked() time.Duration {
-	expiry := 3 * q.srtt
-	if expiry < queryTrackerMinExpiry {
-		expiry = queryTrackerMinExpiry
-	}
-	if expiry > queryTrackerMaxExpiry {
-		expiry = queryTrackerMaxExpiry
-	}
-	return expiry
-}
-
-func (q *queryTracker) sweepLocked(nowNano int64, force bool) {
-	if !force && nowNano < q.nextSweep {
-		return
-	}
-	q.nextSweep = nowNano + int64(queryTrackerSweepGap)
-	cutoff := nowNano - int64(q.expiryLocked())
-	for id, e := range q.pending {
-		if e.sentAt < cutoff {
-			q.outstanding -= e.copies
-			delete(q.pending, id)
-		}
-	}
-	if q.outstanding < 0 {
-		q.outstanding = 0
-	}
-}
-
-func (q *queryTracker) reset() {
-	if q == nil {
-		return
-	}
-	q.mu.Lock()
-	clear(q.pending)
-	q.outstanding = 0
-	q.srtt = 0
-	q.nextSweep = 0
-	q.mu.Unlock()
-}
 
 // pullDepth is the number of queries to keep in flight while data flows; <= 0
 // turns pulling off.
@@ -187,7 +64,7 @@ func (c *Client) notePulledData(packetType uint8, now time.Time) {
 // One query, not duplicated: a pull only has to reach the server, and a lost
 // one is replaced by the next data packet's.
 func (c *Client) sendPull() {
-	payload, err := buildClientPingPayload()
+	payload, err := c.sessionPingPayload()
 	if err != nil {
 		return
 	}

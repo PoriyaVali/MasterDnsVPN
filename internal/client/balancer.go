@@ -113,6 +113,7 @@ type connectionStats struct {
 	lost            atomic.Uint64
 	rttMicrosSum    atomic.Uint64
 	rttCount        atomic.Uint64
+	rttEWMA         atomic.Int64 // microseconds; zero until the first RTT sample
 	windowStartedAt atomic.Int64 // UnixNano
 	windowSent      atomic.Uint32
 	windowLost      atomic.Uint32
@@ -352,6 +353,7 @@ func (b *Balancer) ReportSuccess(serverKey string, rtt time.Duration) {
 	if rtt > 0 {
 		stats.rttMicrosSum.Add(uint64(rtt / time.Microsecond))
 		stats.rttCount.Add(1)
+		stats.observeRTT(rtt)
 	}
 	stats.applyHalfLife()
 }
@@ -1804,8 +1806,7 @@ func (b *Balancer) hasLossSignalLocked() bool {
 		if stats == nil {
 			continue
 		}
-		sent, _, _, _, _ := stats.snapshot()
-		if sent >= 5 {
+		if stats.sent.Load() >= 5 {
 			return true
 		}
 	}
@@ -1818,8 +1819,7 @@ func (b *Balancer) hasLatencySignalLocked() bool {
 		if stats == nil {
 			continue
 		}
-		_, _, _, _, count := stats.snapshot()
-		if count >= 5 {
+		if stats.rttCount.Load() >= 5 {
 			return true
 		}
 	}
@@ -1914,7 +1914,13 @@ func (b *Balancer) lossThenLatencyCandidatesLocked(excludeKey string) []Connecti
 		return nil
 	}
 
-	candidates := make([]candidate, 0, len(b.activeIDs))
+	// Most configurations have a handful of resolvers. Keep their score
+	// snapshot on the stack instead of allocating it for every tunnel packet.
+	var scratch [64]candidate
+	candidates := scratch[:0]
+	if len(b.activeIDs) > len(scratch) {
+		candidates = make([]candidate, 0, len(b.activeIDs))
+	}
 	bestLoss := ^uint64(0)
 	for _, idx := range b.activeIDs {
 		if excludeKey != "" && b.connections[idx].Key == excludeKey {
@@ -1937,7 +1943,7 @@ func (b *Balancer) lossThenLatencyCandidatesLocked(excludeKey string) []Connecti
 	}
 	lossCutoff := bestLoss + lossTolerance
 
-	lossShortlist := make([]candidate, 0, len(candidates))
+	lossShortlist := candidates[:0]
 	bestLatency := ^uint64(0)
 	for _, cand := range candidates {
 		if cand.loss > lossCutoff {
@@ -2034,10 +2040,11 @@ func (b *Balancer) lossScoreLocked(idx int) uint64 {
 	if idx < 0 || idx >= len(b.stats) || b.stats[idx] == nil {
 		return 200 // Use a more neutral default for unknown
 	}
-	sent, _, lost, _, _ := b.stats[idx].snapshot()
+	sent := b.stats[idx].sent.Load()
 	if sent < 5 {
 		return 200 // Initial probation
 	}
+	lost := b.stats[idx].lost.Load()
 	if lost == 0 {
 		return 0
 	}
@@ -2048,11 +2055,33 @@ func (b *Balancer) latencyScoreLocked(idx int) uint64 {
 	if idx < 0 || idx >= len(b.stats) || b.stats[idx] == nil {
 		return 999000
 	}
-	_, _, _, sum, count := b.stats[idx].snapshot()
+	count := b.stats[idx].rttCount.Load()
 	if count < 5 {
 		return 999000
 	}
-	return sum / count
+	if recent := b.stats[idx].rttEWMA.Load(); recent > 0 {
+		return uint64(recent)
+	}
+	return b.stats[idx].rttMicrosSum.Load() / count
+}
+
+func (s *connectionStats) observeRTT(rtt time.Duration) {
+	sample := int64(rtt / time.Microsecond)
+	if sample < 1 {
+		sample = 1
+	}
+	for {
+		previous := s.rttEWMA.Load()
+		next := sample
+		if previous != 0 {
+			// 1/8 smoothing follows a changed path in tens of responses rather
+			// than hundreds, without letting one delayed reply flip the route.
+			next = previous + (sample-previous)/8
+		}
+		if s.rttEWMA.CompareAndSwap(previous, next) {
+			return
+		}
+	}
 }
 
 func (b *Balancer) hybridScoreLocked(idx int) uint64 {

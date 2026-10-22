@@ -17,32 +17,32 @@ func dnsID(id uint16) []byte {
 func TestQueryTrackerCountsAnswersAndCopies(t *testing.T) {
 	q := newQueryTracker()
 	now := time.Unix(1_700_000_000, 0)
-	q.sent(dnsID(1), now)
-	q.sent(dnsID(1), now) // the same query to a second resolver
-	q.sent(dnsID(2), now)
+	q.sent(dnsID(1), trackerResolver, "socket-a", now)
+	q.sent(dnsID(1), trackerResolver, "socket-b", now) // the same query on a second socket
+	q.sent(dnsID(2), trackerResolver, "socket-a", now)
 	if n := q.inFlight(now); n != 3 {
 		t.Fatalf("in flight = %d, want 3", n)
 	}
-	q.answered(dnsID(1), now.Add(100*time.Millisecond))
+	q.answered(dnsID(1), trackerResolver, "socket-a", now.Add(100*time.Millisecond))
 	if n := q.inFlight(now.Add(100 * time.Millisecond)); n != 2 {
 		t.Fatalf("in flight after one answer = %d, want 2", n)
 	}
-	q.answered(dnsID(99), now) // not ours
+	q.answered(dnsID(99), trackerResolver, "socket-a", now) // not ours
 	if n := q.inFlight(now.Add(100 * time.Millisecond)); n != 2 {
 		t.Fatalf("an unknown answer changed the count to %d", n)
 	}
-	if q.srtt != 100*time.Millisecond {
-		t.Fatalf("srtt = %v", q.srtt)
+	if q.paths[queryResolverEndpoint(trackerResolver)].srtt != 100*time.Millisecond {
+		t.Fatalf("srtt = %v", q.paths[queryResolverEndpoint(trackerResolver)].srtt)
 	}
 }
 
 func TestQueryTrackerForgetsLostQueries(t *testing.T) {
 	q := newQueryTracker()
 	now := time.Unix(1_700_000_000, 0)
-	q.sent(dnsID(1), now)
-	q.answered(dnsID(1), now.Add(100*time.Millisecond)) // srtt 100 ms
-	q.sent(dnsID(2), now)
-	q.sent(dnsID(3), now)
+	q.sent(dnsID(1), trackerResolver, "socket-a", now)
+	q.answered(dnsID(1), trackerResolver, "socket-a", now.Add(100*time.Millisecond)) // srtt 100 ms
+	q.sent(dnsID(2), trackerResolver, "socket-a", now)
+	q.sent(dnsID(3), trackerResolver, "socket-a", now)
 	// A lost query stops counting a few round trips later, so a lossy path
 	// does not look permanently full.
 	if n := q.inFlight(now.Add(2 * time.Second)); n != 0 {
@@ -52,8 +52,8 @@ func TestQueryTrackerForgetsLostQueries(t *testing.T) {
 
 func TestQueryTrackerNilSafe(t *testing.T) {
 	var q *queryTracker
-	q.sent(dnsID(1), time.Now())
-	q.answered(dnsID(1), time.Now())
+	q.sent(dnsID(1), trackerResolver, "socket-a", time.Now())
+	q.answered(dnsID(1), trackerResolver, "socket-a", time.Now())
 	q.reset()
 	if q.inFlight(time.Now()) != 0 {
 		t.Fatal("nil tracker counted something")

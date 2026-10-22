@@ -137,6 +137,8 @@ LOCAL_DNS_CACHE_FLUSH_INTERVAL_SECONDS = 60.0
 # 7 = Least Loss Top Random (random choice inside the best 10% loss tier)
 # 8 = Least Loss Top Round Robin (round-robin inside the best 10% loss tier)
 # Modes 3, 4, 5, 6, 7, and 8 use runtime feedback from sends/successes.
+# Modes 4, 5, and 6 smooth recent RTT samples so selection follows path changes.
+# See docs/performance-fa.md for measurements and tuning guidance.
 RESOLVER_BALANCING_STRATEGY = 3
 
 # Duplicate each normal outgoing tunnel packet this many times.

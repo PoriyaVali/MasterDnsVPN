@@ -809,7 +809,7 @@ func (c *Client) asyncWriterWorker(ctx context.Context, id int, conn *net.UDPCon
 					continue
 				}
 				if _, err := conn.WriteToUDP(frame.packet, frame.addr); err == nil {
-					c.queries.sent(frame.packet, now)
+					c.queries.sent(frame.packet, frame.addr, localAddr, now)
 					c.balancer.TrackResolverSend(
 						frame.packet,
 						frame.addr.String(),
@@ -902,7 +902,7 @@ func (c *Client) asyncProcessorWorker(ctx context.Context, id int) {
 func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr, localAddr string) {
 	// c.log.Debugf("Inbound packet from %v (%d bytes)", addr, len(data))
 	now := time.Now()
-	c.queries.answered(data, now)
+	c.queries.answered(data, addr, localAddr, now)
 
 	// 1. Extract VPN Packet from DNS Response
 	vpnPacket, trusted, err := c.decodeInbound(data)

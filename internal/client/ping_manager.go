@@ -208,7 +208,7 @@ func (p *PingManager) pingLoop() {
 // queuePing puts one PING on stream 0. Every answer to a query carries
 // whatever the server has queued, so a ping also pulls data down.
 func (p *PingManager) queuePing() bool {
-	payload, err := buildClientPingPayload()
+	payload, err := p.client.sessionPingPayload()
 	if err != nil {
 		return false
 	}
@@ -242,6 +242,16 @@ func (p *PingManager) nextPingSequence() uint16 {
 		return 0
 	}
 	return uint16(p.nextPingSeq.Add(1))
+}
+
+func (c *Client) sessionPingPayload() ([]byte, error) {
+	if c != nil && c.sessionKeys.Load() != nil {
+		// V2 sealing already gives every query a fresh authenticated nonce.
+		// The legacy PO:random body is unused by peers and adds no entropy
+		// needed for cache busting or security once the frame is sealed.
+		return nil, nil
+	}
+	return buildClientPingPayload()
 }
 
 func buildClientPingPayload() ([]byte, error) {

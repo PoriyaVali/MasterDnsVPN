@@ -366,6 +366,11 @@ func (s *Server) serveQueuedOrPong(questionPacket []byte, requestName string, re
 		return s.buildSessionVPNResponse(questionPacket, requestName, record, *pkt)
 	}
 
+	if record.v2 {
+		// The existing V2 AEAD nonce and full tag protect this empty PONG.
+		// Its legacy seven-byte body is ignored by clients.
+		return s.buildSessionVPNResponse(questionPacket, requestName, record, VpnProto.Packet{PacketType: Enums.PACKET_PONG})
+	}
 	payload := s.nextPongPayload()
 	return s.buildSessionVPNResponse(questionPacket, requestName, record, VpnProto.Packet{
 		PacketType: Enums.PACKET_PONG,
