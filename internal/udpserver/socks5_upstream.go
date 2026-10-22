@@ -123,37 +123,105 @@ func (s *Server) dialDirectSOCKSTarget(ctx context.Context, host string, port ui
 	if len(allowed) == 0 {
 		return nil, &blockedSOCKSTargetError{host: host}
 	}
+	allowed = ipv4FirstInterleaved(allowed)
 	if len(allowed) > maxDirectTargetAddrs {
 		allowed = allowed[:maxDirectTargetAddrs]
 	}
+	return s.raceDirectTargets(ctx, allowed, portText)
+}
 
-	// Addresses are tried in turn, each given its share of what is left of the
-	// deadline (with a floor), the way the standard dialer splits a timeout
-	// across a name's addresses - so one dead address cannot spend the whole
-	// budget before a working one is reached.
+const (
+	maxDirectTargetAddrs      = 4
+	directTargetFallbackDelay = 300 * time.Millisecond
+)
+
+// ipv4FirstInterleaved puts an IPv4 address first and then alternates the
+// families, each family keeping the lookup's order (RFC 8305 section 4, with
+// IPv4 as the first family: every node has IPv4, and not every node's IPv6
+// reaches anything).
+func ipv4FirstInterleaved(addrs []netip.Addr) []netip.Addr {
+	var v4, v6 []netip.Addr
+	for _, addr := range addrs {
+		if addr.Unmap().Is4() {
+			v4 = append(v4, addr)
+		} else {
+			v6 = append(v6, addr)
+		}
+	}
+	ordered := make([]netip.Addr, 0, len(addrs))
+	for i := 0; i < len(v4) || i < len(v6); i++ {
+		if i < len(v4) {
+			ordered = append(ordered, v4[i])
+		}
+		if i < len(v6) {
+			ordered = append(ordered, v6[i])
+		}
+	}
+	return ordered
+}
+
+// raceDirectTargets connects to the first of addrs that answers. Each address
+// gets directTargetFallbackDelay before the next one is started beside it, a
+// failure starts the next one at once, and the first connection wins; the
+// others are cancelled, and closed if they connect anyway.
+//
+// 🔴 Tried one at a time, an address that never answered held up every one
+// after it. A node with an IPv6 address but no IPv6 route out drops the SYN
+// rather than refusing it, and the lookup sorts IPv6 first: through the UK
+// node a new connection to a dual-stack name sat out two IPv6 attempts of
+// 3.75 s each before IPv4 was tried, and www.google.com, whose IPv6 addresses
+// filled every attempt, did not connect at all (Claude 2026-10-22, measured
+// through the relay). Literal addresses, which the Android app sends, never
+// came here; names, which the Windows bridge sends, all did.
+func (s *Server) raceDirectTargets(ctx context.Context, addrs []netip.Addr, port string) (net.Conn, error) {
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan dialResult, len(addrs))
+	started, pending := 0, 0
+	startNext := func() {
+		address := net.JoinHostPort(addrs[started].String(), port)
+		started++
+		pending++
+		go func() {
+			conn, err := s.dialTCPTargetContext(raceCtx, address)
+			results <- dialResult{conn: conn, err: err}
+		}()
+	}
+
+	startNext()
+	fallback := time.NewTimer(directTargetFallbackDelay)
+	defer fallback.Stop()
 	var lastErr error
-	for i, addr := range allowed {
-		attemptCtx := ctx
-		cancel := context.CancelFunc(func() {})
-		if deadline, ok := ctx.Deadline(); ok {
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				break
+	for pending > 0 {
+		select {
+		case result := <-results:
+			pending--
+			if result.err == nil {
+				cancel()
+				go func(left int) {
+					for ; left > 0; left-- {
+						if late := <-results; late.conn != nil {
+							_ = late.conn.Close()
+						}
+					}
+				}(pending)
+				return result.conn, nil
 			}
-			share := remaining / time.Duration(len(allowed)-i)
-			if share < minDirectTargetAttempt {
-				share = min(minDirectTargetAttempt, remaining)
+			lastErr = result.err
+			if started < len(addrs) && ctx.Err() == nil {
+				startNext()
+				fallback.Reset(directTargetFallbackDelay)
 			}
-			attemptCtx, cancel = context.WithTimeout(ctx, share)
-		}
-		conn, err := s.dialTCPTargetContext(attemptCtx, net.JoinHostPort(addr.String(), portText))
-		cancel()
-		if err == nil {
-			return conn, nil
-		}
-		lastErr = err
-		if ctx.Err() != nil {
-			break
+		case <-fallback.C:
+			if started < len(addrs) {
+				startNext()
+				fallback.Reset(directTargetFallbackDelay)
+			}
 		}
 	}
 	if lastErr == nil {
@@ -161,11 +229,6 @@ func (s *Server) dialDirectSOCKSTarget(ctx context.Context, host string, port ui
 	}
 	return nil, lastErr
 }
-
-const (
-	maxDirectTargetAddrs   = 4
-	minDirectTargetAttempt = 2 * time.Second
-)
 
 func validateSOCKSTargetHost(host string) error {
 	trimmed := strings.TrimSpace(host)
