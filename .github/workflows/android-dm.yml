@@ -3,7 +3,8 @@ name: Android client (Doctor Mobile)
 # Builds the mdns client (cmd/client) as an android executable (libmdns.so) for
 # the arches the Doctor Mobile app ships, and on an -android tag publishes a
 # Release with the per-abi binaries the app downloads. arm64 is pure-Go; armv7
-# and x86_64 need the NDK for cgo linking.
+# and x86_64 need the NDK for cgo linking. Keep the shared release as a draft
+# until both platform workflows and Go Test have succeeded.
 on:
   push:
     tags: ['android-*']
@@ -56,8 +57,15 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
-      - run: ls -la artifacts/
+      - name: Generate Android checksums
+        run: |
+          cd artifacts
+          sha256sum libmdns-*.so > SHA256SUMS-android.txt
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          files: artifacts/libmdns-*.so
+          draft: true
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/libmdns-*.so
+            artifacts/SHA256SUMS-android.txt
