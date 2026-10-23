@@ -760,6 +760,7 @@ func (b *Balancer) ResetServerStats(serverKey string) {
 	stats.lost.Store(0)
 	stats.rttMicrosSum.Store(0)
 	stats.rttCount.Store(0)
+	stats.rttEWMA.Store(0)
 }
 
 func (b *Balancer) SeedConservativeStats(serverKey string) {
@@ -773,6 +774,10 @@ func (b *Balancer) SeedConservativeStats(serverKey string) {
 	stats.lost.Store(0)
 	stats.rttMicrosSum.Store(0)
 	stats.rttCount.Store(0)
+	// 🔑 A resolver re-enabled after a recheck is measured afresh. Its
+	// average from before it was disabled - usually slow, it was failing -
+	// would otherwise outweigh its first new samples.
+	stats.rttEWMA.Store(0)
 }
 
 func (b *Balancer) GetBestConnection() (Connection, bool) {
