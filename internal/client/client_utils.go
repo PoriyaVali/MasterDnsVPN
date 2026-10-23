@@ -205,6 +205,7 @@ func (c *Client) ResponseMode() uint8 {
 func (c *Client) NotifyPacket(packetType uint8, isInbound bool) {
 	if isInbound {
 		c.awaitingReplySince.Store(0)
+		c.lastInboundAt.Store(time.Now().UnixNano())
 	} else if c.awaitingReplySince.Load() == 0 {
 		c.awaitingReplySince.CompareAndSwap(0, time.Now().UnixNano())
 	}

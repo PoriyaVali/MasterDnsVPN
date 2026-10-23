@@ -180,6 +180,10 @@ type Client struct {
 	// awaitingReplySince is when the oldest send still without any answer
 	// went out (UnixNano), 0 when every send has been answered.
 	awaitingReplySince atomic.Int64
+	// lastInboundAt is when the last packet from the server arrived
+	// (UnixNano). Unlike awaitingReplySince it is never reset by bringing a
+	// runtime up, so it is the evidence that the server actually answered.
+	lastInboundAt atomic.Int64
 
 	// Download pipelining (pull.go): queries in flight, and PING frames queued
 	// to pull data but not yet sent.
@@ -520,6 +524,7 @@ func (c *Client) Run(parent context.Context) error {
 	sessionInitRetryDelay := time.Duration(0)
 	sessionInitRetryFailures := 0
 	mtuScanFailures := 0
+	var stall stallWatch
 
 	// Ensure local DNS cache is loaded from file if persistence is enabled
 	c.ensureLocalDNSCacheLoaded()
@@ -647,9 +652,81 @@ func (c *Client) Run(parent context.Context) error {
 				}
 				continue
 			case <-time.After(1 * time.Second):
+				c.watchStall(time.Now(), &stall)
 			}
 		}
 	}
+}
+
+// A single-server client that hears nothing back for singleStallRestartAfter
+// restarts its session, as the pool does for each of its servers
+// (poolStallRestartAfter). Before this, nothing in the core noticed: a session
+// whose resolvers had all gone quiet - a national-internet event takes the
+// foreign ones first - kept sending into the void until something outside the
+// core gave up on it (the Android app after three failed health probes, about
+// a minute and a half; the Iran relay's watch after fifteen minutes).
+const (
+	singleStallRestartAfter = 45 * time.Second
+	// singleStallRestartGap spaces recoveries out; it doubles after every one
+	// that changed nothing, up to singleStallRestartMaxGap, so a network that
+	// is simply gone is not hammered with session setups.
+	singleStallRestartGap    = 60 * time.Second
+	singleStallRestartMaxGap = 5 * time.Minute
+	// Restarts in a row with still no answer mean the resolvers themselves
+	// are gone, and a new session over the same ones will not help: measure
+	// them again, which also lets ones that only fit a smaller MTU back in.
+	singleStallRescanAfter = 2
+)
+
+type stallWatch struct {
+	last  time.Time     // when the last recovery started
+	gap   time.Duration // the wait before the next one
+	fails int           // recoveries since the server last answered
+}
+
+// watchStall runs on the Run loop's goroutine, the only one that reads
+// successMTUChecks.
+//
+// 🔑 "The server answered" is lastInboundAt, not awaitingReplySince == 0:
+// bringing a runtime up stores 0 there before anything was sent, which read
+// as an answer and wiped the streak, so the rescan after a second silent
+// session could never come.
+func (c *Client) watchStall(now time.Time, w *stallWatch) {
+	if c.pool != nil || !c.RuntimeReady() {
+		// A pool member is the pool's to restart (Pool.restartStalledMembers).
+		return
+	}
+	if w.fails > 0 && c.lastInboundAt.Load() > w.last.UnixNano() {
+		w.fails, w.gap = 0, 0 // the last recovery worked
+	}
+	silent := c.unansweredFor(now)
+	if silent < singleStallRestartAfter {
+		return
+	}
+	if w.fails > 0 && now.Sub(w.last) < w.gap {
+		return // still giving the last recovery its time
+	}
+	w.last = now
+	w.fails++
+	if w.fails == 1 {
+		w.gap = singleStallRestartGap
+	} else if w.gap *= 2; w.gap > singleStallRestartMaxGap { // this package's min() takes ints
+		w.gap = singleStallRestartMaxGap
+	}
+	// Every second recovery in a row measures the resolvers again.
+	rescan := w.fails%singleStallRescanAfter == 0
+	if c.log != nil {
+		// A line of its own: an app reading the log must not take a recovery
+		// for a failed session setup.
+		c.log.Warnf("⏱️ <yellow>Stall recovery</yellow>: no answer for <cyan>%s</cyan> | attempt=<cyan>%d</cyan> | rescan=<cyan>%t</cyan>",
+			silent.Round(time.Second), w.fails, rescan)
+	}
+	if rescan {
+		c.successMTUChecks = false
+		c.requestSessionRestart("stall recovery: measuring the resolvers again")
+		return
+	}
+	c.requestSessionRestart("stall recovery: new session")
 }
 
 func (c *Client) HandleStreamPacket(packet VpnProto.Packet) error {

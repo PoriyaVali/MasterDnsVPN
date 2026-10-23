@@ -647,41 +647,52 @@ func (c *Client) rejectSocksUDPAssociateUnsupportedTarget(conn net.Conn, targetA
 }
 
 func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, clientAddr string, clientPort uint16, atyp byte) {
-	replyIP := net.ParseIP(c.cfg.ListenIP)
-	if tcpAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok && tcpAddr != nil && tcpAddr.IP != nil {
-		replyIP = tcpAddr.IP
+	defer func() { _ = conn.Close() }()
+	peer, err := newSocksUDPPeer(conn.RemoteAddr(), clientPort)
+	if err != nil {
+		_ = c.sendSocksReply(conn, SOCKS5_REPLY_GENERAL_FAILURE, SOCKS5_ATYP_IPV4, net.IPv4zero, 0)
+		return
 	}
-	if replyIP == nil || replyIP.IsUnspecified() {
-		replyIP = net.IPv4(127, 0, 0, 1)
-	}
-
-	replyATYP := byte(SOCKS5_ATYP_IPV4)
-	if replyIP.To4() == nil {
-		replyATYP = SOCKS5_ATYP_IPV6
-	}
-
-	bindAddr := &net.UDPAddr{
-		IP:   net.IPv4zero,
-		Port: 0,
-	}
-	udpConn, err := net.ListenUDP("udp", bindAddr)
+	udpConn, err := listenSocksUDP(conn)
 	if err != nil {
 		_ = c.sendSocksReply(conn, SOCKS5_REPLY_GENERAL_FAILURE, SOCKS5_ATYP_IPV4, net.IPv4zero, 0)
 		return
 	}
 	defer udpConn.Close()
+	// RFC 1928 ends the association when its TCP control connection ends. Do
+	// not leave an unauthenticated UDP relay alive until its idle deadline.
+	controlDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, conn)
+		_ = udpConn.Close()
+		close(controlDone)
+	}()
+	defer func() {
+		_ = conn.Close()
+		<-controlDone
+	}()
+	stopOnCancel := context.AfterFunc(ctx, func() {
+		_ = udpConn.Close()
+		_ = conn.Close()
+	})
+	defer stopOnCancel()
 
 	// Created on the first datagram to a bypassed address, if there is one.
 	var direct *directUDPRelay
 	defer func() { direct.Close() }()
 
 	boundAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	replyIP := boundAddr.IP
+	replyATYP := byte(SOCKS5_ATYP_IPV4)
+	if replyIP.To4() == nil {
+		replyATYP = SOCKS5_ATYP_IPV6
+	}
 
 	// 🔑 Reply with an address the client can actually send to, not the address
 	// we bound.
 	//
-	// The bind is `IPv4zero:0` over network "udp", which on a dual-stack host
-	// comes back as the IPv6 unspecified address. Handing that to a reply
+	// The old `IPv4zero:0` bind over network "udp" on a dual-stack host
+	// came back as the IPv6 unspecified address. Handing that to a reply
 	// declared ATYP=IPv4 meant `To4()` returned nil and the address was
 	// silently omitted - a six byte reply where the protocol requires ten. The
 	// client then read the port's two bytes as the start of the address and the
@@ -694,8 +705,7 @@ func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, cli
 	// the core's log had zero "Received DNS Query from SOCKS5 UDP" lines while
 	// TCP CONNECTs filled it.
 	//
-	// `replyIP` is the local address this very TCP control connection arrived
-	// on, so it is by construction reachable from the client.
+	// The relay now binds this very TCP connection's local address too.
 	err = c.sendSocksReply(conn, SOCKS5_REPLY_SUCCESS, replyATYP, replyIP, uint16(boundAddr.Port))
 	if err != nil {
 		return
@@ -712,11 +722,17 @@ func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, cli
 			return
 		}
 
+		if ctx.Err() != nil {
+			return
+		}
+		if !peer.allowed(peerAddr) {
+			continue
+		}
 		if n < 6 {
 			continue
 		}
 
-		if buf[2] != 0x00 {
+		if buf[0] != 0x00 || buf[1] != 0x00 || buf[2] != 0x00 {
 			continue
 		}
 
@@ -736,6 +752,9 @@ func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, cli
 				continue
 			}
 			domainLen := int(buf[4])
+			if domainLen == 0 {
+				continue
+			}
 			payloadOffset = 4 + 1 + domainLen + 2
 			if payloadOffset > n || 5+domainLen > n {
 				continue
@@ -753,9 +772,10 @@ func (c *Client) handleSocksUDPAssociate(ctx context.Context, conn net.Conn, cli
 			continue
 		}
 
-		if payloadOffset > n {
+		if payloadOffset > n || targetPort == 0 {
 			continue
 		}
+		peer.pin(peerAddr)
 
 		if targetPort != 53 {
 			if ip, ok := c.bypassTarget(buf[3], targetAddr); ok {
