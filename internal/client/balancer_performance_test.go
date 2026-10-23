@@ -59,6 +59,55 @@ func TestBalancerLatencyIgnoresSingleOutlier(t *testing.T) {
 	}
 }
 
+// A resolver that passed its recheck (recheckInactiveResolver) is seeded
+// afresh: the latency it had while failing must not outweigh its new samples.
+func TestBalancerReenabledResolverIsMeasuredAfresh(t *testing.T) {
+	for _, strategy := range []int{BalancingLowestLatency, BalancingHybridScore, BalancingLossThenLatency} {
+		t.Run(fmt.Sprint(strategy), func(t *testing.T) {
+			b := NewBalancer(strategy, nil)
+			b.SetConnections([]*Connection{{Key: "a", IsValid: true}, {Key: "b", IsValid: true}})
+			b.SetConnectionValidity("a", true)
+			b.SetConnectionValidity("b", true)
+			report := func(a, other time.Duration, n int) {
+				for i := 0; i < n; i++ {
+					b.ReportSend("a")
+					b.ReportSuccess("a", a)
+					b.ReportSend("b")
+					b.ReportSuccess("b", other)
+				}
+			}
+			report(2*time.Second, 300*time.Millisecond, 50)
+			b.SetConnectionValidity("a", false)
+			b.SetConnectionValidity("a", true)
+			b.SeedConservativeStats("a")
+			report(20*time.Millisecond, 300*time.Millisecond, 8)
+			got, ok := b.GetBestConnection()
+			if !ok || got.Key != "a" {
+				t.Fatalf("re-enabled 20 ms resolver lost to a 300 ms one: chose %q", got.Key)
+			}
+		})
+	}
+}
+
+func TestBalancerResetServerStatsForgetsLatency(t *testing.T) {
+	b := NewBalancer(BalancingLowestLatency, nil)
+	b.SetConnections([]*Connection{{Key: "a"}})
+	b.SetConnectionValidity("a", true)
+	for i := 0; i < 20; i++ {
+		b.ReportSuccess("a", 2*time.Second)
+	}
+	b.ResetServerStats("a")
+	for i := 0; i < 5; i++ {
+		b.ReportSuccess("a", 20*time.Millisecond)
+	}
+	b.mu.RLock()
+	score := b.latencyScoreLocked(0)
+	b.mu.RUnlock()
+	if score != 20_000 {
+		t.Fatalf("latency after a reset = %d us, want the 20000 us measured since", score)
+	}
+}
+
 func BenchmarkBalancerLossThenLatency(b *testing.B) {
 	for _, size := range []int{4, 32, 128} {
 		b.Run(fmt.Sprint(size), func(b *testing.B) {

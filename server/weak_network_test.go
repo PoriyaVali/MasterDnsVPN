@@ -51,6 +51,11 @@ func TestWeakNetworkRoundTripAndRecovery(t *testing.T) {
 	}
 	for _, profile := range profiles {
 		t.Run(profile.name, func(t *testing.T) {
+			// Each profile has its own node, relays and client, and spends
+			// its time waiting on delays and MTU probe timeouts, not CPU:
+			// side by side, the test takes as long as its slowest profile
+			// (~75 s) instead of all three in turn (~3.5 min) on every push.
+			t.Parallel()
 			started := time.Now()
 			var blackout atomic.Bool
 			var counts perfPathCounts

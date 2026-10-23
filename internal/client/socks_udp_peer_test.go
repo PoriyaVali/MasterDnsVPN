@@ -110,6 +110,18 @@ func udpTestSocket(t *testing.T, ip string) *net.UDPConn {
 	return conn
 }
 
+// needLoopbackAlias skips a test that needs a second loopback address. Linux
+// and Windows answer on all of 127.0.0.0/8; macOS only on 127.0.0.1 unless
+// lo0 has an alias, and there the test would fail on the host, not the code.
+func needLoopbackAlias(t *testing.T, ip string) {
+	t.Helper()
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(ip)})
+	if err != nil {
+		t.Skipf("loopback address %s is not usable on this host: %v", ip, err)
+	}
+	_ = conn.Close()
+}
+
 func udpTestEcho(t *testing.T) *net.UDPAddr {
 	t.Helper()
 	echo := udpTestSocket(t, "127.0.0.1")
@@ -159,6 +171,7 @@ func expectNoUDPReply(t *testing.T, client *net.UDPConn, relay *net.UDPAddr, pac
 }
 
 func TestUDPAssociationIsBoundToTCPInterface(t *testing.T) {
+	needLoopbackAlias(t, "127.0.0.2")
 	_, relay, _, _ := openTestUDPAssociation(t, newBypassTestClient("127.0.0.0/8"), 0)
 	client := udpTestSocket(t, "127.0.0.1")
 	packet := udpTestFrame(udpTestEcho(t), []byte("local-only"))
@@ -205,6 +218,7 @@ func TestUDPAssociationPinsFirstValidPortAndRejectsMalformedClaim(t *testing.T) 
 }
 
 func TestUDPAssociationRejectsAnotherTCPPeerAddress(t *testing.T) {
+	needLoopbackAlias(t, "127.0.0.2")
 	_, relay, _, _ := openTestUDPAssociation(t, newBypassTestClient("127.0.0.0/8"), 0)
 	attacker := udpTestSocket(t, "127.0.0.2")
 	client := udpTestSocket(t, "127.0.0.1")

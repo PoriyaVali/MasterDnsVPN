@@ -297,21 +297,26 @@ func (p *Pool) supervise(ctx context.Context) error {
 }
 
 // restartStalledMembers restarts the session of every server that has had no
-// answer for poolStallRestartAfter, at most once per poolStallRestartGap.
+// answer for poolStallRestartAfter (longer while its pings are slow, see
+// Client.stallWait), at most once per poolStallRestartGap.
 //
 // A restart opens a new session through the server's resolvers; if that
 // fails a few times the server measures its resolvers again (Client.Run).
 func (p *Pool) restartStalledMembers(last []time.Time) {
 	now := p.nowFn()
 	for i, m := range p.members {
-		if !m.client.RuntimeReady() || m.client.unansweredFor(now) < poolStallRestartAfter {
+		if !m.client.RuntimeReady() {
+			continue
+		}
+		wait := m.client.stallWait(now, poolStallRestartAfter)
+		if m.client.unansweredFor(now) < wait {
 			continue
 		}
 		if !last[i].IsZero() && now.Sub(last[i]) < poolStallRestartGap {
 			continue
 		}
 		last[i] = now
-		m.client.requestSessionRestart(fmt.Sprintf("no answer from this server for %s", poolStallRestartAfter))
+		m.client.requestSessionRestart(fmt.Sprintf("no answer from this server for %s", wait))
 	}
 }
 

@@ -700,7 +700,7 @@ func (c *Client) watchStall(now time.Time, w *stallWatch) {
 		w.fails, w.gap = 0, 0 // the last recovery worked
 	}
 	silent := c.unansweredFor(now)
-	if silent < singleStallRestartAfter {
+	if silent < c.stallWait(now, singleStallRestartAfter) {
 		return
 	}
 	if w.fails > 0 && now.Sub(w.last) < w.gap {
@@ -727,6 +727,24 @@ func (c *Client) watchStall(now time.Time, w *stallWatch) {
 		return
 	}
 	c.requestSessionRestart("stall recovery: new session")
+}
+
+// stallWait is how long a session may go unanswered before it counts as
+// stalled: at least base, and at least three pings at the pace the ping
+// manager keeps now.
+//
+// ⚠️ A quiet tunnel pings only every PING_COLD_INTERVAL_SECONDS (up to an
+// hour). Set past a third of base, one lost ping was the only send in the
+// window and read as a dead server, and the session was torn down while the
+// server was fine. While traffic flows the pings are fast and base decides.
+func (c *Client) stallWait(now time.Time, base time.Duration) time.Duration {
+	if c == nil || c.pingManager == nil {
+		return base
+	}
+	if paced := 3 * c.pingManager.nextInterval(now.UnixNano()); paced > base {
+		return paced
+	}
+	return base
 }
 
 func (c *Client) HandleStreamPacket(packet VpnProto.Packet) error {
