@@ -187,3 +187,83 @@ func TestAnInboundPacketIsTheEvidence(t *testing.T) {
 		t.Fatal("an outbound packet moved lastInboundAt")
 	}
 }
+
+// slowPingClient pings every minute once its tunnel has been quiet.
+func slowPingClient(t *testing.T, now time.Time, quietFor time.Duration) *Client {
+	t.Helper()
+	c := buildTestClientWithResolvers(config.ClientConfig{
+		PingAggressiveIntervalSeconds: 0.1,
+		PingLazyIntervalSeconds:       0.75,
+		PingCooldownIntervalSeconds:   2,
+		PingColdIntervalSeconds:       60,
+		PingWarmThresholdSeconds:      8,
+		PingCoolThresholdSeconds:      20,
+		PingColdThresholdSeconds:      30,
+		PingStreamIdleIntervalSeconds: 3,
+		PingStreamIdleWindowSeconds:   120,
+	}, "r")
+	c.runtimeReady.Store(true)
+	c.successMTUChecks = true
+	c.pingManager.lastNonPingSentAt.Store(now.Add(-quietFor).UnixNano())
+	c.pingManager.lastNonPongReceivedAt.Store(now.Add(-quietFor).UnixNano())
+	return c
+}
+
+func TestStallWatchWaitsForThreePingsOnAQuietTunnel(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	c := slowPingClient(t, now, 10*time.Minute)
+	var w stallWatch
+
+	// One ping a minute: 50 s without an answer is one lost ping.
+	sendUnanswered(c, now, 50*time.Second)
+	c.watchStall(now, &w)
+	if resetRequested(c) {
+		t.Fatal("one lost cold ping restarted a session whose server may be fine")
+	}
+
+	sendUnanswered(c, now, 3*time.Minute+time.Second)
+	c.watchStall(now, &w)
+	if !resetRequested(c) {
+		t.Fatal("three cold pings went unanswered and the session was not restarted")
+	}
+}
+
+func TestStallWatchKeepsItsPaceWhileTrafficFlows(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	c := slowPingClient(t, now, time.Second) // pinging every 100 ms
+	var w stallWatch
+
+	sendUnanswered(c, now, 46*time.Second)
+	c.watchStall(now, &w)
+	if !resetRequested(c) {
+		t.Fatal("a slow cold interval delayed recovery of a busy session")
+	}
+}
+
+func TestPoolWaitsForThreePingsOnAQuietServer(t *testing.T) {
+	p := testPool(t, config.LoadBalancerLeastLoad, false, 1)
+	now := p.nowFn()
+	c := p.members[0].client
+	c.cfg.PingColdIntervalSeconds = 60
+	c.cfg.PingColdThresholdSeconds = 30
+	c.cfg.PingCoolThresholdSeconds = 20
+	c.cfg.PingWarmThresholdSeconds = 8
+	c.pingManager.lastNonPingSentAt.Store(now.Add(-10 * time.Minute).UnixNano())
+	c.pingManager.lastNonPongReceivedAt.Store(now.Add(-10 * time.Minute).UnixNano())
+	c.awaitingReplySince.Store(now.Add(-50 * time.Second).UnixNano())
+
+	p.restartStalledMembers(make([]time.Time, 1))
+	select {
+	case <-c.sessionResetSignal:
+		t.Fatal("one lost cold ping restarted a pool member")
+	default:
+	}
+
+	c.awaitingReplySince.Store(now.Add(-3*time.Minute - time.Second).UnixNano())
+	p.restartStalledMembers(make([]time.Time, 1))
+	select {
+	case <-c.sessionResetSignal:
+	default:
+		t.Fatal("a pool member silent for three cold pings was not restarted")
+	}
+}
