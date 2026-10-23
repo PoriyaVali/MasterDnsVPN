@@ -790,6 +790,25 @@ func formatDeadlineDelta(now time.Time, deadline time.Time) string {
 	return delta.String()
 }
 
+// dataTimerRTO is how long a sent data packet waits for its ACK before it is
+// sent again.
+//
+// ⚠️ A packet takes the stream's RTO when it is queued, and a stream starts on
+// the configured one (ARQ_INITIAL_RTO_SECONDS, 1 s by default) until its first
+// round trip is measured. A burst queued in that first instant - an upload, a
+// page's first request - kept the 1 s timer after the path had been measured
+// at a fraction of it, and a packet lost at the end of the burst, with nothing
+// after it to reveal the gap, held the stream for a second: TestTrafficEfficiency
+// took ~1.3 s instead of ~0.3 s in about half its runs. A first transmission
+// now follows the current estimate when that is shorter, as RFC 6298 (5.3)
+// restarts the timer with the current RTO; a retransmission keeps its backoff.
+func dataTimerRTO(info *arqDataItem, current time.Duration) time.Duration {
+	if info.Retries == 0 && current > 0 && current < info.CurrentRTO {
+		return current
+	}
+	return info.CurrentRTO
+}
+
 func (a *ARQ) currentDataBaseRTO() time.Duration {
 	base := a.dataAdaptiveRTO.currentBase
 	if base <= 0 {
@@ -2491,6 +2510,7 @@ func (a *ARQ) checkRetransmits() {
 	var retryExceeded bool
 	draining := a.deferredClose || a.state == StateDraining
 	drainRTOCap := clampDuration(2*time.Second, a.rto, a.maxRTO)
+	dataBase := a.currentDataBaseRTO()
 
 	for sn, info := range a.sndBuf {
 		if info.TTL > 0 {
@@ -2503,7 +2523,7 @@ func (a *ARQ) checkRetransmits() {
 			break
 		}
 
-		effectiveRTO := info.CurrentRTO
+		effectiveRTO := dataTimerRTO(info, dataBase)
 		if draining && effectiveRTO > drainRTOCap {
 			effectiveRTO = drainRTOCap
 		}
@@ -2553,11 +2573,14 @@ func (a *ARQ) checkRetransmits() {
 		info, exists := a.sndBuf[j.sn]
 		if exists {
 			dataFloor := a.currentDataBaseRTO()
+			// Back off from the timer that just expired, not the one the
+			// packet was queued with.
+			expired := dataTimerRTO(info, dataFloor)
 			info.LastSentAt = now
 			info.Dispatched = false
 			info.Retries++
 			info.SampleEligible = false
-			grownRTO := time.Duration(float64(info.CurrentRTO) * dataRetransmitRTOGrowthFactor)
+			grownRTO := time.Duration(float64(expired) * dataRetransmitRTOGrowthFactor)
 			maxRTO := a.maxRTO
 			if draining && maxRTO > drainRTOCap {
 				maxRTO = drainRTOCap

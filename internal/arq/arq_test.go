@@ -1066,6 +1066,59 @@ func TestARQ_DataAckSkipsAdaptiveSampleAfterRetransmit(t *testing.T) {
 	}
 }
 
+// A burst queued before the stream's first round trip carries the initial
+// RTO. Once a fast ACK has measured the path, a lost packet from that burst
+// is sent again on the measured RTO, and backs off from it; a packet already
+// retransmitted keeps the backoff it has earned.
+func TestARQ_FirstTransmissionFollowsMeasuredRTO(t *testing.T) {
+	enq := NewMockPacketEnqueuer()
+	a := NewARQ(1, 1, enq, nil, 1200, &testLogger{t}, Config{
+		WindowSize: 32,
+		RTO:        1.0,
+		MaxRTO:     5.0,
+	})
+
+	now := time.Now()
+	queue := func(sn uint16, sentAgo time.Duration, retries int, rto time.Duration) {
+		a.sndBuf[sn] = &arqDataItem{
+			Data:           []byte("burst"),
+			CreatedAt:      now.Add(-sentAgo),
+			LastSentAt:     now.Add(-sentAgo),
+			Dispatched:     true,
+			Retries:        retries,
+			CurrentRTO:     rto,
+			SampleEligible: retries == 0,
+		}
+	}
+	queue(1, 20*time.Millisecond, 0, a.rto)                  // answered: the path is fast
+	queue(2, 300*time.Millisecond, 0, a.rto)                 // lost at the end of the burst
+	queue(3, 300*time.Millisecond, 1, 1350*time.Millisecond) // already resent once
+
+	if !a.ReceiveAck(Enums.PACKET_STREAM_DATA_ACK, 1) {
+		t.Fatal("expected tracked data ack")
+	}
+	measured := a.currentDataBaseRTO()
+	if measured >= 300*time.Millisecond {
+		t.Fatalf("a 20 ms sample left the data RTO at %s", measured)
+	}
+
+	a.checkRetransmits()
+
+	var resent []uint16
+	for len(enq.Packets) > 0 {
+		resent = append(resent, (<-enq.Packets).sequenceNum)
+	}
+	if len(resent) != 1 || resent[0] != 2 {
+		t.Fatalf("resent %v 300 ms in, want only seq 2 (measured RTO %s, initial %s)", resent, measured, a.rto)
+	}
+	a.mu.RLock()
+	backoff := a.sndBuf[2].CurrentRTO
+	a.mu.RUnlock()
+	if want := time.Duration(float64(measured) * dataRetransmitRTOGrowthFactor); backoff != want {
+		t.Fatalf("seq 2 backed off to %s, want %s grown from the RTO that expired", backoff, want)
+	}
+}
+
 func TestARQ_ControlAckUpdatesAdaptiveBaseRTO(t *testing.T) {
 	enq := NewMockPacketEnqueuer()
 	a := NewARQ(1, 1, enq, nil, 1200, &testLogger{t}, Config{
