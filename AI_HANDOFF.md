@@ -1,5 +1,34 @@
 # AI work log and handoff
 
+## Active handoff - 2026-10-31 - Codex - android-multiuser-20261031 PUBLIC and verified
+
+RELEASED stable/latest at 2026-10-31T18:25:42Z:
+https://github.com/PoriyaVali/MasterDnsVPN/releases/tag/android-multiuser-20261031
+Immutable annotated tag/source 1a73a5ad59f492addb7a85e61c3761a02921968b.
+Claude PR9 optimizations retained with attribution; Codex release corrections
+are in1a73a5a. This follow-up changes ONLY AI_HANDOFF.md and is documentation,
+not a new runtime revision for this release; do not move the tag.
+
+ACTUAL hosted validation: GoTest41228850772 and tagGoTest41229193871 SUCCESS
+(full Linux tests,vet,client/server package race and real2client4resolver smoke).
+Smoke JSON verified4independent paths all carrying bidirectional traffic,
+524288verifiedbytes each bulk direction,20RTTs,8newconnections,zeroerrors or
+corrupt payloads. This is correctness evidence, not a corrected CPU speedup.
+Android41229193868 and Desktop/server41229193873 SUCCESS. Guarded publication
+41229353241 SUCCESS after exact-sourceGoTest and both checksum manifests.
+
+All22publicassets/nonzero sizes and SHA256 manifests verified independently.
+Downloaded Windows client/server hashes match, -version prints release tag,
+and Go metadata shows exact source1a73a5a/vcs.modified=false. Full receipts
+stored in parent hiddify-app/.dart_tool/mdns-v2bx-release-20261031/. No node
+installation/restart; owner will use companion V2bX updater themselves.
+
+V2bX integration source5d72b9cee70c56823af1f2333f8976601f52db67 pins this exact
+MDNS module, targetv1.12.1; workflow41229434022 running mandatory validation
+and release builds at this checkpoint (not yet public). Shared root handoff
+will record final V2bX publication. Known preexisting empty-NOERROR path-health
+stall remains documented, not fixed. No universal6-16%/capacity claim.
+
 ## Active handoff - 2026-10-31 - Codex - release candidate validated locally; Linux CI/publication PENDING
 
 UNCOMMITTED release candidate includes Claude PR9 server CPU changes and Codex
