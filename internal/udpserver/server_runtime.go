@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -179,7 +180,7 @@ func (s *Server) deferredIdleCleanupTimeout(cleanupInterval time.Duration, sessi
 func (s *Server) readLoop(ctx context.Context, conn *net.UDPConn, reqCh chan<- request, readerID int) error {
 	for {
 		buffer := s.packetPool.Get().([]byte)
-		n, addr, err := conn.ReadFromUDP(buffer)
+		n, addr, err := conn.ReadFromUDPAddrPort(buffer)
 		if err != nil {
 			s.packetPool.Put(buffer)
 
@@ -195,11 +196,10 @@ func (s *Server) readLoop(ctx context.Context, conn *net.UDPConn, reqCh chan<- r
 			return err
 		}
 
+		// A full queue drops rather than waits. Shutdown closes the socket,
+		// which ends the read above.
 		select {
 		case reqCh <- request{buf: buffer, size: n, addr: addr, conn: conn}:
-		case <-ctx.Done():
-			s.packetPool.Put(buffer)
-			return nil
 		default:
 			s.packetPool.Put(buffer)
 			s.onDrop(addr, len(reqCh), cap(reqCh))
@@ -208,46 +208,46 @@ func (s *Server) readLoop(ctx context.Context, conn *net.UDPConn, reqCh chan<- r
 }
 
 func (s *Server) dnsWorker(ctx context.Context, conn *net.UDPConn, reqCh <-chan request, workerID int) {
-	for {
+	// Run closes the queue once the readers have stopped, which ends this
+	// loop. A plain receive, and a check of ctx that takes no lock, cost less
+	// per packet than a select on both: every worker locked ctx's channel
+	// each time it waited.
+	for req := range reqCh {
 		select {
 		case <-ctx.Done():
-			return
-		case req, ok := <-reqCh:
-			if !ok {
-				return
-			}
-
-			// The client's address is known only here, where the packet was read;
-			// everything below used to receive the bytes alone, which is why an
-			// mdns node could not report a single online device.
-			var clientIP string
-			if req.addr != nil {
-				clientIP = req.addr.IP.String()
-			}
-			response := s.safeHandlePacket(req.buf[:req.size], clientIP)
-			if req.reply != nil {
-				req.reply(response)
-			} else if len(response) != 0 {
-				writeConn := conn
-				if req.conn != nil {
-					writeConn = req.conn
-				}
-				if _, err := writeConn.WriteToUDP(response, req.addr); err != nil {
-					s.log.Debugf(
-						"\U0001F4A5 <yellow>UDP Write Error, Worker: <cyan>%d</cyan>, Remote: <cyan>%v</cyan>, Error: <cyan>%v</cyan></yellow>",
-						workerID,
-						req.addr,
-						err,
-					)
-				}
-			}
-
+			// Shutting down: what is still queued is dropped, not answered.
 			s.packetPool.Put(req.buf)
+			continue
+		default:
 		}
+
+		// The client's address is known only here, where the packet was read;
+		// everything below used to receive the bytes alone, which is why an
+		// mdns node could not report a single online device. Its text is
+		// made only for a packet that needs it.
+		response := s.safeHandlePacket(req.buf[:req.size], clientAddr{addr: req.addr.Addr()})
+		if req.reply != nil {
+			req.reply(response)
+		} else if len(response) != 0 {
+			writeConn := conn
+			if req.conn != nil {
+				writeConn = req.conn
+			}
+			if _, err := writeConn.WriteToUDPAddrPort(response, req.addr); err != nil {
+				s.log.Debugf(
+					"\U0001F4A5 <yellow>UDP Write Error, Worker: <cyan>%d</cyan>, Remote: <cyan>%v</cyan>, Error: <cyan>%v</cyan></yellow>",
+					workerID,
+					req.addr,
+					err,
+				)
+			}
+		}
+
+		s.packetPool.Put(req.buf)
 	}
 }
 
-func (s *Server) safeHandlePacket(packet []byte, clientIP string) (response []byte) {
+func (s *Server) safeHandlePacket(packet []byte, from clientAddr) (response []byte) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			if s.log != nil {
@@ -260,10 +260,10 @@ func (s *Server) safeHandlePacket(packet []byte, clientIP string) (response []by
 		}
 	}()
 
-	return s.handlePacket(packet, clientIP)
+	return s.handlePacketFrom(packet, from)
 }
 
-func (s *Server) onDrop(addr *net.UDPAddr, queueLen int, queueCap int) {
+func (s *Server) onDrop(addr netip.AddrPort, queueLen int, queueCap int) {
 	total := s.droppedPackets.Add(1)
 
 	now := logger.NowUnixNano()

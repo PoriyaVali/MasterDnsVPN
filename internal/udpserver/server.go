@@ -99,7 +99,11 @@ type Server struct {
 type request struct {
 	buf  []byte
 	size int
-	addr *net.UDPAddr
+	// addr is where the query came from, as the socket gave it (an IPv4
+	// client on a dual-stack socket is IPv4-mapped). Reading it as a
+	// netip.AddrPort allocates nothing; a *net.UDPAddr cost two allocations a
+	// packet.
+	addr netip.AddrPort
 	conn *net.UDPConn
 	// reply sends the response back on a TCP connection; nil for UDP.
 	reply func([]byte)

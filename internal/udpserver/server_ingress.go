@@ -20,7 +20,13 @@ import (
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
+// handlePacket answers packet from the client at clientIP (text, as the tests
+// and the TCP path once gave it).
 func (s *Server) handlePacket(packet []byte, clientIP string) []byte {
+	return s.handlePacketFrom(packet, clientAddr{text: clientIP})
+}
+
+func (s *Server) handlePacketFrom(packet []byte, from clientAddr) []byte {
 	parsed, err := DnsParser.ParseDNSRequestLite(packet)
 	if err != nil {
 		if errors.Is(err, DnsParser.ErrNotDNSRequest) || errors.Is(err, DnsParser.ErrPacketTooShort) {
@@ -37,7 +43,7 @@ func (s *Server) handlePacket(packet []byte, clientIP string) []byte {
 	decision := s.domainMatcher.Match(parsed)
 	switch decision.Action {
 	case domainMatcher.ActionProcess:
-		response := s.handleTunnelCandidate(packet, parsed, decision, clientIP)
+		response := s.handleTunnelCandidate(packet, parsed, decision, from)
 		if response != nil {
 			return response
 		}
@@ -72,7 +78,7 @@ func (s *Server) nameErrorBelowTunnelDomain(decision domainMatcher.Decision) boo
 		decision.Labels != ""
 }
 
-func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacket, decision domainMatcher.Decision, clientIP string) []byte {
+func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacket, decision domainMatcher.Decision, from clientAddr) []byte {
 	vpnPacket, sealed, orphan, err := s.parseTunnelLabels(decision.Labels)
 	if err != nil {
 		if orphan >= 0 {
@@ -113,7 +119,7 @@ func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacke
 		// The byte count is what lets the caller separate a real device from one
 		// address out of a carrier's rotating pool.
 		if validation.record != nil {
-			validation.record.user.noteAddr(validation.record.deviceKey(clientIP), now, int64(len(packet)+len(response)))
+			validation.record.user.noteAddr(validation.record.deviceKey(from), now, int64(len(packet)+len(response)))
 		}
 		return response
 	}
@@ -129,7 +135,7 @@ func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacke
 	case Enums.PACKET_MTU_DOWN_REQ:
 		return s.handleMTUDownRequest(packet, parsed, decision, vpnPacket)
 	case Enums.PACKET_SESSION_INIT:
-		return s.handleSessionInitRequest(packet, decision, vpnPacket, clientIP)
+		return s.handleSessionInitRequest(packet, decision, vpnPacket, from.String())
 	default:
 		return s.buildNoDataResponseLiteLogged(packet, parsed, fmt.Sprintf("pre-session-unhandled-%s", Enums.PacketTypeName(vpnPacket.PacketType)))
 	}
