@@ -422,11 +422,80 @@ func isQuestionNamePointer(name []byte) bool {
 // when it is the question's name and the question is copied into the response,
 // otherwise the name itself.
 func responseAnswerNameBytes(questionPacket []byte, questionBytes []byte, answerName string) ([]byte, error) {
+	if len(questionBytes) > 0 {
+		// Every tunnel answer names its question: compare the two in place
+		// rather than parse the question's name a second time per response.
+		if same, decided := firstQuestionNameIs(questionPacket, answerName); decided {
+			if same {
+				return questionNamePointer, nil
+			}
+			return encodeDNSNameStrict(answerName)
+		}
+	}
 	_, parsedName, ok := extractFirstQuestionNameWire(questionPacket)
 	if ok && len(questionBytes) > 0 && sameDNSName(parsedName, answerName) {
 		return questionNamePointer, nil
 	}
 	return encodeDNSNameStrict(answerName)
+}
+
+// firstQuestionNameIs reports what sameDNSName would say of the first
+// question's name and name, without building the question's text. It does not
+// decide (decided is false) for a missing or malformed question, for a byte
+// outside ASCII on either side, where strings.EqualFold folds more than ASCII
+// case, or for a dot inside a label, whose text sameDNSName may trim: the
+// caller then takes the slow path, which answers as it always did. Up to a
+// mismatch both sides are ASCII, so the mismatch decides, as it does for
+// EqualFold.
+func firstQuestionNameIs(packet []byte, name string) (same bool, decided bool) {
+	if len(packet) < dnsHeaderSize || binary.BigEndian.Uint16(packet[4:6]) == 0 {
+		return false, false
+	}
+	name = strings.TrimSuffix(name, ".")
+	for i := 0; i < len(name); i++ {
+		if name[i] >= 0x80 {
+			return false, false
+		}
+	}
+	if _, _, err := measureName(packet, dnsHeaderSize); err != nil {
+		return false, false
+	}
+
+	offset, pos := dnsHeaderSize, 0
+	for {
+		length := int(packet[offset])
+		if length == 0 {
+			return pos == len(name), true
+		}
+		if length >= 192 {
+			offset = int(binary.BigEndian.Uint16(packet[offset:offset+2]) & 0x3FFF)
+			continue
+		}
+		offset++
+		if pos != 0 {
+			if pos >= len(name) || name[pos] != '.' {
+				return false, true
+			}
+			pos++
+		}
+		for _, ch := range packet[offset : offset+length] {
+			if ch >= 0x80 || ch == '.' {
+				return false, false
+			}
+			if pos >= len(name) || lowerASCII(ch) != lowerASCII(name[pos]) {
+				return false, true
+			}
+			pos++
+		}
+		offset += length
+	}
+}
+
+func lowerASCII(ch byte) byte {
+	if ch-'A' < 26 {
+		return ch + ('a' - 'A')
+	}
+	return ch
 }
 
 func extractFirstQuestionNameWire(packet []byte) ([]byte, string, bool) {

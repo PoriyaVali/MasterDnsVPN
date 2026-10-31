@@ -246,23 +246,61 @@ func parseResourceRecords(data []byte, offset int, count int) ([]ResourceRecord,
 	return records, offset, nil
 }
 
+// parseName reads the name at offset as lower-case dotted text. It walks the
+// labels twice, once to validate and measure them and once to copy them, so
+// the text takes one allocation of its exact size. A tunnel query's name is
+// some 250 bytes, and a builder that started at 64 grew, and copied, two or
+// three times for every packet.
 func parseName(data []byte, offset int) (string, int, error) {
+	size, next, err := measureName(data, offset)
+	if err != nil {
+		return "", next, err
+	}
+	if size == 0 {
+		return ".", next, nil
+	}
+
+	var name strings.Builder
+	name.Grow(size)
+	for {
+		length := int(data[offset])
+		if length == 0 {
+			break
+		}
+		if length >= 192 {
+			offset = int(binary.BigEndian.Uint16(data[offset:offset+2]) & 0x3FFF)
+			continue
+		}
+		offset++
+		if name.Len() != 0 {
+			name.WriteByte('.')
+		}
+		writeLowerASCIILabel(&name, data[offset:offset+length])
+		offset += length
+	}
+	return name.String(), next, nil
+}
+
+// measureName validates the name at offset and returns the length of its
+// dotted text (0 for the root) and the offset just past the name where it
+// starts. A name that parseName may copy has passed every check here, so the
+// copy follows the same labels and pointers without checking them again.
+func measureName(data []byte, offset int) (int, int, error) {
 	dataLen := len(data)
 	if offset >= dataLen {
-		return "", offset, ErrInvalidName
+		return 0, offset, ErrInvalidName
 	}
 
 	var (
 		jumped   bool
 		jumps    int
 		origNext = offset
-		name     strings.Builder
-		hasLabel bool
+		size     int
 	)
 
 	for {
 		if offset >= dataLen {
-			return "", origNext, ErrInvalidName
+			return 0, origNext, ErrInvalidName
 		}
 
 		length := int(data[offset])
@@ -271,16 +309,16 @@ func parseName(data []byte, offset int) (string, int, error) {
 			if !jumped {
 				origNext = offset
 			}
-			break
+			return size, origNext, nil
 		}
 
 		if length >= 192 { // 0xC0
 			if offset+1 >= dataLen || jumps >= maxNameJumps {
-				return "", origNext, ErrInvalidName
+				return 0, origNext, ErrInvalidName
 			}
 			ptr := int(binary.BigEndian.Uint16(data[offset:offset+2]) & 0x3FFF)
 			if ptr >= dataLen {
-				return "", origNext, ErrInvalidName
+				return 0, origNext, ErrInvalidName
 			}
 			if !jumped {
 				origNext = offset + 2
@@ -292,39 +330,33 @@ func parseName(data []byte, offset int) (string, int, error) {
 		}
 
 		if length > 63 {
-			return "", origNext, ErrInvalidName
+			return 0, origNext, ErrInvalidName
 		}
 
 		offset++
 		end := offset + length
 		if end > dataLen {
-			return "", origNext, ErrInvalidName
+			return 0, origNext, ErrInvalidName
 		}
 
-		if name.Len() == 0 {
-			name.Grow(64)
-		} else {
-			name.WriteByte('.')
+		if size != 0 {
+			size++
 		}
-
-		writeLowerASCIILabel(&name, data[offset:end])
-		hasLabel = true
+		size += length
 		offset = end
 		if !jumped {
 			origNext = offset
 		}
 	}
-
-	if !hasLabel {
-		return ".", origNext, nil
-	}
-	return name.String(), origNext, nil
 }
 
+// writeLowerASCIILabel appends label lower-cased. Labels are at most 63
+// bytes: one with capitals, as every label is from a resolver that randomises
+// query case, is folded on the stack and appended in one write.
 func writeLowerASCIILabel(dst *strings.Builder, label []byte) {
 	upperIndex := -1
-	for i := range label {
-		if label[i] >= 'A' && label[i] <= 'Z' {
+	for i, ch := range label {
+		if ch-'A' < 26 {
 			upperIndex = i
 			break
 		}
@@ -335,13 +367,12 @@ func writeLowerASCIILabel(dst *strings.Builder, label []byte) {
 		return
 	}
 
-	dst.Write(label[:upperIndex])
-	for i := upperIndex; i < len(label); i++ {
-		ch := label[i]
-		if ch >= 'A' && ch <= 'Z' {
-			dst.WriteByte(ch + ('a' - 'A'))
-		} else {
-			dst.WriteByte(ch)
+	var lower [63]byte
+	n := copy(lower[:], label)
+	for i := upperIndex; i < n; i++ {
+		if ch := lower[i]; ch-'A' < 26 {
+			lower[i] = ch + ('a' - 'A')
 		}
 	}
+	dst.Write(lower[:n])
 }
