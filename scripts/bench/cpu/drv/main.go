@@ -337,7 +337,7 @@ func cpuSeconds(pid int) float64 {
 
 type proc struct {
 	cmd *exec.Cmd
-	out *strings.Builder
+	out *syncBuffer
 }
 
 var (
@@ -365,8 +365,8 @@ func startEnv(env []string, name string, args ...string) *proc {
 			cmd.Env = append(cmd.Env, e)
 		}
 	}
-	out := &strings.Builder{}
-	cmd.Stdout, cmd.Stderr = &lockedWriter{w: out}, &lockedWriter{w: out}
+	out := &syncBuffer{}
+	cmd.Stdout, cmd.Stderr = out, out
 	cmd.Stdin = nil
 	must(cmd.Start())
 	cleanupMu.Lock()
@@ -375,15 +375,24 @@ func startEnv(env []string, name string, args ...string) *proc {
 	return &proc{cmd: cmd, out: out}
 }
 
-type lockedWriter struct {
+// syncBuffer collects a child's stdout and stderr. exec writes them from its
+// own goroutine while the driver reads them, waiting for the node's READY, so
+// both go through one lock.
+type syncBuffer struct {
 	mu sync.Mutex
-	w  *strings.Builder
+	b  strings.Builder
 }
 
-func (l *lockedWriter) Write(p []byte) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.w.Write(p)
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
 }
 
 func waitTCP(port int, d time.Duration) error {
