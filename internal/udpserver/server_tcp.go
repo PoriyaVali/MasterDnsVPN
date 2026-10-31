@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -96,9 +97,9 @@ func (s *Server) serveTCPConn(ctx context.Context, conn net.Conn, reqCh chan<- r
 	defer stop()
 	defer conn.Close()
 
-	var addr *net.UDPAddr
+	var addr netip.AddrPort
 	if tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
-		addr = &net.UDPAddr{IP: tcpAddr.IP, Port: tcpAddr.Port, Zone: tcpAddr.Zone}
+		addr = tcpAddr.AddrPort()
 	}
 
 	writer := dnstcp.NewWriter(conn, tcpConnWriteBacklog, tcpWriteTimeout)
@@ -123,7 +124,7 @@ func (s *Server) serveTCPConn(ctx context.Context, conn net.Conn, reqCh chan<- r
 	writer.Close()
 }
 
-func (s *Server) readTCPQueries(ctx context.Context, conn net.Conn, addr *net.UDPAddr, reqCh chan<- request, reply func([]byte), pending *atomic.Int64) {
+func (s *Server) readTCPQueries(ctx context.Context, conn net.Conn, addr netip.AddrPort, reqCh chan<- request, reply func([]byte), pending *atomic.Int64) {
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
 		buffer := s.packetPool.Get().([]byte)

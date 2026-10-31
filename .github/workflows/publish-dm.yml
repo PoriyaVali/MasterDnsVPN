@@ -1,0 +1,97 @@
+name: Publish release (Doctor Mobile)
+
+# Publishes the draft release that android-dm.yml and desktop-wrt-dm.yml fill
+# for an android-* tag. Each of them attaches its SHA256SUMS list only after
+# all of its builds succeeded, so the draft is complete once both lists are
+# attached and every file they name is too, with that checksum. Go Test must
+# also have passed on the tag's commit. The title is the first line of
+# docs/releases/<tag>.md, and that file is the notes.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (android-...)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-${{ inputs.tag }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Check the tag name
+        run: |
+          if [[ ! "$TAG" =~ ^android-[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::'$TAG' is not an android- release tag"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+      - name: Check Go Test and the draft's files, then publish
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          notes="docs/releases/$TAG.md"
+          if [ ! -s "$notes" ]; then
+            echo "::error::the tag has no $notes"
+            exit 1
+          fi
+
+          sha=$(git rev-parse HEAD)
+          passed=$(gh run list --workflow go-test.yml --commit "$sha" --status success --json databaseId --jq length)
+          if [ "$passed" = 0 ]; then
+            echo "::error::Go Test has not passed on $sha"
+            exit 1
+          fi
+
+          set -- $(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[] | select(.tag_name == env.TAG) | .id')
+          if [ $# -ne 1 ]; then
+            echo "::error::expected one release for $TAG, found $#"
+            exit 1
+          fi
+          id=$1
+          if [ "$(gh api "repos/$GH_REPO/releases/$id" --jq .draft)" != true ]; then
+            echo "::notice::$TAG is already published"
+            exit 0
+          fi
+
+          gh api --paginate "repos/$GH_REPO/releases/$id/assets?per_page=100" \
+            --jq '.[] | select(.state == "uploaded") | [.id, .name, (.digest // "")] | @tsv' > assets.tsv
+          cut -f2,3 assets.tsv | sort > attached.tsv
+          for list in SHA256SUMS-android.txt SHA256SUMS-desktop.txt; do
+            asset=$(awk -F'\t' -v n="$list" '$2 == n { print $1 }' assets.tsv)
+            if [ -z "$asset" ]; then
+              echo "::error::$list is not attached: its workflow has not finished, or one of its builds failed"
+              exit 1
+            fi
+            gh api -H 'Accept: application/octet-stream' "repos/$GH_REPO/releases/assets/$asset" > "$list"
+            sed -E 's/^([0-9a-f]{64}) [ *]?(.+)$/\2\tsha256:\1/' "$list" | sort > listed.tsv
+            if [ ! -s listed.tsv ]; then
+              echo "::error::$list names no files"
+              exit 1
+            fi
+            # A file that is missing, or attached with another checksum.
+            wrong=$(comm -23 listed.tsv attached.tsv)
+            if [ -n "$wrong" ]; then
+              echo "::error::the draft does not hold these files of $list as listed:"
+              echo "$wrong"
+              exit 1
+            fi
+            echo "$list: $(wc -l < listed.tsv) files match"
+          done
+
+          title=$(head -n1 "$notes" | sed -E 's/^#+[[:space:]]*//')
+          url=$(gh api -X PATCH "repos/$GH_REPO/releases/$id" -F draft=false -f name="$title" -F body=@"$notes" --jq .html_url)
+          echo "::notice::published $url"
+          echo "Published [$title]($url)" >> "$GITHUB_STEP_SUMMARY"

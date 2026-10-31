@@ -60,6 +60,46 @@ go run scripts/bench/bench.go -mode send -addr 127.0.0.1:9090 -json
 
 ---
 
+### 3. `cpu/` (Server CPU per byte, Linux)
+
+Measures the server's CPU time for each MiB it carries, with the real client in
+the Android app's "balanced" profile (upload MTU 150, download MTU 512, packet
+duplication 3) talking through simulated resolvers.
+
+- `cpu/node` runs the server the way V2bX embeds it (`server.New`, ChaCha20) in
+  its own process. SIGUSR1 starts a CPU profile, and SIGUSR2 stops it and writes
+  the allocation profile beside it.
+- `cpu/drv` runs that node and the client as separate processes and reads the
+  node's CPU time from `/proc`. The resolvers (with delay, jitter and loss), the
+  SOCKS5 egress and the target application run inside the driver. Every byte is
+  checked.
+
+```bash
+mkdir -p .bench/cpu/bin
+go build -o .bench/cpu/bin/node ./scripts/bench/cpu/node
+go build -o .bench/cpu/bin/client ./cmd/client
+go run ./scripts/bench/cpu/drv -phases idle,download,upload,rtt,connect
+```
+
+It reports, for each phase:
+
+- wall time;
+- node and client CPU;
+- throughput;
+- node CPU per MiB and per packet;
+- latency percentiles;
+- errors and corrupted transfers.
+
+Useful flags:
+
+- `-clients N` runs N users at once.
+- `-srvenv GOMAXPROCS=1` limits only the node to one core, as on a small VPS.
+- `-profile PREFIX` writes one CPU profile per phase.
+- `-json FILE` appends the results as JSON.
+
+To compare two builds, build each into its own directory, pass it with `-bin`,
+and alternate runs. A single run varies by up to 5%.
+
 ## Directory Structure
 
 - `.bench/local_snapshot_go/bin`: Compiled benchmark binaries.

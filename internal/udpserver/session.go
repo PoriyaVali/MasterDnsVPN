@@ -1394,9 +1394,9 @@ func (r *sessionRecord) enqueueOrphanReset(packetType uint8, streamID uint16, se
 // deviceKey is what this session's traffic is counted against as a device:
 // the device the client declared (v2), or else the address the packet came
 // from - which, for a DNS tunnel, is a recursive resolver's.
-func (v *sessionRuntimeView) deviceKey(clientIP string) string {
+func (v *sessionRuntimeView) deviceKey(from clientAddr) string {
 	if v != nil && v.deviceAddr != "" {
 		return v.deviceAddr
 	}
-	return clientIP
+	return from.String()
 }

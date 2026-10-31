@@ -2,7 +2,7 @@ name: Desktop + OpenWRT client and server (Doctor Mobile)
 
 # Builds client and server executables for desktop and router targets.
 # Pure-Go (CGO off); uploads to the same draft as the Android workflow.
-# Publish that draft after both workflows and Go Test have succeeded.
+# publish-dm.yml publishes it once both workflows and Go Test have succeeded.
 on:
   push:
     tags: ['android-*']
