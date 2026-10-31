@@ -265,6 +265,19 @@ type ARQ struct {
 
 	firstDataNackSeen map[uint16]time.Time
 	lastDataNackSent  map[uint16]time.Time
+	// nackPrunedAt is the rcvNxt the NACK state was last pruned against. A
+	// prune at the same rcvNxt deletes nothing unless an entry behind it was
+	// added since (nackStaleAdded), so it is skipped: it walked both maps on
+	// every packet that arrived ahead of the next expected one.
+	nackPrunedAt   uint16
+	nackPruned     bool
+	nackStaleAdded bool
+	// closedFlag and resetFlag mirror closed and IsReset's condition for the
+	// readers that only ask: the server asks for every packet it routes to a
+	// stream, and the read lock it took waited on every writer of a.mu.
+	// Written with the fields they mirror, under a.mu.
+	closedFlag atomic.Bool
+	resetFlag  atomic.Bool
 
 	// Concurrency
 	ctx            context.Context
@@ -364,9 +377,7 @@ type CloseOptions struct {
 }
 
 func (a *ARQ) IsClosed() bool {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return a.closed
+	return a.closedFlag.Load()
 }
 
 func (a *ARQ) State() StreamState {
@@ -703,14 +714,13 @@ func (a *ARQ) signalFlushReady() {
 
 // IsReset checks whether stream is explicitly in reset path
 func (a *ARQ) IsReset() bool {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return a.state == StateReset || a.rstReceived || a.rstSent
+	return a.resetFlag.Load()
 }
 
-// setState atomically transitions the stream
+// setState atomically transitions the stream. Caller must hold a.mu.
 func (a *ARQ) setState(newState StreamState) {
 	a.state = newState
+	a.resetFlag.Store(newState == StateReset || a.rstReceived || a.rstSent)
 }
 
 func (a *ARQ) closeReadReceivedLocked() bool {
@@ -1171,6 +1181,7 @@ func (a *ARQ) MarkRstSent() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.rstSent = true
+	a.resetFlag.Store(true)
 	a.clearAllQueues(true)
 	a.setState(StateReset)
 }
@@ -1183,6 +1194,7 @@ func (a *ARQ) MarkRstReceived() {
 	}
 
 	a.rstReceived = true
+	a.resetFlag.Store(true)
 	a.stopLocalRead = true
 	a.interruptLocalReadLocked()
 	a.clearOutboundStateLocked(true)
@@ -2073,36 +2085,47 @@ func (a *ARQ) HandleDataNack(sn uint16) bool {
 }
 
 func (a *ARQ) maybeSendDataNacks(sn uint16) {
+	a.maybeSendDataNacksAt(sn, time.Now())
+}
+
+func (a *ARQ) maybeSendDataNacksAt(sn uint16, now time.Time) {
 	if a == nil || a.dataNackMaxGap <= 0 {
 		return
 	}
 
-	a.mu.RLock()
+	// The NACKs to send gather here and go out once the lock is released;
+	// there are rarely more than a few, and more grow the slice.
+	var stack [16]uint16
+	toSend := stack[:0]
+
+	// One lock for the scan and every decision, made in the same order as
+	// before. It was taken three times, then once per missing number, for
+	// every packet that arrived ahead of the next expected one: with several
+	// resolvers, most of them.
+	a.mu.Lock()
 	rcvNxt := a.rcvNxt
-	closed := a.closed
-	a.mu.RUnlock()
-	if closed {
+	if a.closed {
+		a.mu.Unlock()
 		return
 	}
 
 	diff := sn - rcvNxt
 	if diff == 0 || diff >= 32768 {
+		a.mu.Unlock()
 		return
 	}
 
-	a.mu.Lock()
 	a.pruneDataNackStateLocked(rcvNxt)
-	a.mu.Unlock()
 
 	windowSpan := uint16(a.dataNackMaxGap)
-	a.mu.RLock()
-	missingSeqs := make([]uint16, 0, a.dataNackMaxGap)
 	if diff <= windowSpan {
 		for missing := rcvNxt; missing != sn; missing++ {
 			if _, buffered := a.rcvBuf[missing]; buffered {
 				continue
 			}
-			missingSeqs = append(missingSeqs, missing)
+			if a.shouldSendDataNackLocked(missing, now) {
+				toSend = append(toSend, missing)
+			}
 		}
 	} else {
 		seen := make(map[uint16]struct{}, maxI(2, a.dataNackMaxGap/20+1))
@@ -2112,7 +2135,9 @@ func (a *ARQ) maybeSendDataNacks(sn uint16) {
 			if _, buffered := a.rcvBuf[missing]; buffered {
 				continue
 			}
-			missingSeqs = append(missingSeqs, missing)
+			if a.shouldSendDataNackLocked(missing, now) {
+				toSend = append(toSend, missing)
+			}
 			seen[missing] = struct{}{}
 			added++
 		}
@@ -2120,8 +2145,8 @@ func (a *ARQ) maybeSendDataNacks(sn uint16) {
 		frontier := uint16(uint32(rcvNxt) + uint32(windowSpan) - 1)
 		for candidate := frontier; ; candidate-- {
 			if _, buffered := a.rcvBuf[candidate]; !buffered {
-				if _, exists := seen[candidate]; !exists {
-					missingSeqs = append(missingSeqs, candidate)
+				if _, exists := seen[candidate]; !exists && a.shouldSendDataNackLocked(candidate, now) {
+					toSend = append(toSend, candidate)
 				}
 				break
 			}
@@ -2130,13 +2155,9 @@ func (a *ARQ) maybeSendDataNacks(sn uint16) {
 			}
 		}
 	}
-	a.mu.RUnlock()
+	a.mu.Unlock()
 
-	now := time.Now()
-	for _, missing := range missingSeqs {
-		if !a.shouldSendDataNack(missing, now) {
-			continue
-		}
+	for _, missing := range toSend {
 		if !a.enqueuer.PushTXPacket(
 			Enums.DefaultPacketPriority(Enums.PACKET_STREAM_DATA_NACK),
 			Enums.PACKET_STREAM_DATA_NACK,
@@ -2152,10 +2173,14 @@ func (a *ARQ) maybeSendDataNacks(sn uint16) {
 func (a *ARQ) shouldSendDataNack(sn uint16, now time.Time) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	return a.shouldSendDataNackLocked(sn, now)
+}
 
+func (a *ARQ) shouldSendDataNackLocked(sn uint16, now time.Time) bool {
 	firstSeenAt, exists := a.firstDataNackSeen[sn]
 	if !exists {
 		a.firstDataNackSeen[sn] = now
+		a.noteNackStateAddedLocked(sn)
 		return a.dataNackInitialDelay <= 0
 	}
 	if a.dataNackInitialDelay > 0 && now.Sub(firstSeenAt) < a.dataNackInitialDelay {
@@ -2172,7 +2197,16 @@ func (a *ARQ) shouldSendDataNack(sn uint16, now time.Time) bool {
 func (a *ARQ) noteDataNackSent(sn uint16, now time.Time) {
 	a.mu.Lock()
 	a.lastDataNackSent[sn] = now
+	a.noteNackStateAddedLocked(sn)
 	a.mu.Unlock()
+}
+
+// noteNackStateAddedLocked marks an entry for sn behind rcvNxt, which the
+// next prune must see even when rcvNxt has not moved.
+func (a *ARQ) noteNackStateAddedLocked(sn uint16) {
+	if seqBehind(a.rcvNxt, sn) {
+		a.nackStaleAdded = true
+	}
 }
 
 func seqBehind(base uint16, candidate uint16) bool {
@@ -2180,6 +2214,10 @@ func seqBehind(base uint16, candidate uint16) bool {
 }
 
 func (a *ARQ) pruneDataNackStateLocked(rcvNxt uint16) {
+	if a.nackPruned && rcvNxt == a.nackPrunedAt && !a.nackStaleAdded {
+		return
+	}
+	a.nackPrunedAt, a.nackPruned, a.nackStaleAdded = rcvNxt, true, false
 	for sn := range a.firstDataNackSeen {
 		if seqBehind(rcvNxt, sn) {
 			delete(a.firstDataNackSeen, sn)
@@ -2890,6 +2928,7 @@ func (a *ARQ) finalizeClose(reason string) {
 	deferredDeadlineIn := formatDeadlineDelta(time.Now(), a.deferredDeadline)
 	a.closeReason = reason
 	a.closed = true
+	a.closedFlag.Store(true)
 	a.deferredClose = false
 	a.deferredReason = ""
 	a.deferredDeadline = time.Time{}
