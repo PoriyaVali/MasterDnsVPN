@@ -3,8 +3,8 @@ name: Android client (Doctor Mobile)
 # Builds the mdns client (cmd/client) as an android executable (libmdns.so) for
 # the arches the Doctor Mobile app ships, and on an -android tag publishes a
 # Release with the per-abi binaries the app downloads. arm64 is pure-Go; armv7
-# and x86_64 need the NDK for cgo linking. Keep the shared release as a draft
-# until both platform workflows and Go Test have succeeded.
+# and x86_64 need the NDK for cgo linking. The shared release stays a draft
+# until publish-dm.yml finds both platform workflows and Go Test succeeded.
 on:
   push:
     tags: ['android-*']
