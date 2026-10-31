@@ -23,3 +23,26 @@ jobs:
 
       - name: Run Tests
         run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Race checks for client and server runtime
+        run: go test -race ./internal/client ./internal/arq ./internal/udpserver ./internal/dnsparser ./internal/domainmatcher
+
+      - name: Real-client multipath benchmark smoke
+        run: |
+          mkdir -p .bench/cpu/bin
+          go build -o .bench/cpu/bin/node ./scripts/bench/cpu/node
+          go build -o .bench/cpu/bin/client ./cmd/client
+          go run ./scripts/bench/cpu/drv -clients 2 -resolvers 4 -delay 2 \
+            -streams 2 -size 131072 -rounds 10 -conns 4 \
+            -phases download,upload,rtt,connect -json .bench/cpu/smoke.jsonl
+
+      - name: Preserve benchmark smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multipath-benchmark-smoke
+          path: .bench/cpu/smoke.jsonl
+          if-no-files-found: ignore

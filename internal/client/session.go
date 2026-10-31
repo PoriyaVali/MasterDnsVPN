@@ -140,7 +140,18 @@ func (c *Client) initializeSessionRequest() error {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	var racers sync.WaitGroup
+	stopRacers := func() {
+		cancel()
+		racers.Wait()
+	}
+	defer stopRacers()
+
+	// A winning acceptance may replace these settings. Every attempt belongs
+	// to the pre-acceptance generation, and must finish before policy is applied.
+	poolSize := c.cfg.EffectiveResolverUDPConnectionPoolSize()
+	timeout := c.mtuTestTimeout * 3
+	base64 := initPayload[0] == mtuProbeBase64Reply
 
 	type result struct {
 		err    error
@@ -150,70 +161,95 @@ func (c *Client) initializeSessionRequest() error {
 
 	resChan := make(chan result, len(targets))
 	launched := 0
-
-launch:
-	for i, conn := range targets {
-		if i > 0 {
-			select {
-			case <-time.After(sessionInitStagger):
-			case <-ctx.Done():
-				break launch
+	var lastErr error
+	nextTarget := 0
+	launchTimer := time.NewTimer(time.Hour)
+	launchTimer.Stop()
+	defer launchTimer.Stop()
+	var launch <-chan time.Time
+	launchNext := func() {
+		for nextTarget < len(targets) {
+			conn := targets[nextTarget]
+			nextTarget++
+			c.log.Infof("<green>Session init attempt with <cyan>%s</cyan> and resolver <cyan>%s</cyan>", conn.Domain, conn.Resolver)
+			query, err := c.buildSessionQuery(conn.Domain, Enums.PACKET_SESSION_INIT, initPayload)
+			if err != nil {
+				lastErr = err
+				continue
 			}
+			launched++
+			racers.Add(1)
+			go func(conn Connection, query []byte) {
+				defer racers.Done()
+				// Decode this attempt's reply mode, not mutable session state.
+				packet, sealed, err := c.exchangeDNSOverConnectionWith(ctx, conn, query, timeout, base64, initKeys, poolSize)
+				select {
+				case resChan <- result{err: err, packet: packet, sealed: sealed}:
+				case <-ctx.Done():
+				}
+			}(conn, query)
+			break
 		}
-
-		c.log.Infof("<green>Session init attempt with <cyan>%s</cyan> and resolver <cyan>%s</cyan>", conn.Domain, conn.Resolver)
-		query, err := c.buildSessionQuery(conn.Domain, Enums.PACKET_SESSION_INIT, initPayload)
-		if err != nil {
-			continue
+		launch = nil
+		if nextTarget < len(targets) {
+			launchTimer.Reset(sessionInitStagger)
+			launch = launchTimer.C
 		}
-
-		launched++
-		go func(conn Connection, query []byte) {
-			// The answer is decoded the way this init asked for it, not by
-			// c.responseMode: a session reset zeroes that, which made every
-			// re-init in base64 mode unreadable.
-			packet, sealed, err := c.exchangeDNSOverConnectionWith(conn, query, c.mtuTestTimeout*3, initPayload[0] == mtuProbeBase64Reply, initKeys)
-			select {
-			case resChan <- result{err: err, packet: packet, sealed: sealed}:
-			case <-ctx.Done():
-			}
-		}(conn, query)
 	}
-
+	launchNext()
 	if launched == 0 {
 		return ErrSessionInitFailed
 	}
 
-	var lastErr error
 	responsesReceived := 0
 	safety := time.NewTimer(30 * time.Second) // Hard safety timeout
 	defer safety.Stop()
 	for {
 		select {
+		case <-launch:
+			launchNext()
 		case res := <-resChan:
 			responsesReceived++
 			if res.err == nil {
+				// An invalid or unrelated response must leave other paths alive.
+				// Only a verified accept/busy reply ends this round. Join before
+				// policy changes pools/config so no late attempt can race them.
+				if !validSessionInitResponse(res.packet, res.sealed, verifyCode, initKeys) {
+					lastErr = ErrSessionInitFailed
+					break
+				}
+				stopRacers()
 				err := c.applySessionInitPacket(res.packet, res.sealed, initPayload, verifyCode, initKeys)
-				if err == nil {
-					return nil
-				}
-				if errors.Is(err, ErrSessionInitBusy) {
-					return err
-				}
-				lastErr = err
+				return err
 			} else {
 				lastErr = res.err
-			}
-
-			if responsesReceived >= launched {
-				if lastErr == nil {
-					return ErrSessionInitFailed
-				}
-				return lastErr
 			}
 		case <-safety.C:
 			return ErrSessionInitFailed
 		}
+		if nextTarget == len(targets) && responsesReceived >= launched {
+			if lastErr == nil {
+				return ErrSessionInitFailed
+			}
+			return lastErr
+		}
+	}
+}
+
+// Validate without changing session state while other init attempts still run.
+// applySessionInitPacket checks again after those attempts have been joined.
+func validSessionInitResponse(packet VpnProto.Packet, sealed bool, verifyCode [4]byte, initKeys *sessioncrypto.Keys) bool {
+	switch packet.PacketType {
+	case Enums.PACKET_SESSION_BUSY:
+		return len(packet.Payload) >= sessionBusyPayloadSize && bytes.Equal(packet.Payload[:sessionBusyPayloadSize], verifyCode[:])
+	case Enums.PACKET_SESSION_ACCEPT:
+		if sealed != (initKeys != nil) {
+			return false
+		}
+		accept, err := VpnProto.DecodeSessionAcceptPayload(packet.Payload)
+		return err == nil && bytes.Equal(accept.VerifyCode[:], verifyCode[:])
+	default:
+		return false
 	}
 }
 

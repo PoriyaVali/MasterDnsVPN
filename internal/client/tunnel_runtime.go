@@ -12,6 +12,7 @@
 package client
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -142,10 +143,18 @@ func (c *Client) sendOneWayDNSQuery(resolver Connection, packet []byte, deadline
 // getUDPConn retrieves a UDP connection from the pool for the specified resolver.
 // If no connection is available in the pool, it dials a new one.
 func (c *Client) getUDPConn(resolverLabel string) (*net.UDPConn, error) {
+	return c.getUDPConnWithPoolSize(resolverLabel, 0)
+}
+
+// Init racers use a captured capacity instead of rereading session policy.
+func (c *Client) getUDPConnWithPoolSize(resolverLabel string, poolSize int) (*net.UDPConn, error) {
 	c.resolverConnsMu.Lock()
 	pool, ok := c.resolverConns[resolverLabel]
 	if !ok {
-		pool = make(chan pooledUDPConn, c.cfg.EffectiveResolverUDPConnectionPoolSize())
+		if poolSize <= 0 {
+			poolSize = c.cfg.EffectiveResolverUDPConnectionPoolSize()
+		}
+		pool = make(chan pooledUDPConn, poolSize)
 		c.resolverConns[resolverLabel] = pool
 	}
 	c.resolverConnsMu.Unlock()
@@ -310,13 +319,31 @@ func (c *Client) exchangeUDPQuery(transport *udpQueryTransport, packet []byte, t
 // exchangeDNSOverConnectionWith sends one tunnel query on a pooled socket and
 // reads its answer, decoded as base64 says, and opened with keys when the
 // answer may be sealed (a v2 SESSION_INIT). sealed reports whether it was.
-func (c *Client) exchangeDNSOverConnectionWith(conn Connection, query []byte, timeout time.Duration, base64 bool, keys *sessioncrypto.Keys) (VpnProto.Packet, bool, error) {
-	udpConn, err := c.getUDPConn(conn.ResolverLabel)
+func (c *Client) exchangeDNSOverConnectionWith(ctx context.Context, conn Connection, query []byte, timeout time.Duration, base64 bool, keys *sessioncrypto.Keys, poolSize int) (VpnProto.Packet, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return VpnProto.Packet{}, false, err
+	}
+	udpConn, err := c.getUDPConnWithPoolSize(conn.ResolverLabel, poolSize)
 	if err != nil {
 		return VpnProto.Packet{}, false, err
 	}
+	// A losing racer must not wait out the full DNS timeout or reinsert its
+	// socket after the winning attempt has installed new policy/pools.
+	closed := make(chan struct{})
+	stopClose := context.AfterFunc(ctx, func() {
+		_ = udpConn.Close()
+		close(closed)
+	})
 
 	response, err := c.exchangeUDPQueryWithConn(udpConn, query, timeout)
+	if !stopClose() {
+		<-closed // The callback owns this socket until Close has finished.
+		return VpnProto.Packet{}, false, ctx.Err()
+	}
+	if cancelErr := ctx.Err(); cancelErr != nil {
+		_ = udpConn.Close()
+		return VpnProto.Packet{}, false, cancelErr
+	}
 	if err != nil {
 		_ = udpConn.Close()
 		return VpnProto.Packet{}, false, err

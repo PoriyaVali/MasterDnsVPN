@@ -11,6 +11,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
@@ -28,6 +29,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"masterdnsvpn-go/internal/config"
 )
 
 var (
@@ -70,7 +73,7 @@ MAX_PACKETS_PER_BATCH = 32
 RX_TX_WORKERS = 24
 MTU_TEST_TIMEOUT = 1.5
 MTU_TEST_RETRIES = 2
-LOG_LEVEL = "ERROR"
+LOG_LEVEL = "INFO"
 %s
 `
 
@@ -79,10 +82,11 @@ func uuidFor(i int) string { return fmt.Sprintf("5f0c6a8e-1111-4222-8333-%012d",
 // ---- simulated resolvers -------------------------------------------------
 
 type relay struct {
-	front  *net.UDPConn
-	server *net.UDPAddr
-	mu     sync.Mutex
-	up     map[string]*net.UDPConn
+	front                  *net.UDPConn
+	server                 *net.UDPAddr
+	mu                     sync.Mutex
+	up                     map[string]*net.UDPConn
+	packetsUp, packetsDown atomic.Int64
 }
 
 var packetsUp, packetsDown atomic.Int64
@@ -103,8 +107,8 @@ func later(f func()) {
 	f()
 }
 
-func startRelay(server *net.UDPAddr) *relay {
-	front, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+func startRelay(server *net.UDPAddr, index int) *relay {
+	front, err := net.ListenUDP("udp", &net.UDPAddr{IP: relayIP(index)})
 	must(err)
 	_ = front.SetReadBuffer(4 << 20)
 	_ = front.SetWriteBuffer(4 << 20)
@@ -120,6 +124,7 @@ func startRelay(server *net.UDPAddr) *relay {
 				continue
 			}
 			packetsUp.Add(1)
+			r.packetsUp.Add(1)
 			up := r.upstream(from)
 			p := append([]byte(nil), buf[:n]...)
 			later(func() { _, _ = up.Write(p) })
@@ -153,11 +158,28 @@ func (r *relay) upstream(client *net.UDPAddr) *net.UDPConn {
 				continue
 			}
 			packetsDown.Add(1)
+			r.packetsDown.Add(1)
 			p := append([]byte(nil), buf[:n]...)
 			later(func() { _, _ = r.front.WriteToUDP(p, dst) })
 		}
 	}()
 	return c
+}
+
+func relayTraffic(relays []*relay) []pathTraffic {
+	paths := make([]pathTraffic, len(relays))
+	for i, r := range relays {
+		paths[i] = pathTraffic{Address: r.front.LocalAddr().String(), Up: r.packetsUp.Load(), Down: r.packetsDown.Load()}
+	}
+	return paths
+}
+
+func trafficDelta(before, after []pathTraffic) []pathTraffic {
+	for i := range after {
+		after[i].Up -= before[i].Up
+		after[i].Down -= before[i].Down
+	}
+	return after
 }
 
 // ---- far side: app and egress ---------------------------------------------
@@ -326,13 +348,13 @@ func freePort(network string) int {
 func cpuSeconds(pid int) float64 {
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
-		return 0
+		fail(fmt.Sprintf("read CPU counters for process %d: %v", pid, err))
 	}
-	s := string(b)
-	f := strings.Fields(s[strings.LastIndexByte(s, ')')+2:])
-	u, _ := strconv.ParseFloat(f[11], 64)
-	k, _ := strconv.ParseFloat(f[12], 64)
-	return (u + k) / 100
+	seconds, err := parseCPUSeconds(string(b))
+	if err != nil {
+		fail(fmt.Sprintf("parse CPU counters for process %d: %v", pid, err))
+	}
+	return seconds
 }
 
 type proc struct {
@@ -445,24 +467,6 @@ func dial(socks int, first string, timeout time.Duration) (net.Conn, *bufio.Read
 
 // ---- phases ---------------------------------------------------------------
 
-type phaseResult struct {
-	Phase      string  `json:"phase"`
-	Wall       float64 `json:"wall_s"`
-	NodeCPU    float64 `json:"node_cpu_s"`
-	ClientCPU  float64 `json:"client_cpu_s"`
-	Bytes      int64   `json:"bytes,omitempty"`
-	MiBps      float64 `json:"mib_per_s,omitempty"`
-	CPUmsPerMB float64 `json:"node_cpu_ms_per_mib,omitempty"`
-	P50ms      float64 `json:"p50_ms,omitempty"`
-	P95ms      float64 `json:"p95_ms,omitempty"`
-	P99ms      float64 `json:"p99_ms,omitempty"`
-	PktUp      int64   `json:"packets_up"`
-	PktDown    int64   `json:"packets_down"`
-	USPerPkt   float64 `json:"node_us_per_packet"`
-	Errors     int64   `json:"errors"`
-	Corrupt    int64   `json:"corrupt"`
-}
-
 func percentile(d []time.Duration, p float64) float64 {
 	if len(d) == 0 {
 		return 0
@@ -474,13 +478,16 @@ func percentile(d []time.Duration, p float64) float64 {
 
 func main() {
 	flag.Parse()
+	if *clients < 1 || *resolvers < 1 || *resolvers > 253 || *streams < 1 || *size < 1 || *rounds < 1 || *conns < 1 || *idleSec < 0 || *delayMS < 0 || *jitterMS < 0 || *loss < 0 || *loss >= 1 {
+		fail("require positive clients/streams/size/rounds/conns, 1..253 resolvers, nonnegative delays and 0 <= loss < 1")
+	}
 	app := startApp()
 	egress := startEgress(app)
 	port := freePort("udp")
 	nodeAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port}
 	var relays []*relay
 	for i := 0; i < *resolvers; i++ {
-		relays = append(relays, startRelay(nodeAddr))
+		relays = append(relays, startRelay(nodeAddr, i))
 	}
 	args := []string{"-port", strconv.Itoa(port), "-egress", strconv.Itoa(egress), "-users", strconv.Itoa(*clients)}
 	if *profile != "" {
@@ -502,14 +509,25 @@ func main() {
 	for _, r := range relays {
 		lines = append(lines, r.front.LocalAddr().String())
 	}
+	must(validateResolverFixture(lines, *resolvers))
 	var socks []int
 	var procs []*proc
+	var dataDuplication, setupDuplication int
 	for i := 0; i < *clients; i++ {
 		dir := filepath.Join(tmp, strconv.Itoa(i))
 		must(os.MkdirAll(dir, 0o700))
 		p := freePort("tcp")
 		must(os.WriteFile(filepath.Join(dir, "client_config.toml"), []byte(fmt.Sprintf(clientConfig, uuidFor(i), p, *extra)), 0o600))
 		must(os.WriteFile(filepath.Join(dir, "client_resolvers.txt"), []byte(strings.Join(lines, "\n")+"\n"), 0o600))
+		cfg, err := config.LoadClientConfig(filepath.Join(dir, "client_config.toml"))
+		must(err)
+		if len(cfg.Resolvers) != *resolvers || len(cfg.Domains) != 1 || cfg.Domains[0] != "t.e2e.test" {
+			fail("client configuration changed the benchmark's resolver/domain fixture")
+		}
+		if !strings.EqualFold(cfg.LogLevel, "INFO") && !strings.EqualFold(cfg.LogLevel, "DEBUG") {
+			fail("client LOG_LEVEL must retain the active-resolver startup summary")
+		}
+		dataDuplication, setupDuplication = cfg.PacketDuplicationCount, cfg.SetupPacketDuplicationCount
 		c := start(filepath.Join(*binDir, "client"), "-config", filepath.Join(dir, "client_config.toml"))
 		procs = append(procs, c)
 		socks = append(socks, p)
@@ -520,18 +538,40 @@ func main() {
 		}
 	}
 	// Warm up: the first transfer opens each session and settles MTUs.
+	warmupStart := relayTraffic(relays)
+	var warmupErrors atomic.Int64
 	var wg sync.WaitGroup
 	for _, p := range socks {
 		wg.Add(1)
 		go func(p int) {
 			defer wg.Done()
-			if c, br, err := dial(p, "GET 65536 7\n", 120*time.Second); err == nil {
-				_, _ = io.Copy(io.Discard, br)
-				c.Close()
+			c, br, err := dial(p, "GET 65536 7\n", 120*time.Second)
+			if err != nil {
+				warmupErrors.Add(1)
+				return
+			}
+			defer c.Close()
+			if !verify(br, 65536, 7) {
+				warmupErrors.Add(1)
 			}
 		}(p)
 	}
 	wg.Wait()
+	if warmupErrors.Load() != 0 {
+		fail(fmt.Sprintf("%d clients failed byte-exact warmup", warmupErrors.Load()))
+	}
+	for i, c := range procs {
+		if err := validateActiveResolvers(c.out.String(), *resolvers); err != nil {
+			fail(fmt.Sprintf("client %d: %v", i, err))
+		}
+	}
+	warmupPaths := trafficDelta(warmupStart, relayTraffic(relays))
+	for _, path := range warmupPaths {
+		if path.Up == 0 || path.Down == 0 {
+			fail(fmt.Sprintf("resolver %s carried no bidirectional warmup traffic", path.Address))
+		}
+	}
+	fmt.Printf("verified %d parsed/MTU-valid paths per client; data duplication cap %d, setup cap %d\n", *resolvers, min(dataDuplication, *resolvers), min(setupDuplication, *resolvers))
 
 	clientCPU := func() float64 {
 		t := 0.0
@@ -541,6 +581,7 @@ func main() {
 		return t
 	}
 	var results []phaseResult
+	var validationErrors []string
 	for _, ph := range strings.Split(*phases, ",") {
 		ph = strings.TrimSpace(ph)
 		if ph == "" {
@@ -552,19 +593,25 @@ func main() {
 		}
 		n0, c0, t0 := cpuSeconds(node.cmd.Process.Pid), clientCPU(), time.Now()
 		u0, d0 := packetsUp.Load(), packetsDown.Load()
+		pathStart := relayTraffic(relays)
 		res := phaseResult{Phase: ph}
+		var expectedBytes int64
+		var expectedSamples int
 		switch ph {
 		case "idle":
 			time.Sleep(time.Duration(*idleSec * float64(time.Second)))
 		case "download", "upload":
 			res.Bytes, res.Errors, res.Corrupt = transfer(ph, socks)
+			expectedBytes = int64(*clients) * int64(*streams) * int64(*size)
 		case "rtt":
 			var lat []time.Duration
 			lat, res.Errors = roundTrips(socks)
+			res.Samples, expectedSamples = len(lat), *clients**rounds
 			res.P50ms, res.P95ms, res.P99ms = percentile(lat, .5), percentile(lat, .95), percentile(lat, .99)
 		case "connect":
 			var lat []time.Duration
 			lat, res.Errors = connects(socks)
+			res.Samples, expectedSamples = len(lat), *clients**conns
 			res.P50ms, res.P95ms, res.P99ms = percentile(lat, .5), percentile(lat, .95), percentile(lat, .99)
 		default:
 			fail("unknown phase " + ph)
@@ -573,6 +620,10 @@ func main() {
 		res.NodeCPU = cpuSeconds(node.cmd.Process.Pid) - n0
 		res.ClientCPU = clientCPU() - c0
 		res.PktUp, res.PktDown = packetsUp.Load()-u0, packetsDown.Load()-d0
+		res.Paths = trafficDelta(pathStart, relayTraffic(relays))
+		if err := validatePhase(res, expectedBytes, expectedSamples); err != nil {
+			validationErrors = append(validationErrors, err.Error())
+		}
 		if res.PktUp > 0 {
 			res.USPerPkt = res.NodeCPU * 1e6 / float64(res.PktUp)
 		}
@@ -595,12 +646,20 @@ func main() {
 		}
 		fmt.Printf("  pkts %d/%d  %.1f us/pkt  errors %d corrupt %d\n", res.PktUp, res.PktDown, res.USPerPkt, res.Errors, res.Corrupt)
 	}
+	if len(results) == 0 {
+		validationErrors = append(validationErrors, "no benchmark phases ran")
+	}
 	if *jsonOut != "" {
 		f, err := os.OpenFile(*jsonOut, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		must(err)
-		b, _ := json.Marshal(map[string]any{"label": *label, "clients": *clients, "resolvers": *resolvers, "delay_ms": *delayMS, "loss": *loss, "results": results})
-		_, _ = f.Write(append(b, '\n'))
-		_ = f.Close()
+		b, err := json.Marshal(map[string]any{"label": *label, "clients": *clients, "resolvers": *resolvers, "streams_per_client": *streams, "size_per_stream_bytes": *size, "rounds_per_client": *rounds, "connections_per_client": *conns, "idle_seconds": *idleSec, "server_env": *srvEnv, "extra_client_config": *extra, "active_resolvers_per_client": *resolvers, "data_duplication_configured": dataDuplication, "setup_duplication_configured": setupDuplication, "data_duplication_limit": min(dataDuplication, *resolvers), "setup_duplication_limit": min(setupDuplication, *resolvers), "warmup_paths": warmupPaths, "delay_ms": *delayMS, "jitter_ms": *jitterMS, "loss": *loss, "valid": len(validationErrors) == 0, "validation_errors": validationErrors, "results": results})
+		must(err)
+		_, err = f.Write(append(b, '\n'))
+		must(err)
+		must(f.Close())
+	}
+	if len(validationErrors) != 0 {
+		fail(strings.Join(validationErrors, "; "))
 	}
 }
 
@@ -717,16 +776,15 @@ func connects(socks []int) ([]time.Duration, int64) {
 					errs.Add(1)
 					continue
 				}
-				_, err = br.ReadByte()
+				first, err := br.ReadByte()
 				d := time.Since(t)
-				if err != nil {
+				if err != nil || !verify(io.MultiReader(bytes.NewReader([]byte{first}), br), 1024, 3) {
 					errs.Add(1)
 				} else {
 					mu.Lock()
 					lat = append(lat, d)
 					mu.Unlock()
 				}
-				_, _ = io.Copy(io.Discard, br)
 				c.Close()
 			}
 		}(p)

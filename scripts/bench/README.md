@@ -73,6 +73,14 @@ duplication 3) talking through simulated resolvers.
   node's CPU time from `/proc`. The resolvers (with delay, jitter and loss), the
   SOCKS5 egress and the target application run inside the driver. Every byte is
   checked.
+- Every relay uses a distinct loopback IP. The driver checks the production
+  resolver parser's retained count and every client's MTU-valid path summary,
+  then requires traffic in both directions on every relay during byte-verified
+  warmup. Client INFO logging is required for that startup check.
+- The original CPU results used different ports on a single IP, so production
+  IP deduplication reduced them to one path and one effective copy. Those
+  results do not establish four-path performance; rerun both binaries with the
+  corrected driver before drawing multipath conclusions.
 
 ```bash
 mkdir -p .bench/cpu/bin
@@ -88,7 +96,16 @@ It reports, for each phase:
 - throughput;
 - node CPU per MiB and per packet;
 - latency percentiles;
-- errors and corrupted transfers.
+- errors and corrupted transfers;
+- per-path query/answer counts, configured duplication and its active-path cap
+  (the cap is not a measured duplicate ratio).
+
+Any transfer error, corrupted/incomplete transfer, unexpected byte total, or
+missing RTT/connection sample makes the driver exit nonzero after stopping its
+child processes. With `-json`, completed phases and `valid=false` are saved
+before that exit. Warmup/configuration failures abort before measurement.
+Unreadable or malformed `/proc` CPU counters also abort; a missing CPU
+measurement is never reported as zero CPU. Legitimate zero tick counts remain valid.
 
 Useful flags:
 
@@ -98,7 +115,17 @@ Useful flags:
 - `-json FILE` appends the results as JSON.
 
 To compare two builds, build each into its own directory, pass it with `-bin`,
-and alternate runs. A single run varies by up to 5%.
+and alternate runs. Preserve each JSONL sample, command, source/binary hashes
+and profiles. Variation reached 5% in the old single-path fixture; establish
+the new fixture's variation instead of assuming the same bound.
+
+The fixture/phase validation helpers can also be tested on a non-Linux host:
+
+```bash
+go test -tags=benchcheck ./scripts/bench/cpu/drv
+```
+
+The actual CPU driver and its `/proc` measurements still require Linux.
 
 ## Directory Structure
 

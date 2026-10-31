@@ -1,50 +1,66 @@
-# android-multiuser-20261031 — lower server CPU per byte
+# android-multiuser-20261031 — server CPU optimizations and safer session startup
 
-Includes everything in `android-multiuser-20261023-2` and merges [PR #9](https://github.com/PoriyaVali/MasterDnsVPN/pull/9).
+Includes `android-multiuser-20261023-2`, the server CPU optimizations from
+[PR #9](https://github.com/PoriyaVali/MasterDnsVPN/pull/9), and the release-readiness
+corrections described below. Claude authored PR #9; Codex prepared this release
+and the subsequent session/benchmark corrections.
 
 ## Changes
 
-- **Server CPU per byte.** The node spends 6–16 % less CPU for each MiB it carries, depending on direction and cores; throughput and latency are unchanged. The method, the profiles and the reasoning behind each change are in [docs/server-cpu-fa.md](https://github.com/PoriyaVali/MasterDnsVPN/blob/android-multiuser-20261031/docs/server-cpu-fa.md).
-  - **DNS names:** a query name is measured, then built in one allocation of the exact size; capitals fold on the stack; an answer compares the question's name in place instead of parsing it again.
-  - **Client addresses:** read without allocations, with the IP text built only when it is needed. It is the same text as before, so the panel's device counts do not change.
-  - **ARQ NACKs:** for an out-of-order packet the decisions are taken under one lock and without allocations, and the prune is skipped when it cannot remove anything. On upload, the NACK code's share of node CPU went from 5.0 % to 3.7 %.
-  - **Stream state:** `IsClosed` and `IsReset`, asked for every packet, no longer take the stream's lock.
-  - **DNS workers** read their queue without selecting on the shutdown channel for each packet.
-- **Client.** It shares the DNS parser and ARQ packages, so it gets the same changes; its behaviour is unchanged.
-- **Benchmark.** `scripts/bench/cpu` runs the node the way V2bX embeds it and drives it with the real client in the Android app's balanced profile through simulated resolvers, reading the node's CPU per phase and checking every byte.
-- **Releases.** `publish-dm.yml` publishes an `android-*` draft once Go Test has passed on the tag's commit and every file in both SHA256SUMS lists is attached with that checksum. The notes are this file.
+- **Server:** fewer DNS-name and client-address allocations, fewer ARQ NACK
+  lock acquisitions, atomic reads of frequently queried stream state, and a
+  lower-cost DNS-worker receive loop. Subscriber metering, device accounting,
+  encryption, authentication and the packet format are preserved.
+- **Client session startup:** concurrent session attempts finish before an
+  accepted server policy mutates client configuration. A valid early response
+  can finish startup without waiting for every staggered attempt to launch;
+  losing exchanges are cancelled and joined.
+- **CPU benchmark:** simulated resolvers use independent IP addresses so the
+  client retains every path. The driver validates path use and rejects failed,
+  corrupt or incomplete transfers. The earlier stdout/stderr capture race is
+  also fixed.
+- **Validation:** Go Test includes vet, client/server package race checks and a
+  real-client, four-resolver smoke run on Linux. Release publication still
+  requires passing Go Test on the exact tagged commit and complete matching
+  Android/desktop checksum manifests.
 
-## Compatibility and validation
+## What the performance numbers mean
 
-The packet format, encryption, session keys, authentication and ARQ behaviour are unchanged; older clients and servers keep working with this release, and clients need no update for the server's gains. V2bX nodes get them when V2bX embeds this release; the `mdns-server-*` binaries here have them already.
+PR #9 reported approximately 6–16% lower server CPU per MiB with unchanged
+throughput and latency. Its original fixture declared four resolvers on one IP;
+the client removed duplicate IPs, leaving one effective path and one effective
+copy. Those historical numbers describe that single-path workload. They are
+not a new result for the corrected multipath benchmark, a server-capacity
+guarantee or a prediction for public resolvers. See
+[the corrected methodology](https://github.com/PoriyaVali/MasterDnsVPN/blob/android-multiuser-20261031/docs/server-cpu-fa.md).
 
-Node CPU per MiB on loopback, with four simulated resolvers 10 ms away, ChaCha20 and a 4-core Xeon at 2.1 GHz; mean of alternating runs, lower is better:
+## Deployment and compatibility
 
-| Node cores | Download | Upload |
-| --- | ---: | ---: |
-| 4 | 101.6 → 91.2 ms (−10.2 %) | 244.1 → 215.6 ms (−11.7 %) |
-| 2 | 89.7 → 82.5 ms (−8.0 %) | 231.7 → 195.8 ms (−15.5 %) |
-| 1 | 77.0 → 72.5 ms (−5.8 %) | 205.0 → 183.3 ms (−10.6 %) |
+Existing clients remain compatible with the server CPU changes. Embedded nodes
+must be rebuilt against this source; replacing a standalone `mdns-server-*`
+file does not change the MDNS code inside V2bX. The companion V2bX release pins
+this source so operators can receive it through the normal V2bX updater.
 
-Download stayed at about 1.88 MiB/s. Upload throughput varies 6–12 % from run to run in both versions and did not change beyond that. Round trips stayed at 222.5 ms on an open stream and 122 ms on a new connection (p50). These are simulated paths on loopback, not phones or public resolvers.
+Android, desktop/router clients and standalone servers are built from the same
+immutable tag. The new client startup changes require updating the client
+binary; existing clients can still use the updated server.
 
-On servers: the node asks for 8 MB socket buffers, but Linux caps them at `net.core.rmem_max` (often about 200 KB). Running `sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608`, and saving it under `/etc/sysctl.d/`, lets the setting apply.
+## Known limitation
 
-Before release: `go vet ./...` clean, `go test ./...` passing (23 packages), `go test -race` on `internal/arq`, `internal/udpserver`, `internal/dnsparser` and `internal/domainmatcher` passing, and GitHub Go Test plus all ten platform builds green on the branch.
+A resolver that starts returning empty DNS NOERROR answers can still be scored
+as healthy by the existing client balancer and stall useful traffic. That
+preexisting path-health issue is separate from the session-startup race fixed
+here; this release does not redesign resolver health scoring or adaptive pacing.
 
 ## فارسی
 
-مصرف CPU سرور برای هر مگابایت ترافیک، بسته به جهت و تعداد هسته‌ها، ۶ تا ۱۶ درصد
-کم شده است؛ سرعت و تأخیر تغییری نکرده‌اند. قالب بسته، رمزنگاری و احراز هویت همان
-است و کلاینت‌های قبلی بدون به‌روزرسانی کار می‌کنند. نودهای V2bX این بهبود را وقتی
-می‌گیرند که V2bX این نسخه را در خود بگیرد؛ باینری‌های `mdns-server-*` همین انتشار
-آن را دارند. روش اندازه‌گیری و جزئیات در
-[گزارش کاهش مصرف CPU سرور](https://github.com/PoriyaVali/MasterDnsVPN/blob/android-multiuser-20261031/docs/server-cpu-fa.md)
-آمده است.
+این نسخه بهینه‌سازی‌های CPU سرور در PR #9 را همراه با اصلاح race آغاز نشست
+کلاینت منتشر می‌کند. قالب بسته، رمزنگاری و احراز هویت تغییر نکرده‌اند.
 
-برای اینکه بافر ۸ مگابایتی سوکت سرور واقعاً اعمال شود، این را روی سرور اجرا کنید
-و در `/etc/sysctl.d/` هم ذخیره کنید:
+ابزار سنجش قبلی به‌دلیل حذف IP تکراری عملاً تک‌مسیره بود؛ بنابراین اعداد قبلی
+کاهش ۶ تا ۱۶ درصدی CPU فقط به همان بار محدودند. ابزار اصلاح شده است، اما برای
+شبکهٔ واقعی یا حالت چندمسیره درصد بهبود تازه‌ای تضمین نمی‌شود.
 
-```sh
-sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
-```
+برای اعمال بهینه‌سازی روی نودهایی که با V2bX کار می‌کنند، V2bX باید با این
+نسخه دوباره ساخته شود. انتشار همراه V2bX همین وابستگی را ارتقا می‌دهد و از
+طریق updater معمول آن قابل دریافت خواهد بود.
