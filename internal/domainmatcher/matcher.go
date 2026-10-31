@@ -257,12 +257,17 @@ func stripLabelDots(labels string) string {
 		return labels
 	}
 
+	// Whole labels between the dots, not byte by byte: a query carries some
+	// 250 characters of them on every packet.
 	var b strings.Builder
-	b.Grow(len(labels))
-	for i := 0; i < len(labels); i++ {
-		if labels[i] != '.' {
-			b.WriteByte(labels[i])
+	b.Grow(len(labels) - strings.Count(labels, "."))
+	for {
+		dot := strings.IndexByte(labels, '.')
+		if dot < 0 {
+			b.WriteString(labels)
+			return b.String()
 		}
+		b.WriteString(labels[:dot])
+		labels = labels[dot+1:]
 	}
-	return b.String()
 }
