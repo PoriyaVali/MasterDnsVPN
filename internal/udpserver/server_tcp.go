@@ -33,7 +33,7 @@ const (
 
 // startTCP listens on the UDP address over TCP. A port already taken for TCP
 // is not fatal: the server keeps serving UDP, as it did before TCP existed.
-func (s *Server) startTCP(ctx context.Context, reqCh chan<- request, wg *sync.WaitGroup) {
+func (s *Server) startTCP(ctx context.Context, reqCh chan<- *request, wg *sync.WaitGroup) {
 	if !s.cfg.TCPEnabled {
 		return
 	}
@@ -52,7 +52,7 @@ func (s *Server) startTCP(ctx context.Context, reqCh chan<- request, wg *sync.Wa
 	}()
 }
 
-func (s *Server) serveTCP(ctx context.Context, ln net.Listener, reqCh chan<- request, wg *sync.WaitGroup) {
+func (s *Server) serveTCP(ctx context.Context, ln net.Listener, reqCh chan<- *request, wg *sync.WaitGroup) {
 	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
 	defer stop()
 	defer ln.Close()
@@ -92,7 +92,7 @@ func (s *Server) serveTCP(ctx context.Context, ln net.Listener, reqCh chan<- req
 // more are dropped. Workers never block on a TCP peer.
 const tcpConnWriteBacklog = 128
 
-func (s *Server) serveTCPConn(ctx context.Context, conn net.Conn, reqCh chan<- request) {
+func (s *Server) serveTCPConn(ctx context.Context, conn net.Conn, reqCh chan<- *request) {
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 	defer conn.Close()
@@ -124,26 +124,27 @@ func (s *Server) serveTCPConn(ctx context.Context, conn net.Conn, reqCh chan<- r
 	writer.Close()
 }
 
-func (s *Server) readTCPQueries(ctx context.Context, conn net.Conn, addr netip.AddrPort, reqCh chan<- request, reply func([]byte), pending *atomic.Int64) {
+func (s *Server) readTCPQueries(ctx context.Context, conn net.Conn, addr netip.AddrPort, reqCh chan<- *request, reply func([]byte), pending *atomic.Int64) {
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(tcpIdleTimeout))
-		buffer := s.packetPool.Get().([]byte)
-		size, err := dnstcp.ReadMessage(conn, buffer)
+		req := s.getRequest()
+		size, err := dnstcp.ReadMessage(conn, req.buf)
 		if err != nil {
-			s.packetPool.Put(buffer)
+			s.putRequest(req)
 			return
 		}
 
+		req.size, req.addr, req.reply = size, addr, reply
 		pending.Add(1)
 		select {
-		case reqCh <- request{buf: buffer, size: size, addr: addr, reply: reply}:
+		case reqCh <- req:
 		case <-ctx.Done():
 			pending.Add(-1)
-			s.packetPool.Put(buffer)
+			s.putRequest(req)
 			return
 		default:
 			pending.Add(-1)
-			s.packetPool.Put(buffer)
+			s.putRequest(req)
 			s.onDrop(addr, len(reqCh), cap(reqCh))
 		}
 	}
