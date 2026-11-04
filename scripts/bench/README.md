@@ -154,8 +154,10 @@ change that) and an image with `taskset` (`IMG`, default
 release and flags, so the comparison is of the source and not the toolchain.
 
 Preserve each JSONL sample, command, source/binary hashes
-and profiles. Variation reached 5% in the old single-path fixture; establish
-the new fixture's variation instead of assuming the same bound.
+and profiles. Variation reached 5% in the old single-path fixture. In the
+four-path fixture, node CPU per MiB varied 5-12% between runs with one client
+and about 40% with six clients uploading; peak RSS varied under 5% in most
+phases and up to 16% in upload phases. Plan on six rounds or more.
 
 The fixture/phase validation helpers can also be tested on a non-Linux host:
 
