@@ -77,7 +77,7 @@ type Server struct {
 	streamOutboundTTL        time.Duration
 	streamOutboundMaxRetry   int
 	mtuProbePayloadPool      sync.Pool
-	packetPool               sync.Pool
+	requestPool              sync.Pool
 	deferredInflightMu       sync.Mutex
 	deferredInflight         map[uint64]struct{}
 	deferredInflightIndex    map[uint8]map[uint16]map[uint64]struct{}
@@ -96,8 +96,13 @@ type Server struct {
 	earlyData bool
 }
 
+// request carries one query from the socket that read it to a worker. It is
+// pooled whole, with the buffer it was read into, and queued by pointer: the
+// queue has up to 131072 slots (EffectiveMaxConcurrentRequests), and once
+// traffic has cycled through all of them each slot that held a request by
+// value was 80 bytes of resident memory, against one word now.
 type request struct {
-	buf  []byte
+	buf  []byte // the whole read buffer; the query is buf[:size]
 	size int
 	// addr is where the query came from, as the socket gave it (an IPv4
 	// client on a dual-stack socket is IPv4-mapped). Reading it as a
@@ -190,9 +195,9 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 		},
 		deferredInflight:      make(map[uint64]struct{}, 128),
 		deferredInflightIndex: make(map[uint8]map[uint16]map[uint64]struct{}, 64),
-		packetPool: sync.Pool{
+		requestPool: sync.Pool{
 			New: func() any {
-				return make([]byte, udpReadBufferSize(cfg.MaxPacketSize))
+				return &request{buf: make([]byte, udpReadBufferSize(cfg.MaxPacketSize))}
 			},
 		},
 	}
@@ -375,7 +380,7 @@ func (s *Server) Run(ctx context.Context) error {
 		len(conns),
 	)
 
-	reqCh := make(chan request, s.cfg.EffectiveMaxConcurrentRequests())
+	reqCh := make(chan *request, s.cfg.EffectiveMaxConcurrentRequests())
 	var workerWG sync.WaitGroup
 	cleanupDone := make(chan struct{})
 

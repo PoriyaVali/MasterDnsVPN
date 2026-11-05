@@ -367,6 +367,68 @@ var (
 	cleanups  []*exec.Cmd
 )
 
+// procStatus reads the numeric fields of /proc/<pid>/status; the Vm* sizes
+// are in kB.
+func procStatus(pid int) map[string]int64 {
+	out := map[string]int64{}
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		fail("read /proc status: " + err.Error())
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		if f := strings.Fields(v); len(f) > 0 {
+			if n, err := strconv.ParseInt(f[0], 10, 64); err == nil {
+				out[k] = n
+			}
+		}
+	}
+	return out
+}
+
+// threadCtx sums context switches over the process's threads; its own
+// status counts only the main thread.
+func threadCtx(pid int) (vol, invol int64) {
+	tasks, _ := filepath.Glob(fmt.Sprintf("/proc/%d/task/*/status", pid))
+	for _, t := range tasks {
+		b, err := os.ReadFile(t)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			k, v, _ := strings.Cut(line, ":")
+			n, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			switch k {
+			case "voluntary_ctxt_switches":
+				vol += n
+			case "nonvoluntary_ctxt_switches":
+				invol += n
+			}
+		}
+	}
+	return vol, invol
+}
+
+// resetPeakRSS sets VmHWM back to the current RSS, so each phase reports its
+// own peak. A peak that could not be reset would cover the process's whole
+// life and be reported as the phase's, so failing is the honest outcome.
+func resetPeakRSS(pid int) {
+	if err := os.WriteFile(fmt.Sprintf("/proc/%d/clear_refs", pid), []byte("5"), 0); err != nil {
+		fail("reset peak RSS through /proc/PID/clear_refs: " + err.Error())
+	}
+}
+
+func latencyMS(lat []time.Duration) []float64 {
+	out := make([]float64, len(lat))
+	for i, d := range lat {
+		out[i] = float64(d.Microseconds()) / 1000
+	}
+	return out
+}
+
 func stopAll() {
 	cleanupMu.Lock()
 	defer cleanupMu.Unlock()
@@ -594,6 +656,11 @@ func main() {
 		n0, c0, t0 := cpuSeconds(node.cmd.Process.Pid), clientCPU(), time.Now()
 		u0, d0 := packetsUp.Load(), packetsDown.Load()
 		pathStart := relayTraffic(relays)
+		resetPeakRSS(node.cmd.Process.Pid)
+		for _, c := range procs {
+			resetPeakRSS(c.cmd.Process.Pid)
+		}
+		v0, i0 := threadCtx(node.cmd.Process.Pid)
 		res := phaseResult{Phase: ph}
 		var expectedBytes int64
 		var expectedSamples int
@@ -607,11 +674,13 @@ func main() {
 			var lat []time.Duration
 			lat, res.Errors = roundTrips(socks)
 			res.Samples, expectedSamples = len(lat), *clients**rounds
+			res.LatencyMS = latencyMS(lat)
 			res.P50ms, res.P95ms, res.P99ms = percentile(lat, .5), percentile(lat, .95), percentile(lat, .99)
 		case "connect":
 			var lat []time.Duration
 			lat, res.Errors = connects(socks)
 			res.Samples, expectedSamples = len(lat), *clients**conns
+			res.LatencyMS = latencyMS(lat)
 			res.P50ms, res.P95ms, res.P99ms = percentile(lat, .5), percentile(lat, .95), percentile(lat, .99)
 		default:
 			fail("unknown phase " + ph)
@@ -621,6 +690,15 @@ func main() {
 		res.ClientCPU = clientCPU() - c0
 		res.PktUp, res.PktDown = packetsUp.Load()-u0, packetsDown.Load()-d0
 		res.Paths = trafficDelta(pathStart, relayTraffic(relays))
+		s1 := procStatus(node.cmd.Process.Pid)
+		res.NodeRSSPeakKB, res.NodeRSSEndKB, res.NodeThreads = s1["VmHWM"], s1["VmRSS"], s1["Threads"]
+		v1, i1 := threadCtx(node.cmd.Process.Pid)
+		res.NodeCtxVol, res.NodeCtxInvol = v1-v0, i1-i0
+		for _, c := range procs {
+			cs := procStatus(c.cmd.Process.Pid)
+			res.ClientRSSPeakKB = max(res.ClientRSSPeakKB, cs["VmHWM"])
+			res.ClientRSSEndKB += cs["VmRSS"]
+		}
 		if err := validatePhase(res, expectedBytes, expectedSamples); err != nil {
 			validationErrors = append(validationErrors, err.Error())
 		}
@@ -644,7 +722,8 @@ func main() {
 		if res.P50ms > 0 {
 			fmt.Printf("  p50 %6.1f p95 %6.1f p99 %6.1f ms", res.P50ms, res.P95ms, res.P99ms)
 		}
-		fmt.Printf("  pkts %d/%d  %.1f us/pkt  errors %d corrupt %d\n", res.PktUp, res.PktDown, res.USPerPkt, res.Errors, res.Corrupt)
+		fmt.Printf("  pkts %d/%d  %.1f us/pkt  errors %d corrupt %d", res.PktUp, res.PktDown, res.USPerPkt, res.Errors, res.Corrupt)
+		fmt.Printf("  node rss peak %.1f end %.1f MiB, ctx %d/%d  client rss peak %.1f MiB\n", float64(res.NodeRSSPeakKB)/1024, float64(res.NodeRSSEndKB)/1024, res.NodeCtxVol, res.NodeCtxInvol, float64(res.ClientRSSPeakKB)/1024)
 	}
 	if len(results) == 0 {
 		validationErrors = append(validationErrors, "no benchmark phases ran")

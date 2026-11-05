@@ -65,7 +65,7 @@ func (s *Server) openUDPListeners() ([]*net.UDPConn, error) {
 	return []*net.UDPConn{conn}, nil
 }
 
-func (s *Server) startDNSWorkers(ctx context.Context, conn *net.UDPConn, reqCh <-chan request, workerWG *sync.WaitGroup) {
+func (s *Server) startDNSWorkers(ctx context.Context, conn *net.UDPConn, reqCh <-chan *request, workerWG *sync.WaitGroup) {
 	for i := range s.cfg.EffectiveDNSRequestWorkers() {
 		workerWG.Add(1)
 		go func(workerID int) {
@@ -75,7 +75,7 @@ func (s *Server) startDNSWorkers(ctx context.Context, conn *net.UDPConn, reqCh <
 	}
 }
 
-func (s *Server) startReaders(ctx context.Context, conns []*net.UDPConn, reqCh chan<- request, readErrCh chan<- error, readerWG *sync.WaitGroup) {
+func (s *Server) startReaders(ctx context.Context, conns []*net.UDPConn, reqCh chan<- *request, readErrCh chan<- error, readerWG *sync.WaitGroup) {
 	if len(conns) == 0 {
 		return
 	}
@@ -177,12 +177,21 @@ func (s *Server) deferredIdleCleanupTimeout(cleanupInterval time.Duration, sessi
 	return idle
 }
 
-func (s *Server) readLoop(ctx context.Context, conn *net.UDPConn, reqCh chan<- request, readerID int) error {
+func (s *Server) getRequest() *request { return s.requestPool.Get().(*request) }
+
+// putRequest pools req with its buffer, and without what a pooled request
+// would otherwise keep alive: a socket, a TCP connection's reply.
+func (s *Server) putRequest(req *request) {
+	*req = request{buf: req.buf}
+	s.requestPool.Put(req)
+}
+
+func (s *Server) readLoop(ctx context.Context, conn *net.UDPConn, reqCh chan<- *request, readerID int) error {
 	for {
-		buffer := s.packetPool.Get().([]byte)
-		n, addr, err := conn.ReadFromUDPAddrPort(buffer)
+		req := s.getRequest()
+		n, addr, err := conn.ReadFromUDPAddrPort(req.buf)
 		if err != nil {
-			s.packetPool.Put(buffer)
+			s.putRequest(req)
 
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
@@ -198,16 +207,17 @@ func (s *Server) readLoop(ctx context.Context, conn *net.UDPConn, reqCh chan<- r
 
 		// A full queue drops rather than waits. Shutdown closes the socket,
 		// which ends the read above.
+		req.size, req.addr, req.conn = n, addr, conn
 		select {
-		case reqCh <- request{buf: buffer, size: n, addr: addr, conn: conn}:
+		case reqCh <- req:
 		default:
-			s.packetPool.Put(buffer)
+			s.putRequest(req)
 			s.onDrop(addr, len(reqCh), cap(reqCh))
 		}
 	}
 }
 
-func (s *Server) dnsWorker(ctx context.Context, conn *net.UDPConn, reqCh <-chan request, workerID int) {
+func (s *Server) dnsWorker(ctx context.Context, conn *net.UDPConn, reqCh <-chan *request, workerID int) {
 	// Run closes the queue once the readers have stopped, which ends this
 	// loop. A plain receive, and a check of ctx that takes no lock, cost less
 	// per packet than a select on both: every worker locked ctx's channel
@@ -216,7 +226,7 @@ func (s *Server) dnsWorker(ctx context.Context, conn *net.UDPConn, reqCh <-chan 
 		select {
 		case <-ctx.Done():
 			// Shutting down: what is still queued is dropped, not answered.
-			s.packetPool.Put(req.buf)
+			s.putRequest(req)
 			continue
 		default:
 		}
@@ -243,7 +253,7 @@ func (s *Server) dnsWorker(ctx context.Context, conn *net.UDPConn, reqCh <-chan 
 			}
 		}
 
-		s.packetPool.Put(req.buf)
+		s.putRequest(req)
 	}
 }
 

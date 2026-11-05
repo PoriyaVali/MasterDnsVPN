@@ -98,7 +98,15 @@ It reports, for each phase:
 - latency percentiles;
 - errors and corrupted transfers;
 - per-path query/answer counts, configured duplication and its active-path cap
-  (the cap is not a measured duplicate ratio).
+  (the cap is not a measured duplicate ratio);
+- the node's peak RSS during the phase (VmHWM, reset through
+  `/proc/PID/clear_refs` when the phase starts) and its RSS at the end, its
+  thread count, and its voluntary and involuntary context switches summed over
+  all of its threads; the clients' largest peak RSS and their summed RSS;
+- with `-json`, every RTT and connect sample (`latency_ms`). Connect times are
+  bimodal, answered either on a query already waiting at the node or on the
+  client's next ping about 100 ms later, so a median of them flips between the
+  two from run to run.
 
 Any transfer error, corrupted/incomplete transfer, unexpected byte total, or
 missing RTT/connection sample makes the driver exit nonzero after stopping its
@@ -115,9 +123,41 @@ Useful flags:
 - `-json FILE` appends the results as JSON.
 
 To compare two builds, build each into its own directory, pass it with `-bin`,
-and alternate runs. Preserve each JSONL sample, command, source/binary hashes
-and profiles. Variation reached 5% in the old single-path fixture; establish
-the new fixture's variation instead of assuming the same bound.
+and alternate runs. `cpu/compare/run.sh` does this in fresh, identical
+containers (one image, CPU set and memory limit; the node pinned to its own
+cores, the client, relays and driver to the others), over six scenarios: bulk
+transfer, bulk transfer on a one-core node, six clients at once, a weak path
+(40 ms, 20 ms jitter, 2% loss), latency, and ten idle clients. The order of the
+builds rotates every round. `cpu/compare/analyze.py` then compares two of them
+metric by metric, with each build's mean and spread and a permutation p-value:
+
+```bash
+root=$PWD
+git worktree add .bench/cmp/src-old android-multiuser-20261023-2
+cp -r scripts/bench/cpu .bench/cmp/src-old/scripts/bench/  # an older tree may lack this harness
+for v in old new; do
+  src=$root; [ $v = old ] && src=$root/.bench/cmp/src-old
+  out=$root/.bench/cmp/$v; mkdir -p $out
+  (cd $src && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o $out/node ./scripts/bench/cpu/node &&
+    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o $out/client ./cmd/client)
+  CGO_ENABLED=0 go build -o $out/drv ./scripts/bench/cpu/drv  # one driver for both
+done
+scripts/bench/cpu/compare/run.sh .bench/cmp/out 6 old=.bench/cmp/old new=.bench/cmp/new
+scripts/bench/cpu/compare/analyze.py .bench/cmp/out/results.jsonl old new
+```
+
+A release's own `mdns-linux-amd64` can stand in for `client`.
+
+It needs Docker, four CPUs by default (`CPUSET`, `NODE_CPUS`, `CLIENT_CPUS`
+change that) and an image with `taskset` (`IMG`, default
+`debian:bookworm-slim`). Build every `node` and `client` with the same Go
+release and flags, so the comparison is of the source and not the toolchain.
+
+Preserve each JSONL sample, command, source/binary hashes
+and profiles. Variation reached 5% in the old single-path fixture. In the
+four-path fixture, node CPU per MiB varied 5-12% between runs with one client
+and about 40% with six clients uploading; peak RSS varied under 5% in most
+phases and up to 16% in upload phases. Plan on six rounds or more.
 
 The fixture/phase validation helpers can also be tested on a non-Linux host:
 

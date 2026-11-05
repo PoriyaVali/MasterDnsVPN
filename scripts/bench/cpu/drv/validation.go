@@ -66,6 +66,18 @@ type phaseResult struct {
 	Corrupt    int64         `json:"corrupt"`
 	Samples    int           `json:"latency_samples,omitempty"`
 	Paths      []pathTraffic `json:"paths"`
+	// Resource use, from /proc/<pid>/status: peak RSS since the phase began
+	// (VmHWM, reset through clear_refs), RSS at its end, context switches.
+	NodeRSSPeakKB   int64 `json:"node_rss_peak_kb"`
+	NodeRSSEndKB    int64 `json:"node_rss_end_kb"`
+	NodeThreads     int64 `json:"node_threads_end"`
+	NodeCtxVol      int64 `json:"node_ctx_voluntary"`
+	NodeCtxInvol    int64 `json:"node_ctx_involuntary"`
+	ClientRSSPeakKB int64 `json:"client_rss_peak_kb_max"`
+	ClientRSSEndKB  int64 `json:"client_rss_end_kb_sum"`
+	// Every latency sample, ms: connect times are bimodal (answered on a
+	// pending query, or on the next ping), so a median alone flips.
+	LatencyMS []float64 `json:"latency_ms,omitempty"`
 }
 
 type pathTraffic struct {
