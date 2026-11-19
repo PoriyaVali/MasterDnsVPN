@@ -88,6 +88,26 @@ func udpExchange(port int, query []byte) ([]byte, error) {
 	return buf[:n], err
 }
 
+// dialTCP connects to the test server's TCP side. runTestServer returns as
+// soon as UDP answers, and Run opens the TCP listener just after starting the
+// UDP readers, so a dial at that moment was refused - seen in CI as "no TCP
+// listener: connection refused". Retried until the listener is up.
+func dialTCP(t *testing.T, port int) net.Conn {
+	t.Helper()
+	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		conn, err := net.Dial("tcp", address)
+		if err == nil {
+			return conn
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no TCP listener: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func writeTCPQuery(t *testing.T, conn net.Conn, query []byte) {
 	t.Helper()
 	framed := make([]byte, 2+len(query))
@@ -117,10 +137,7 @@ func readTCPResponse(t *testing.T, conn net.Conn) []byte {
 func TestServerAnswersPipelinedQueriesOverTCP(t *testing.T) {
 	port := runTestServer(t, nil)
 
-	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-	if err != nil {
-		t.Fatalf("no TCP listener: %v", err)
-	}
+	conn := dialTCP(t, port)
 	defer conn.Close()
 
 	want := map[uint16]uint16{
@@ -150,10 +167,7 @@ func TestServerAnswersPipelinedQueriesOverTCP(t *testing.T) {
 // A client that sends its query and half-closes still gets the answer.
 func TestServerAnswersTCPQueryAfterHalfClose(t *testing.T) {
 	port := runTestServer(t, nil)
-	conn, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	conn := dialTCP(t, port)
 	defer conn.Close()
 	writeTCPQuery(t, conn, buildTestDNSQuery(0x2001, "vpn.example.com", Enums.DNS_RECORD_TYPE_A))
 	_ = conn.(*net.TCPConn).CloseWrite()

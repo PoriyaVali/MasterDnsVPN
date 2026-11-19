@@ -1,5 +1,16 @@
 # AI work log and handoff
 
+## Active handoff - 2026-11-19 - Claude - flaky TCP server test fixed
+
+`TestServerAnswersPipelinedQueriesOverTCP` failed once in CI ("no TCP
+listener: connection refused", 0.00s) on PR #11, whose diff did not touch
+internal/udpserver. Cause: `runTestServer` returns as soon as UDP answers,
+and `Run` opens the TCP listener just after starting the UDP readers, so a
+dial in between is refused. Reproduced every time with a 50 ms delay before
+the TCP listen (local only, not committed); the tests now dial through
+`dialTCP`, which retries for up to 2 s, and pass with the delay in place.
+Test-only change (internal/udpserver/server_tcp_test.go).
+
 ## Active handoff - 2026-11-19 - Claude - client: empty NOERROR answers count as failures (the known path-health stall)
 
 Fixes the stall recorded below as known and unfixed. In a session the server
