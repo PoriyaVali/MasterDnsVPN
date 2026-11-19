@@ -396,34 +396,7 @@ func TestResolverHealthLoopCollectsResolverTimeoutsWhenAutoDisableEnabled(t *tes
 	}, "expected resolver timeout sample to be collected when auto-disable is enabled")
 }
 
-func TestHandleInboundPacketTreatsMissingTXTAsResolverSuccess(t *testing.T) {
-	c := buildTestClientWithResolvers(config.ClientConfig{}, "a", "b", "c", "d")
-	addr := &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 53}
-
-	query, err := DnsParser.BuildTXTQuestionPacket("x.v.example.com", 16, 4096)
-	if err != nil {
-		t.Fatalf("BuildTXTQuestionPacket returned error: %v", err)
-	}
-	response, err := DnsParser.BuildEmptyNoErrorResponse(query)
-	if err != nil {
-		t.Fatalf("BuildEmptyNoErrorResponse returned error: %v", err)
-	}
-
-	dnsID := binary.BigEndian.Uint16(response[:2])
-	c.balancer.pendingStoreForTest(balancerResolverSampleKey{
-		resolverAddr: addr.String(),
-		dnsID:        dnsID,
-	}, balancerResolverSample{
-		serverKey: "a",
-		sentAt:    time.Now().Add(-200 * time.Millisecond),
-	})
-
-	c.handleInboundPacket(response, addr, "")
-
-	if got := c.balancer.pendingCount(); got != 0 {
-		t.Fatalf("expected resolverPending to be cleared after empty DNS success, got=%d", got)
-	}
-}
+// An empty NOERROR answer: see TestEmptyAnswerIsOneFailure.
 
 func TestHandleInboundPacketTreatsServerFailureWithoutTXTAsResolverFailure(t *testing.T) {
 	c := buildTestClientWithResolvers(config.ClientConfig{

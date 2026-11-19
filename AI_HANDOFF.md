@@ -1,5 +1,33 @@
 # AI work log and handoff
 
+## Active handoff - 2026-11-19 - Claude - client: empty NOERROR answers count as failures (the known path-health stall)
+
+Fixes the stall recorded below as known and unfixed. In a session the server
+answers every query with a TXT record (queued data or a PONG); a NOERROR reply
+without one comes from a resolver that stripped, filtered or truncated it.
+`handleInboundPacket` (internal/client/async_runtime.go) credited it as a
+resolver success, with the shortest RTT and no loss, so least-loss balancing
+(strategy 3, the default, and 6) kept every query on the path that delivers
+nothing. It is now a resolver failure (`TrackResolverFailure`: loss, and
+auto-disable may take the path out until a recheck finds it carrying the
+tunnel). A parsed but untrusted packet is no longer credited either. Server
+empty answers in a session are protocol errors only (checked:
+server_ingress.go, validatePostSessionPacket, handlePostSessionPacket).
+
+Tests: internal/client/empty_answer_test.go (balancer pick with strategies 3,
+6 and 8; one failure per empty answer) and
+server/empty_answer_e2e_test.go (real node, two resolvers, the fast one turns
+empty mid-stream). Before: 0 of 21 bytes in 6 s, ~68 empty replies, strategies
+3 and 6; after: delivered in 0.4-1.0 s. Strategy 8 rotates over both of two
+resolvers and delivered before and after. The superseded
+`TestHandleInboundPacketTreatsMissingTXTAsResolverSuccess` is removed.
+`go test ./...` and the CI race set pass locally (go1.25.0, Linux).
+
+Not changed (measured by Codex 2026-10-31, tuning without real-network data):
+pull depth, MTU minimum across fewer than five paths, duplication counts.
+Known: the confirm-down probe behind auto-disable runs on the processor worker
+that saw the failure, as SERVFAIL already did (4-20 active resolvers only).
+
 ## Active handoff - 2026-10-31 - Codex - android-multiuser-20261031 PUBLIC and verified
 
 RELEASED stable/latest at 2026-10-31T18:25:42Z:
