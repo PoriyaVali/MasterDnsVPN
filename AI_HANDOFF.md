@@ -21,7 +21,7 @@ empty mid-stream). Before: 0 of 21 bytes in 6 s, ~68 empty replies, strategies
 3 and 6; after: delivered in 0.4-1.0 s. Strategy 8 rotates over both of two
 resolvers and delivered before and after. The superseded
 `TestHandleInboundPacketTreatsMissingTXTAsResolverSuccess` is removed.
-`go test ./...` and the CI race set pass locally (Go 1.25.6, Linux).
+`go test ./...` and the CI race set pass locally (go1.25.0, Linux).
 
 Not changed (measured by Codex 2026-10-31, tuning without real-network data):
 pull depth, MTU minimum across fewer than five paths, duplication counts.
