@@ -908,31 +908,28 @@ func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr, localAddr s
 	vpnPacket, trusted, err := c.decodeInbound(data)
 	if err != nil {
 		if errors.Is(err, DnsParser.ErrTXTAnswerMissing) {
-			receivedAt := time.Now()
-			if parsed, parseErr := DnsParser.ParsePacketLite(data); parseErr == nil && parsed.Header.RCode != 0 {
-				c.balancer.TrackResolverFailure(
-					data,
-					addr,
-					localAddr,
-					receivedAt,
-				)
-			} else {
-				c.balancer.TrackResolverSuccess(
-					data,
-					addr,
-					localAddr,
-					receivedAt,
-					0,
-				)
-			}
-			// summary := DnsParser.DescribeResponseWithoutTunnelPayload(data)
-			// c.log.Debugf("DNS response from %v had no tunnel TXT payload | %s", addr, summary)
+			// 🔴 A failure, whatever the RCODE. In a session the server answers
+			// every query with a TXT record - queued data or a PONG - so a
+			// reply without one is a resolver that stripped, filtered or
+			// truncated it: a path that carries nothing. It used to count as a
+			// success, with the shortest round trip of all (the resolver never
+			// asked anyone) and no loss, and the least-loss strategies then sent
+			// every query to it while a working resolver sat idle. As a failure
+			// it loses its rank at once, and auto-disable can take it out until
+			// a recheck finds it carrying the tunnel again.
+			c.balancer.TrackResolverFailure(data, addr, localAddr, time.Now())
 			return
 		}
 		// c.log.Debugf("\U0001F6A8 <red>Failed to parse VPN packet from DNS response: %v from %v</red>", err, addr)
 		return
 	}
 
+	if !trusted {
+		// Parsed, but nothing this session will act on: not credited, for the
+		// same reason as an empty answer - the path delivered nothing.
+		c.balancer.TrackResolverFailure(data, addr, localAddr, time.Now())
+		return
+	}
 	c.balancer.TrackResolverSuccess(
 		data,
 		addr,
@@ -940,11 +937,6 @@ func (c *Client) handleInboundPacket(data []byte, addr *net.UDPAddr, localAddr s
 		time.Now(),
 		0,
 	)
-	if !trusted {
-		// The resolver did answer (so it is credited above), but not with
-		// anything this session will act on.
-		return
-	}
 	// if c.log != nil && c.log.Enabled(logger.LevelDebug) && vpnPacket.PacketType != Enums.PACKET_PONG {
 	// 	if vpnPacket.PacketType == Enums.PACKET_STREAM_DATA_ACK {
 	// 		c.log.Debugf("Client received ACK | Stream: %d | Seq: %d", vpnPacket.StreamID, vpnPacket.SequenceNum)
