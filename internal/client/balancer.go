@@ -1606,6 +1606,15 @@ const (
 	resolverPendingShardCount = 16
 )
 
+// resolverExpireFloor is the least a query must go unanswered before it
+// counts toward disabling its resolver. The request timeout shrinks as the
+// resolver list grows - 2 s at 50 resolvers, 1 s past 75 - and the long
+// lists used where networks are filtered are exactly where resolvers come
+// under load and answer in seconds: a burst of a dozen queries to one of
+// them, unanswered for a second, used to disable it. Switching away does
+// not wait for this: each resolver's loss timeout does that.
+const resolverExpireFloor = 5 * time.Second
+
 func resolverSampleTTL(tunnelPacketTimeout time.Duration) time.Duration {
 	ttl := tunnelPacketTimeout * 3
 	if ttl < 10*time.Second {
@@ -1689,9 +1698,13 @@ func (b *Balancer) prunePendingLocked(pending map[balancerResolverSampleKey]bala
 	}
 
 	absoluteCutoff := now.Add(-ttl)
-	// The grace for a late answer stays on requestTimeout: a resolver that is
+	expiry := requestTimeout
+	if expiry < resolverExpireFloor {
+		expiry = resolverExpireFloor
+	}
+	// The grace for a late answer follows the expiry: a resolver that is
 	// only slow still gets its loss retracted.
-	lateGrace := resolverLateResponseGrace(requestTimeout, ttl)
+	lateGrace := resolverLateResponseGrace(expiry, ttl)
 	var timeoutObservations []balancerTimeoutObservation
 	var nextDue time.Time
 	removedCount := 0
@@ -1724,16 +1737,17 @@ func (b *Balancer) prunePendingLocked(pending map[balancerResolverSampleKey]bala
 				}
 			}
 		}
-		// ⚠️ Only a query unanswered for the whole request timeout counts
-		// toward disabling its resolver. The loss timeout above follows
-		// the resolver's usual round trip - 600 ms for a fast one - and
-		// a resolver under load, as on a national network that is
-		// throttling, answers seconds late without being down: with that
-		// timeout feeding the window, a burst of queries all past it
-		// before the first late answer came could disable a resolver
-		// that was answering every one of them.
+		// ⚠️ Only a query unanswered for the whole request timeout - and
+		// never less than resolverExpireFloor - counts toward disabling
+		// its resolver. The loss timeout above follows the resolver's
+		// usual round trip - 600 ms for a fast one - and a resolver under
+		// load, as on a national network that is throttling, answers
+		// seconds late without being down: with that timeout feeding the
+		// window, a burst of queries all past it before the first late
+		// answer came could disable a resolver that was answering every
+		// one of them.
 		if sample.timedOut && !sample.expired {
-			expireAt := sample.sentAt.Add(requestTimeout)
+			expireAt := sample.sentAt.Add(expiry)
 			if expireAt.After(now) {
 				due(expireAt)
 			} else {
