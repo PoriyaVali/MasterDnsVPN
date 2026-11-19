@@ -396,6 +396,8 @@ func (c *Client) runResolverHealthLoop(ctx context.Context) {
 		default:
 		}
 
+		// Also swept every resolverLossSweepInterval by runResolverLossSweep;
+		// a sample is counted once whichever sweep finds it due.
 		c.balancer.CollectExpiredResolverTimeouts(
 			c.now(),
 			c.tunnelPacketTimeout,
@@ -411,6 +413,30 @@ func (c *Client) runResolverHealthLoop(ctx context.Context) {
 			timer.Stop()
 			return
 		case <-timer.C:
+		}
+	}
+}
+
+// resolverLossSweepInterval is how often unanswered queries that are due are
+// counted as lost; a sweep with nothing due returns at once.
+const resolverLossSweepInterval = 250 * time.Millisecond
+
+// runResolverLossSweep counts unanswered queries as lost as soon as each is
+// due (lossTimeout). The health loop collected them once per check interval -
+// 5 s with a handful of resolvers - so a resolver that had gone silent kept
+// its clean record, and its traffic, for up to twice that.
+func (c *Client) runResolverLossSweep(ctx context.Context) {
+	if c == nil || c.balancer == nil {
+		return
+	}
+	ticker := time.NewTicker(resolverLossSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.balancer.CollectExpiredResolverTimeouts(c.now(), c.tunnelPacketTimeout)
 		}
 	}
 }
