@@ -1671,7 +1671,7 @@ func (b *Balancer) getUniqueConnectionsLocked(requiredCount int) []Connection {
 			if len(pool) == 0 {
 				return b.selectRoundRobinLocked(count)
 			}
-			return b.limitConnectionPoolLocked(pool, count, pick)
+			return b.fillUniqueConnectionsLocked(b.limitConnectionPoolLocked(pool, count, pick), count)
 		}
 		scorer, hasSignal := b.strategyScorerLocked()
 		if scorer == nil {
@@ -1684,6 +1684,60 @@ func (b *Balancer) getUniqueConnectionsLocked(requiredCount int) []Connection {
 
 		return b.selectLowestScoreLocked(count, scorer)
 	}
+}
+
+// fillUniqueConnectionsLocked tops selected up to count with the active
+// resolvers not already in it: least loss first, and of equal loss the
+// faster first.
+//
+// 🔑 The pooled strategies (6, 7, 8) took every copy of a duplicated packet
+// from their pool alone - the resolvers within a hair of the best round trip
+// (6), or the top loss tier of two (7, 8). Asked for three copies, strategy 6
+// sent one whenever one resolver was clearly the fastest, and 7 and 8 sent
+// two at most: PACKET_DUPLICATION_COUNT and SETUP_PACKET_DUPLICATION_COUNT,
+// the copies that carry a packet through loss, were quietly cut. The pool
+// still decides the first copies; the rest go where they would under
+// strategy 3, ordered by loss.
+func (b *Balancer) fillUniqueConnectionsLocked(selected []Connection, count int) []Connection {
+	if len(selected) >= count || len(selected) >= len(b.activeIDs) {
+		return selected
+	}
+	type candidate struct {
+		idx     int
+		loss    uint64
+		latency uint64
+	}
+	var scratch [64]candidate
+	candidates := scratch[:0]
+	for _, idx := range b.activeIDs {
+		if idx < 0 || idx >= len(b.connections) {
+			continue
+		}
+		taken := false
+		for i := range selected {
+			if selected[i].Key == b.connections[idx].Key {
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			candidates = append(candidates, candidate{idx: idx, loss: b.lossScoreLocked(idx), latency: b.latencyScoreLocked(idx)})
+		}
+	}
+	out := make([]Connection, len(selected), count)
+	copy(out, selected)
+	for len(out) < count && len(candidates) > 0 {
+		best := 0
+		for j := 1; j < len(candidates); j++ {
+			if candidates[j].loss < candidates[best].loss ||
+				(candidates[j].loss == candidates[best].loss && candidates[j].latency < candidates[best].latency) {
+				best = j
+			}
+		}
+		out = append(out, b.connections[candidates[best].idx])
+		candidates = append(candidates[:best], candidates[best+1:]...)
+	}
+	return out
 }
 
 func (b *Balancer) selectTargetByStrategyLocked() (Connection, bool) {
@@ -2078,8 +2132,9 @@ func latencyToleranceForTier(bestLatency uint64) uint64 {
 
 func (b *Balancer) leastLossTopTierCandidatesLocked(excludeKey string) []Connection {
 	type candidate struct {
-		idx  int
-		loss uint64
+		idx     int
+		loss    uint64
+		latency uint64
 	}
 
 	if !b.hasLossSignalLocked() || len(b.activeIDs) == 0 {
@@ -2092,8 +2147,9 @@ func (b *Balancer) leastLossTopTierCandidatesLocked(excludeKey string) []Connect
 			continue
 		}
 		candidates = append(candidates, candidate{
-			idx:  idx,
-			loss: b.lossScoreLocked(idx),
+			idx:     idx,
+			loss:    b.lossScoreLocked(idx),
+			latency: b.latencyScoreLocked(idx),
 		})
 	}
 	if len(candidates) == 0 {
@@ -2105,10 +2161,13 @@ func (b *Balancer) leastLossTopTierCandidatesLocked(excludeKey string) []Connect
 		topCount = len(candidates)
 	}
 
+	// Of equal loss - on a clean network, all of them at zero - the faster
+	// ranks first; the tier used to be whichever came first in the list.
 	for i := 0; i < topCount; i++ {
 		minIdx := i
 		for j := i + 1; j < len(candidates); j++ {
-			if candidates[j].loss < candidates[minIdx].loss {
+			if candidates[j].loss < candidates[minIdx].loss ||
+				(candidates[j].loss == candidates[minIdx].loss && candidates[j].latency < candidates[minIdx].latency) {
 				minIdx = j
 			}
 		}
@@ -2121,16 +2180,17 @@ func (b *Balancer) leastLossTopTierCandidatesLocked(excludeKey string) []Connect
 	// kept handing it its share, and each of those queries cost the stream
 	// the slow path's whole round trip: degraded for as long as the slowness
 	// lasted (12 s measured, never recovering). No replacement is pulled in
-	// from further down the loss ranking, which could be worse than slow.
+	// from further down the loss ranking, which could be worse than slow;
+	// copies beyond the tier are filled by fillUniqueConnectionsLocked.
 	fastest := uint64(0)
 	for i := 0; i < topCount; i++ {
-		if latency := b.latencyScoreLocked(candidates[i].idx); latency != latencyScoreUnknown && (fastest == 0 || latency < fastest) {
+		if latency := candidates[i].latency; latency != latencyScoreUnknown && (fastest == 0 || latency < fastest) {
 			fastest = latency
 		}
 	}
 	selected := make([]Connection, 0, topCount)
 	for i := 0; i < topCount; i++ {
-		if fastest > 0 && tierMemberTooSlow(b.latencyScoreLocked(candidates[i].idx), fastest) {
+		if fastest > 0 && tierMemberTooSlow(candidates[i].latency, fastest) {
 			continue
 		}
 		selected = append(selected, b.connections[candidates[i].idx])
