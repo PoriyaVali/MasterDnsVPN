@@ -452,6 +452,11 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 		return c.confirmResolverDown(conn, window)
 	})
 
+	c.balancer.SetDownstreamQuietCheck(func(now time.Time) bool {
+		pm := c.pingManager
+		return pm != nil && now.UnixNano()-pm.lastNonPongReceivedAt.Load() >= int64(downstreamQuietAfter)
+	})
+
 	c.pingManager = newPingManager(c)
 	return c
 }

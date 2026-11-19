@@ -41,22 +41,60 @@ func picks(t *testing.T, c *Client, n int) map[string]int {
 	return seen
 }
 
-func TestATopTierMemberMuchSlowerThanTheFastestLeavesTheRotation(t *testing.T) {
-	for _, strategy := range []int{BalancingLeastLossTopRandom, BalancingLeastLossTopRoundRobin} {
-		c := buildTestClientWithResolvers(config.ClientConfig{
-			ResolverBalancingStrategy:       strategy,
-			AutoDisableTimeoutServers:       true,
-			AutoDisableTimeoutWindowSeconds: 30,
-		}, "fast", "slow", "lossy1", "lossy2")
-		feed(t, c, "fast", "192.0.2.1", 60*time.Millisecond, 20, 0)
-		// Turned slow, lost nothing: every answer still comes, 1.8 s late.
-		feed(t, c, "slow", "192.0.2.2", 1800*time.Millisecond, 20, 0)
-		feed(t, c, "lossy1", "192.0.2.3", 60*time.Millisecond, 10, 10)
-		feed(t, c, "lossy2", "192.0.2.4", 60*time.Millisecond, 10, 10)
+func tierTestClient(t *testing.T, strategy int) *Client {
+	t.Helper()
+	return buildTestClientWithResolvers(config.ClientConfig{
+		ResolverBalancingStrategy:       strategy,
+		AutoDisableTimeoutServers:       true,
+		AutoDisableTimeoutWindowSeconds: 30,
+	}, "a", "b", "c", "d")
+}
 
-		if got := picks(t, c, 40); got["slow"] != 0 || got["fast"] == 0 {
-			t.Fatalf("strategy %d: %v - the tier rotated onto a resolver thirty times slower", strategy, got)
+// A resolver that turns slow loses nothing - every answer still comes, late -
+// so a tier ranked by loss alone kept handing it its share. Among resolvers
+// of similar loss the faster now rank first.
+func TestASlowTierMemberGivesWayToFasterOnesOfSimilarLoss(t *testing.T) {
+	for _, strategy := range []int{BalancingLeastLossTopRandom, BalancingLeastLossTopRoundRobin} {
+		c := tierTestClient(t, strategy)
+		feed(t, c, "a", "192.0.2.1", 60*time.Millisecond, 20, 0)
+		feed(t, c, "b", "192.0.2.2", 1800*time.Millisecond, 20, 0)
+		// 2% loss: within the band of the best.
+		feed(t, c, "c", "192.0.2.3", 70*time.Millisecond, 49, 1)
+		feed(t, c, "d", "192.0.2.4", 60*time.Millisecond, 10, 10)
+
+		if got := picks(t, c, 40); got["b"] != 0 || got["a"] == 0 || got["c"] == 0 {
+			t.Fatalf("strategy %d: %v - the tier should be the two faster resolvers of similar loss", strategy, got)
 		}
+	}
+}
+
+// Under a throttled national network every resolver slows down at once. The
+// tier keeps its size - the load stays spread - rather than piling it all on
+// whichever looks fastest.
+func TestTheTierKeepsItsSizeWhenEveryResolverIsSlow(t *testing.T) {
+	c := tierTestClient(t, BalancingLeastLossTopRoundRobin)
+	feed(t, c, "a", "192.0.2.1", 400*time.Millisecond, 20, 0)
+	feed(t, c, "b", "192.0.2.2", 1600*time.Millisecond, 20, 0)
+	feed(t, c, "c", "192.0.2.3", 2000*time.Millisecond, 20, 0)
+	feed(t, c, "d", "192.0.2.4", 2500*time.Millisecond, 20, 0)
+
+	if got := picks(t, c, 40); got["a"] == 0 || got["b"] == 0 {
+		t.Fatalf("%v - two resolvers should share the load", got)
+	}
+}
+
+// Measured: an idle resolver that had answered its few probes had a perfect
+// loss score and beat busy resolvers carrying traffic through 1% loss, and
+// the slowest of four took half the traffic.
+func TestAnIdleResolverWithCleanProbesDoesNotDisplaceFasterBusyOnes(t *testing.T) {
+	c := tierTestClient(t, BalancingLeastLossTopRoundRobin)
+	feed(t, c, "a", "192.0.2.1", 60*time.Millisecond, 49, 1)
+	feed(t, c, "b", "192.0.2.2", 70*time.Millisecond, 49, 1)
+	feed(t, c, "c", "192.0.2.3", 60*time.Millisecond, 10, 10)
+	feed(t, c, "d", "192.0.2.4", 140*time.Millisecond, 8, 0)
+
+	if got := picks(t, c, 40); got["d"] != 0 || got["a"] == 0 || got["b"] == 0 {
+		t.Fatalf("%v - the slow idle resolver took a faster busy one's place", got)
 	}
 }
 
@@ -93,6 +131,8 @@ func TestAPollProbesAResolverTheStrategyStoppedChoosing(t *testing.T) {
 		c.balancer.statsForKey(key).lastSentAt.Store(now)
 	}
 	c.balancer.statsForKey("d").lastSentAt.Store(now - int64(10*time.Second))
+	// Nothing has come down for a while: a probe's answer carries no data.
+	c.pingManager.lastNonPongReceivedAt.Store(now - int64(5*time.Second))
 
 	for i := 0; i < 20; i++ {
 		data, err := c.balancer.SelectTargets(Enums.PACKET_STREAM_DATA, 0, 1)
