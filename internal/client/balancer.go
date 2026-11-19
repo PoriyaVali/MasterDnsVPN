@@ -83,6 +83,7 @@ type Balancer struct {
 	healthRRCounter  atomic.Uint64
 	rngState         atomic.Uint64
 	nextPendingSweep atomic.Int64
+	lastExploreAt    atomic.Int64 // UnixNano of the last idle-resolver probe
 	pendingOverflow  atomic.Bool
 	pendingSize      atomic.Int32
 	pendingEvictRR   atomic.Uint32
@@ -115,6 +116,7 @@ type connectionStats struct {
 	rttCount        atomic.Uint64
 	rttEWMA         atomic.Int64 // microseconds; zero until the first RTT sample
 	rttVar          atomic.Int64 // microseconds; mean deviation around rttEWMA
+	lastSentAt      atomic.Int64 // UnixNano of the last query sent through it
 	windowStartedAt atomic.Int64 // UnixNano
 	windowSent      atomic.Uint32
 	windowLost      atomic.Uint32
@@ -615,6 +617,7 @@ func (b *Balancer) TrackResolverSend(
 	b.ReportSend(serverKey)
 	if stats != nil {
 		stats.recordWindowSend(sentAt, window)
+		stats.lastSentAt.Store(sentAt.UnixNano())
 	}
 }
 
@@ -972,6 +975,11 @@ func (b *Balancer) SelectTargets(packetType uint8, streamID uint16, requiredCoun
 
 	// 2. Base case: Single target or non-stream packet is ALWAYS dynamic via balancer
 	if requiredCount == 1 || streamID == 0 || !isBalancerStreamDataLike(packetType) {
+		if packetType == Enums.PACKET_PING && streamID == 0 && requiredCount == 1 {
+			if idle, ok := b.idleResolverToProbeLocked(time.Now()); ok {
+				return []Connection{idle}, nil
+			}
+		}
 		selected := b.getUniqueConnectionsLocked(requiredCount)
 		if len(selected) == 0 {
 			return nil, ErrNoValidConnections
@@ -1005,6 +1013,53 @@ func (b *Balancer) SelectTargets(packetType uint8, streamID uint16, requiredCoun
 	}
 
 	return selected, nil
+}
+
+const (
+	// idleResolverProbeEvery bounds how often a poll is spent on a resolver
+	// the strategy has stopped choosing.
+	idleResolverProbeEvery = 500 * time.Millisecond
+	// idleResolverAfter is how long an active resolver may go without a
+	// query before a poll is sent its way.
+	idleResolverAfter = 3 * time.Second
+)
+
+// idleResolverToProbeLocked picks the active resolver that has gone longest
+// without a query, when that is over idleResolverAfter and no probe went out
+// in the last idleResolverProbeEvery.
+//
+// 🔑 A score is only ever updated by queries, and the scored strategies stop
+// sending queries to a resolver that scored badly - lossy for a while, or
+// slow. It kept that score for the rest of the session even after it had
+// recovered: a resolver that was silent for ten seconds was never used
+// again. A poll is the one query whose loss costs nothing - the next data
+// packet polls too - so polls, and only polls, go now and then to the
+// resolver idle longest; its answers, or its silence, refresh its score.
+func (b *Balancer) idleResolverToProbeLocked(now time.Time) (Connection, bool) {
+	if b.strategy < BalancingLeastLoss || len(b.activeIDs) < 2 {
+		return Connection{}, false
+	}
+	nowNano := now.UnixNano()
+	last := b.lastExploreAt.Load()
+	if nowNano-last < int64(idleResolverProbeEvery) {
+		return Connection{}, false
+	}
+	idlest, idlestAt := -1, int64(0)
+	for _, idx := range b.activeIDs {
+		if idx < 0 || idx >= len(b.stats) || b.stats[idx] == nil {
+			continue
+		}
+		if at := b.stats[idx].lastSentAt.Load(); idlest < 0 || at < idlestAt {
+			idlest, idlestAt = idx, at
+		}
+	}
+	if idlest < 0 || nowNano-idlestAt < int64(idleResolverAfter) {
+		return Connection{}, false
+	}
+	if !b.lastExploreAt.CompareAndSwap(last, nowNano) {
+		return Connection{}, false
+	}
+	return b.connections[idlest], true
 }
 
 func (b *Balancer) AverageRTT(serverKey string) (time.Duration, bool) {
@@ -2060,11 +2115,44 @@ func (b *Balancer) leastLossTopTierCandidatesLocked(excludeKey string) []Connect
 		candidates[i], candidates[minIdx] = candidates[minIdx], candidates[i]
 	}
 
+	// ⏱ A member much slower than the tier's fastest leaves the rotation.
+	// The tier was loss alone, and a resolver that turns slow - congestion,
+	// throttling - loses nothing: every answer still comes, late. Round robin
+	// kept handing it its share, and each of those queries cost the stream
+	// the slow path's whole round trip: degraded for as long as the slowness
+	// lasted (12 s measured, never recovering). No replacement is pulled in
+	// from further down the loss ranking, which could be worse than slow.
+	fastest := uint64(0)
+	for i := 0; i < topCount; i++ {
+		if latency := b.latencyScoreLocked(candidates[i].idx); latency != latencyScoreUnknown && (fastest == 0 || latency < fastest) {
+			fastest = latency
+		}
+	}
 	selected := make([]Connection, 0, topCount)
 	for i := 0; i < topCount; i++ {
+		if fastest > 0 && tierMemberTooSlow(b.latencyScoreLocked(candidates[i].idx), fastest) {
+			continue
+		}
 		selected = append(selected, b.connections[candidates[i].idx])
 	}
+	if len(selected) == 0 {
+		selected = append(selected, b.connections[candidates[0].idx])
+	}
 	return selected
+}
+
+// latencyScoreUnknown is latencyScoreLocked's answer for a resolver with too
+// few round trips to judge.
+const latencyScoreUnknown = 999000
+
+// tierMemberTooSlow: well over three times the fastest member's round trip,
+// and at least 250 ms more - a different class of path, not ordinary spread
+// between resolvers. Unknown latency is never too slow.
+func tierMemberTooSlow(latency uint64, fastest uint64) bool {
+	if latency == latencyScoreUnknown || fastest == 0 {
+		return false
+	}
+	return latency > 3*fastest && latency > fastest+250_000
 }
 
 func (b *Balancer) lossScoreLocked(idx int) uint64 {
@@ -2084,11 +2172,11 @@ func (b *Balancer) lossScoreLocked(idx int) uint64 {
 
 func (b *Balancer) latencyScoreLocked(idx int) uint64 {
 	if idx < 0 || idx >= len(b.stats) || b.stats[idx] == nil {
-		return 999000
+		return latencyScoreUnknown
 	}
 	count := b.stats[idx].rttCount.Load()
 	if count < 5 {
-		return 999000
+		return latencyScoreUnknown
 	}
 	if recent := b.stats[idx].rttEWMA.Load(); recent > 0 {
 		return uint64(recent)
@@ -2176,7 +2264,7 @@ func (b *Balancer) hybridScoreLocked(idx int) uint64 {
 
 func (b *Balancer) hybridLatencyPenaltyLocked(idx int) uint64 {
 	latencyMicros := b.latencyScoreLocked(idx)
-	if latencyMicros == 999000 {
+	if latencyMicros == latencyScoreUnknown {
 		return 200
 	}
 
