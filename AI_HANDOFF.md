@@ -1,5 +1,31 @@
 # AI work log and handoff
 
+## Active handoff - 2026-11-19 - Claude - client: a silent resolver is counted lost by its own round trip
+
+Measured first, with a real node and four resolvers on their own loopback
+addresses (local harness, not committed), the busiest failing mid-stream.
+An unanswered query counted as lost only after the request timeout - the
+auto-disable check interval, 5 s with up to five resolvers - and the health
+loop collected those once per interval, so a dead resolver kept a clean
+record for 5-10 s and the tunnel's retransmissions backed off behind it.
+
+Change (internal/client/balancer.go, mtu.go, client.go): each resolver's
+loss timeout is its RTT average plus four deviations (TCP's timer; deviation
+now tracked beside rttEWMA), at least 600 ms, at most the old request
+timeout; `runResolverLossSweep` collects what is due every 250 ms (the
+health loop still collects too; a sample is counted once). The late-answer
+grace stays on the request timeout, so a resolver that is only slow gets its
+loss retracted.
+
+Measured (worst stall / time degraded, before -> after): one copy, strategy
+8, silent: 1.9 s / 10.8 s -> 1.8 s / 2.7 s; one copy, strategy 6, silent:
+11.9 s -> 1.1 s; strategy 6, three copies, slow resolver: 12 s degraded ->
+2 s; nothing got worse. Strategies 3 and 8 still never avoid a resolver that
+is only slow (latency is not in their score). Tests:
+internal/client/loss_timeout_test.go, server/resolver_switch_e2e_test.go
+(old code 11.5-13.5 s, new 0.9-3.5 s, threshold 6 s). go test ./... and the
+CI race set pass (go1.25.0, Linux).
+
 ## Active handoff - 2026-11-19 - Claude - flaky TCP server test fixed
 
 `TestServerAnswersPipelinedQueriesOverTCP` failed once in CI ("no TCP

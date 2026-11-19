@@ -565,6 +565,7 @@ func (c *Client) Run(parent context.Context) error {
 				warnProtectRefusals(c.log)
 				if c.resolverHealthStarted.CompareAndSwap(false, true) {
 					go c.runResolverHealthLoop(ctx)
+					go c.runResolverLossSweep(ctx)
 				}
 				c.ShortPrintBanner()
 			}

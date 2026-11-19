@@ -114,6 +114,7 @@ type connectionStats struct {
 	rttMicrosSum    atomic.Uint64
 	rttCount        atomic.Uint64
 	rttEWMA         atomic.Int64 // microseconds; zero until the first RTT sample
+	rttVar          atomic.Int64 // microseconds; mean deviation around rttEWMA
 	windowStartedAt atomic.Int64 // UnixNano
 	windowSent      atomic.Uint32
 	windowLost      atomic.Uint32
@@ -584,6 +585,8 @@ func (b *Balancer) TrackResolverSend(
 	}
 
 	requestTimeout := resolverRequestTimeout(tunnelPacketTimeout, checkInterval, window)
+	stats := b.statsForKey(serverKey)
+	dueAt := sentAt.Add(stats.lossTimeout(requestTimeout))
 
 	if b.pendingSize.Load() >= resolverPendingHardCap {
 		extra := int(b.pendingSize.Load()) - resolverPendingHardCap + 1
@@ -606,11 +609,11 @@ func (b *Balancer) TrackResolverSend(
 	if !exists {
 		b.pendingSize.Add(1)
 	}
-	b.schedulePendingSweepAt(sentAt.Add(requestTimeout))
+	b.schedulePendingSweepAt(dueAt)
 	shard.mu.Unlock()
 
 	b.ReportSend(serverKey)
-	if stats := b.statsForKey(serverKey); stats != nil {
+	if stats != nil {
 		stats.recordWindowSend(sentAt, window)
 	}
 }
@@ -719,6 +722,7 @@ func (b *Balancer) CollectExpiredResolverTimeouts(
 
 	requestTimeout := resolverRequestTimeout(tunnelPacketTimeout, checkInterval, window)
 	ttl := resolverSampleTTL(tunnelPacketTimeout)
+	timeouts := b.activeLossTimeouts(requestTimeout)
 	var (
 		timeoutObservations []balancerTimeoutObservation
 		nextDue             time.Time
@@ -726,7 +730,7 @@ func (b *Balancer) CollectExpiredResolverTimeouts(
 	for i := range b.pendingShards {
 		shard := &b.pendingShards[i]
 		shard.mu.Lock()
-		observations, shardNextDue, removedCount := b.prunePendingLocked(shard.pending, now, requestTimeout, ttl)
+		observations, shardNextDue, removedCount := b.prunePendingLocked(shard.pending, now, requestTimeout, ttl, timeouts)
 		if removedCount > 0 {
 			b.pendingSize.Add(int32(-removedCount))
 		}
@@ -749,6 +753,21 @@ func (b *Balancer) CollectExpiredResolverTimeouts(
 	}
 }
 
+// activeLossTimeouts is each active resolver's lossTimeout, read once per
+// sweep; a sample of any other resolver keeps requestTimeout.
+func (b *Balancer) activeLossTimeouts(requestTimeout time.Duration) map[string]time.Duration {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	timeouts := make(map[string]time.Duration, len(b.activeIDs))
+	for _, idx := range b.activeIDs {
+		if idx < 0 || idx >= len(b.connections) || idx >= len(b.stats) {
+			continue
+		}
+		timeouts[b.connections[idx].Key] = b.stats[idx].lossTimeout(requestTimeout)
+	}
+	return timeouts
+}
+
 func (b *Balancer) ResetServerStats(serverKey string) {
 	stats := b.statsForKey(serverKey)
 	if stats == nil {
@@ -761,6 +780,7 @@ func (b *Balancer) ResetServerStats(serverKey string) {
 	stats.rttMicrosSum.Store(0)
 	stats.rttCount.Store(0)
 	stats.rttEWMA.Store(0)
+	stats.rttVar.Store(0)
 }
 
 func (b *Balancer) SeedConservativeStats(serverKey string) {
@@ -778,6 +798,7 @@ func (b *Balancer) SeedConservativeStats(serverKey string) {
 	// average from before it was disabled - usually slow, it was failing -
 	// would otherwise outweigh its first new samples.
 	stats.rttEWMA.Store(0)
+	stats.rttVar.Store(0)
 }
 
 func (b *Balancer) GetBestConnection() (Connection, bool) {
@@ -1430,13 +1451,14 @@ func (b *Balancer) setNextPendingSweepLocked(next time.Time) {
 	b.nextPendingSweep.Store(next.UnixNano())
 }
 
-func (b *Balancer) prunePendingLocked(pending map[balancerResolverSampleKey]balancerResolverSample, now time.Time, requestTimeout time.Duration, ttl time.Duration) ([]balancerTimeoutObservation, time.Time, int) {
+func (b *Balancer) prunePendingLocked(pending map[balancerResolverSampleKey]balancerResolverSample, now time.Time, requestTimeout time.Duration, ttl time.Duration, timeouts map[string]time.Duration) ([]balancerTimeoutObservation, time.Time, int) {
 	if b == nil || len(pending) == 0 {
 		return nil, time.Time{}, 0
 	}
 
-	timeoutBefore := now.Add(-requestTimeout)
 	absoluteCutoff := now.Add(-ttl)
+	// The grace for a late answer stays on requestTimeout: a resolver that is
+	// only slow still gets its loss retracted.
 	lateGrace := resolverLateResponseGrace(requestTimeout, ttl)
 	var timeoutObservations []balancerTimeoutObservation
 	var nextDue time.Time
@@ -1444,8 +1466,12 @@ func (b *Balancer) prunePendingLocked(pending map[balancerResolverSampleKey]bala
 
 	for key, sample := range pending {
 		if !sample.timedOut {
-			timeoutAt := sample.sentAt.Add(requestTimeout)
-			if !sample.sentAt.After(timeoutBefore) {
+			timeout, ok := timeouts[sample.serverKey]
+			if !ok {
+				timeout = requestTimeout
+			}
+			timeoutAt := sample.sentAt.Add(timeout)
+			if !timeoutAt.After(now) {
 				sample.timedOut = true
 				sample.timedOutAt = timeoutAt
 				if sample.timedOutAt.After(now) {
@@ -2084,9 +2110,62 @@ func (s *connectionStats) observeRTT(rtt time.Duration) {
 			next = previous + (sample-previous)/8
 		}
 		if s.rttEWMA.CompareAndSwap(previous, next) {
+			s.observeRTTDeviation(previous, sample)
 			return
 		}
 	}
+}
+
+// observeRTTDeviation keeps the mean deviation of the round trip around its
+// average, as TCP does for its retransmission timer (RFC 6298, gain 1/4).
+func (s *connectionStats) observeRTTDeviation(previousEWMA int64, sample int64) {
+	for {
+		previous := s.rttVar.Load()
+		next := sample / 2
+		if previousEWMA != 0 {
+			delta := sample - previousEWMA
+			if delta < 0 {
+				delta = -delta
+			}
+			next = previous + (delta-previous)/4
+		}
+		if s.rttVar.CompareAndSwap(previous, next) {
+			return
+		}
+	}
+}
+
+// lossTimeoutFloor is the least time a query may go unanswered before it
+// counts as lost, whatever the resolver's own round trip: room for a
+// recursive resolver to retry its lookup once.
+const lossTimeoutFloor = 600 * time.Millisecond
+
+// lossTimeout is how long a query to this resolver may go unanswered before
+// it counts as lost: its own round trip plus four deviations - TCP's
+// retransmission timer - bounded by lossTimeoutFloor and requestTimeout.
+//
+// ⏱ It was requestTimeout for every resolver, which is the auto-disable check
+// interval: 5 s with a handful of resolvers. For that long a resolver that had
+// gone silent kept a clean record - no loss, its last good latency - and the
+// balancer kept choosing it, while the tunnel's own retransmissions backed off
+// behind it. A late answer still retracts the loss (RetractTimeout), so a
+// resolver that was only slow loses nothing in the end.
+func (s *connectionStats) lossTimeout(requestTimeout time.Duration) time.Duration {
+	if s == nil || requestTimeout <= lossTimeoutFloor {
+		return requestTimeout
+	}
+	average := s.rttEWMA.Load()
+	if average <= 0 {
+		return requestTimeout
+	}
+	timeout := time.Duration(average+4*s.rttVar.Load()) * time.Microsecond
+	if timeout < lossTimeoutFloor {
+		timeout = lossTimeoutFloor
+	}
+	if timeout > requestTimeout {
+		timeout = requestTimeout
+	}
+	return timeout
 }
 
 func (b *Balancer) hybridScoreLocked(idx int) uint64 {
