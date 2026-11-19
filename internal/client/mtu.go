@@ -84,6 +84,100 @@ type mtuDecision struct {
 	resolveTime   time.Duration
 }
 
+const (
+	// patientScanBelow: when fewer resolvers than this pass the MTU scan, the
+	// ones that failed are tried again with patient probes.
+	patientScanBelow = 3
+	// patientScanEnough: the patient pass starts no new resolver once this
+	// many are active; the health loop rechecks the rest.
+	patientScanEnough      = 8
+	patientProbeTimeoutMin = 4 * time.Second
+	patientProbeTimeoutMax = 8 * time.Second
+)
+
+// patientProbeTimeout is three times the configured probe timeout, within
+// [patientProbeTimeoutMin, patientProbeTimeoutMax].
+func patientProbeTimeout(base time.Duration) time.Duration {
+	timeout := 3 * base
+	if timeout < patientProbeTimeoutMin {
+		timeout = patientProbeTimeoutMin
+	}
+	if timeout > patientProbeTimeoutMax {
+		timeout = patientProbeTimeoutMax
+	}
+	return timeout
+}
+
+// mtuProbeTimeout is the per-probe timeout of the MTU scan: the configured
+// one, or the patient one while a patient pass runs.
+func (c *Client) mtuProbeTimeout() time.Duration {
+	if timeout := time.Duration(c.mtuPatientTimeout.Load()); timeout > 0 {
+		return timeout
+	}
+	return c.mtuTestTimeout
+}
+
+func connectionsNotIn(all []Connection, exclude []Connection) []Connection {
+	skip := make(map[string]struct{}, len(exclude))
+	for _, conn := range exclude {
+		skip[conn.Key] = struct{}{}
+	}
+	out := make([]Connection, 0, len(all))
+	for _, conn := range all {
+		if _, ok := skip[conn.Key]; !ok {
+			out = append(out, conn)
+		}
+	}
+	return out
+}
+
+// scanMTUConnections runs the MTU test of each connection on workerCount
+// workers, starting no new one once stop reports true. It reports false if
+// ctx ended first.
+func (c *Client) scanMTUConnections(ctx context.Context, conns []Connection, workerCount int, uploadCaps map[string]int, counters *mtuScanCounters, stop func() bool) bool {
+	if workerCount <= 1 {
+		for idx := range conns {
+			if err := ctx.Err(); err != nil {
+				return false
+			}
+			if stop != nil && stop() {
+				return true
+			}
+			conn := conns[idx]
+			c.runConnectionMTUTest(ctx, conn, idx+1, len(conns), uploadCaps[conn.Domain], counters)
+		}
+		return true
+	}
+	jobs := make(chan int, len(conns))
+	var wg sync.WaitGroup
+	for range workerCount {
+		wg.Go(func() {
+			for idx := range jobs {
+				if err := ctx.Err(); err != nil {
+					return
+				}
+				if stop != nil && stop() {
+					continue
+				}
+				conn := conns[idx]
+				c.runConnectionMTUTest(ctx, conn, idx+1, len(conns), uploadCaps[conn.Domain], counters)
+			}
+		})
+	}
+	for idx := range conns {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return false
+		case jobs <- idx:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	return ctx.Err() == nil
+}
+
 func (c *Client) optimizeMTUResolvers(connections []Connection) ([]Connection, int, int, int) {
 	if !c.cfg.AutoRemoveLowMTUServers {
 		return summarizeValidMTUConnections(connections)
@@ -329,41 +423,33 @@ func (c *Client) RunInitialMTUTests(ctx context.Context) error {
 	c.logMTUStart(workerCount)
 	c.prepareMTUSuccessOutputFile()
 
-	counters := &mtuScanCounters{}
-	if workerCount <= 1 {
-		for idx := range scanConnections {
-			if err := ctx.Err(); err != nil {
-				return nil
-			}
-			conn := scanConnections[idx]
-			c.runConnectionMTUTest(ctx, conn, idx+1, len(scanConnections), uploadCaps[conn.Domain], counters)
-		}
-	} else {
-		jobs := make(chan int, len(scanConnections))
-		var wg sync.WaitGroup
-		for range workerCount {
-			wg.Go(func() {
-				for idx := range jobs {
-					if err := ctx.Err(); err != nil {
-						return
-					}
-					conn := scanConnections[idx]
-					c.runConnectionMTUTest(ctx, conn, idx+1, len(scanConnections), uploadCaps[conn.Domain], counters)
-				}
-			})
-		}
+	if !c.scanMTUConnections(ctx, scanConnections, workerCount, uploadCaps, &mtuScanCounters{}, nil) {
+		return nil
+	}
 
-		for idx := range scanConnections {
-			select {
-			case <-ctx.Done():
-				close(jobs)
-				wg.Wait()
-				return nil
-			case jobs <- idx:
+	// 🔑 On a network under load - a national network throttling - every
+	// resolver can answer in seconds, and the scan gives each probe only
+	// MTU_TEST_TIMEOUT (1.5-2 s from the app). Then no resolver passed, the
+	// client rescanned with the same timeout forever, and never connected.
+	// When too few pass, the ones that failed get patient probes.
+	if active := c.balancer.ActiveConnections(); len(active) < patientScanBelow {
+		if patient := patientProbeTimeout(c.mtuTestTimeout); patient > c.mtuTestTimeout {
+			failed := connectionsNotIn(scanConnections, active)
+			if len(failed) > 0 {
+				if c.log != nil {
+					c.log.Warnf("<yellow>Only %d of %d resolvers answered the MTU test in %v; trying the others with %v probes</yellow>",
+						len(active), len(scanConnections), c.mtuTestTimeout, patient)
+				}
+				c.mtuPatientTimeout.Store(int64(patient))
+				completed := c.scanMTUConnections(ctx, failed, min(workerCount, len(failed)), uploadCaps, &mtuScanCounters{}, func() bool {
+					return c.balancer.ActiveCount() >= patientScanEnough
+				})
+				c.mtuPatientTimeout.Store(0)
+				if !completed {
+					return nil
+				}
 			}
 		}
-		close(jobs)
-		wg.Wait()
 	}
 
 	activeConns := c.balancer.ActiveConnections()
@@ -750,10 +836,21 @@ func (c *Client) resolverHealthProbeTimeout() time.Duration {
 		if timeout < 4500*time.Millisecond {
 			timeout = 4500 * time.Millisecond
 		}
+	default:
+		// ⚠️ Long lists kept MTU_TEST_TIMEOUT (1.5 s from the app) for the
+		// recheck too, so a resolver that answers in two seconds - common
+		// once a national network throttles - could never come back.
+		if timeout < recheckProbeTimeoutFloor {
+			timeout = recheckProbeTimeoutFloor
+		}
 	}
 
 	return timeout
 }
+
+// recheckProbeTimeoutFloor is the least time a recheck gives each probe of an
+// inactive resolver, however many resolvers there are.
+const recheckProbeTimeoutFloor = 4 * time.Second
 
 func (c *Client) confirmResolverDown(conn *Connection, window time.Duration) bool {
 	if c == nil || conn == nil || conn.Key == "" {
@@ -1025,7 +1122,7 @@ func (c *Client) testUploadMTU(ctx context.Context, conn Connection, probeTransp
 		maxPayload,
 		minUploadMTUFloor,
 		func(candidate int, isRetry bool) (bool, time.Duration, error) {
-			return c.sendUploadMTUProbe(ctx, conn, probeTransport, candidate, c.mtuTestTimeout, mtuProbeOptions{
+			return c.sendUploadMTUProbe(ctx, conn, probeTransport, candidate, c.mtuProbeTimeout(), mtuProbeOptions{
 				IsRetry: isRetry,
 			})
 		},
@@ -1048,7 +1145,7 @@ func (c *Client) testDownloadMTU(ctx context.Context, conn Connection, probeTran
 		c.cfg.MaxDownloadMTU,
 		minDownloadMTUFloor,
 		func(candidate int, isRetry bool) (bool, time.Duration, error) {
-			return c.sendDownloadMTUProbe(ctx, conn, probeTransport, candidate, uploadMTU, c.mtuTestTimeout, mtuProbeOptions{
+			return c.sendDownloadMTUProbe(ctx, conn, probeTransport, candidate, uploadMTU, c.mtuProbeTimeout(), mtuProbeOptions{
 				IsRetry: isRetry,
 			})
 		},

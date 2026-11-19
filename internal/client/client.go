@@ -61,6 +61,7 @@ type Client struct {
 	mtuProbeCounter                       atomic.Uint32
 	mtuTestRetries                        int
 	mtuTestTimeout                        time.Duration
+	mtuPatientTimeout                     atomic.Int64 // per-probe timeout of a patient scan pass; 0 = mtuTestTimeout
 	mtuSaveToFile                         bool
 	mtuServersFileName                    string
 	mtuServersFileFormat                  string

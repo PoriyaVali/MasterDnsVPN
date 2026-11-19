@@ -151,6 +151,11 @@ func (c *Client) initializeSessionRequest() error {
 	// to the pre-acceptance generation, and must finish before policy is applied.
 	poolSize := c.cfg.EffectiveResolverUDPConnectionPoolSize()
 	timeout := c.mtuTestTimeout * 3
+	if timeout < sessionInitTimeoutFloor {
+		// A resolver under load answers in seconds; one that passed only
+		// the patient MTU pass needs as long here.
+		timeout = sessionInitTimeoutFloor
+	}
 	base64 := initPayload[0] == mtuProbeBase64Reply
 
 	type result struct {
@@ -832,3 +837,6 @@ func (c *Client) uploadPayloadMTU() int {
 }
 
 const minSealedUploadPayload = 16
+
+// sessionInitTimeoutFloor is the least each session init attempt waits.
+const sessionInitTimeoutFloor = 6 * time.Second
