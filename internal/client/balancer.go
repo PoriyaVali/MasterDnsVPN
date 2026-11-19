@@ -60,16 +60,22 @@ type balancerResolverSampleKey struct {
 }
 
 type balancerResolverSample struct {
-	serverKey  string
-	sentAt     time.Time
+	serverKey string
+	sentAt    time.Time
+	// timedOut: unanswered past the resolver's own loss timeout, and
+	// counted lost - the balancer moves off it.
 	timedOut   bool
 	timedOutAt time.Time
+	// expired: still unanswered past the request timeout, and counted in
+	// the auto-disable window as well.
+	expired    bool
 	evictAfter time.Time
 }
 
 type balancerTimeoutObservation struct {
 	serverKey string
 	at        time.Time
+	expired   bool // past the request timeout: auto-disable evidence, not another loss
 }
 
 type balancerPendingShard struct {
@@ -83,6 +89,7 @@ type Balancer struct {
 	healthRRCounter  atomic.Uint64
 	rngState         atomic.Uint64
 	nextPendingSweep atomic.Int64
+	lastExploreAt    atomic.Int64 // UnixNano of the last idle-resolver probe
 	pendingOverflow  atomic.Bool
 	pendingSize      atomic.Int32
 	pendingEvictRR   atomic.Uint32
@@ -105,6 +112,9 @@ type Balancer struct {
 	autoDisableTimeoutWindow time.Duration
 	onResolverDisabled       func(*Connection, string)
 	confirmResolverDown      func(*Connection, time.Duration) bool
+	// downstreamQuiet reports that no downstream data has arrived lately,
+	// so the server most likely has nothing queued for this client.
+	downstreamQuiet func(time.Time) bool
 }
 
 type connectionStats struct {
@@ -115,6 +125,10 @@ type connectionStats struct {
 	rttCount        atomic.Uint64
 	rttEWMA         atomic.Int64 // microseconds; zero until the first RTT sample
 	rttVar          atomic.Int64 // microseconds; mean deviation around rttEWMA
+	lastSentAt      atomic.Int64 // UnixNano of the last query sent through it
+	lastLossAt      atomic.Int64 // UnixNano of the last query counted lost
+	lastForgivenAt  atomic.Int64 // UnixNano of the last halving of old losses
+	probeBackoff    atomic.Int64 // ns idle before a probe while data flows; 0 = busyResolverProbeAfter
 	windowStartedAt atomic.Int64 // UnixNano
 	windowSent      atomic.Uint32
 	windowLost      atomic.Uint32
@@ -181,6 +195,17 @@ func (b *Balancer) SetResolverDownConfirmHandler(handler func(*Connection, time.
 	}
 	b.mu.Lock()
 	b.confirmResolverDown = handler
+	b.mu.Unlock()
+}
+
+// SetDownstreamQuietCheck tells the balancer how to see that no downstream
+// data is arriving: probes of idle resolvers cost nothing then.
+func (b *Balancer) SetDownstreamQuietCheck(quiet func(time.Time) bool) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.downstreamQuiet = quiet
 	b.mu.Unlock()
 }
 
@@ -356,21 +381,99 @@ func (b *Balancer) ReportSuccess(serverKey string, rtt time.Duration) {
 		stats.rttCount.Add(1)
 		stats.observeRTT(rtt)
 	}
+	stats.forgiveOldLosses(time.Now())
 	stats.applyHalfLife()
 }
 
+const (
+	// lossForgiveAfter is how long a resolver must go without losing a
+	// query before its older losses start to fade.
+	lossForgiveAfter = 15 * time.Second
+	// lossForgiveEvery bounds the fading to one halving per interval.
+	lossForgiveEvery = time.Second
+)
+
+// forgiveOldLosses halves a resolver's loss count on an answer, once it has
+// gone lossForgiveAfter without losing a query, at most once per
+// lossForgiveEvery.
+//
+// 🔑 The loss score is lost/sent over the resolver's whole history, and it
+// only fades by halving once a count passes 1000. A resolver the strategies
+// stopped choosing after a burst of loss gets a poll now and then and no
+// other query, so its counts never got there: thirty queries lost in one bad
+// stretch kept it out for the rest of the session, however cleanly it
+// answered afterwards. A resolver still losing keeps its score - each loss
+// restarts the clock.
+func (s *connectionStats) forgiveOldLosses(now time.Time) {
+	if s == nil || s.lost.Load() == 0 {
+		return
+	}
+	nowNano := now.UnixNano()
+	if nowNano-s.lastLossAt.Load() < int64(lossForgiveAfter) {
+		return
+	}
+	last := s.lastForgivenAt.Load()
+	if nowNano-last < int64(lossForgiveEvery) || !s.lastForgivenAt.CompareAndSwap(last, nowNano) {
+		return
+	}
+	for {
+		current := s.lost.Load()
+		if current == 0 || s.lost.CompareAndSwap(current, current/2) {
+			return
+		}
+	}
+}
+
+// ReportTimeout counts a query lost and as auto-disable evidence at once: a
+// definite failure, or a query past the request timeout.
 func (b *Balancer) ReportTimeout(serverKey string, now time.Time, window time.Duration, minActive int) bool {
+	if !b.countLoss(serverKey, now) {
+		return false
+	}
+	return b.reportExpired(serverKey, now, window, minActive)
+}
+
+// countLoss counts a query lost, which is all the balancer's scores see.
+func (b *Balancer) countLoss(serverKey string, at time.Time) bool {
 	stats := b.statsForKey(serverKey)
 	if stats == nil {
 		return false
 	}
 	stats.lost.Add(1)
+	stats.lastLossAt.Store(at.UnixNano())
+	stats.backOffProbes()
 	stats.applyHalfLife()
+	return true
+}
 
+// retractLoss takes back a loss counted by countLoss alone, when the answer
+// came after all.
+func (b *Balancer) retractLoss(serverKey string) {
+	stats := b.statsForKey(serverKey)
+	if stats == nil {
+		return
+	}
+	for {
+		current := stats.lost.Load()
+		if current == 0 || stats.lost.CompareAndSwap(current, current-1) {
+			break
+		}
+	}
+	stats.applyHalfLife()
+}
+
+// reportExpired records a query in the auto-disable window - a definite
+// failure, or one unanswered past the request timeout - and disables the
+// resolver when the window holds nothing else and enough of it.
+func (b *Balancer) reportExpired(serverKey string, now time.Time, window time.Duration, minActive int) bool {
+	stats := b.statsForKey(serverKey)
+	if stats == nil {
+		return false
+	}
 	totalTimedOut, totalSent := stats.recordWindowTimeout(now, window)
 	b.mu.Lock()
 	conn, ok := b.connectionByKeyLocked(serverKey)
-	if !ok || !conn.IsValid {
+	if !ok || !conn.IsValid || !b.autoDisableEnabled {
 		b.mu.Unlock()
 		return false
 	}
@@ -615,6 +718,7 @@ func (b *Balancer) TrackResolverSend(
 	b.ReportSend(serverKey)
 	if stats != nil {
 		stats.recordWindowSend(sentAt, window)
+		stats.lastSentAt.Store(sentAt.UnixNano())
 	}
 }
 
@@ -652,7 +756,14 @@ func (b *Balancer) TrackResolverSuccess(
 		return
 	}
 	if sample.timedOut && !sample.timedOutAt.IsZero() {
-		b.RetractTimeout(sample.serverKey, receivedAt, window)
+		if sample.expired {
+			b.RetractTimeout(sample.serverKey, receivedAt, window)
+		} else {
+			b.retractLoss(sample.serverKey)
+		}
+	} else if stats := b.statsForKey(sample.serverKey); stats != nil {
+		// Answered in time: probe it at the normal pace again.
+		stats.probeBackoff.Store(0)
 	}
 	if !sample.sentAt.IsZero() && !receivedAt.Before(sample.sentAt) {
 		rtt = receivedAt.Sub(sample.sentAt)
@@ -673,7 +784,6 @@ func (b *Balancer) TrackResolverFailure(
 	}
 
 	b.mu.RLock()
-	autoDisable := b.autoDisableEnabled
 	window := b.autoDisableTimeoutWindow
 	b.mu.RUnlock()
 
@@ -692,7 +802,12 @@ func (b *Balancer) TrackResolverFailure(
 	}
 	shard.mu.Unlock()
 
-	if !ok || sample.serverKey == "" || sample.timedOut || !autoDisable {
+	if !ok || sample.serverKey == "" || sample.expired {
+		return
+	}
+	if sample.timedOut {
+		// Already counted lost; the failure is the window's evidence too.
+		b.reportExpired(sample.serverKey, failedAt, window, 1)
 		return
 	}
 	b.ReportTimeout(sample.serverKey, failedAt, window, 1)
@@ -707,15 +822,17 @@ func (b *Balancer) CollectExpiredResolverTimeouts(
 	}
 
 	b.mu.RLock()
-	autoDisable := b.autoDisableEnabled
 	window := b.autoDisableTimeoutWindow
 	activeCount := len(b.activeIDs)
 	b.mu.RUnlock()
 	checkInterval := autoDisableCheckIntervalForActiveCount(activeCount, window)
 
-	if !autoDisable {
-		return
-	}
+	// 🔑 Unanswered queries are counted lost whether or not resolvers may be
+	// disabled for it. With AUTO_DISABLE_TIMEOUT_SERVERS off this returned
+	// here, and SERVFAIL and empty answers were dropped too, so no resolver
+	// ever lost a query: strategies 3, 6, 7 and 8 balanced on a loss score
+	// stuck at zero for all of them. ReportTimeout leaves the disabling to
+	// the setting.
 	if !b.pendingOverflow.Load() && !b.pendingSweepDue(now) {
 		return
 	}
@@ -749,7 +866,11 @@ func (b *Balancer) CollectExpiredResolverTimeouts(
 	b.pendingOverflow.Store(false)
 
 	for _, observation := range timeoutObservations {
-		b.ReportTimeout(observation.serverKey, observation.at, window, 1)
+		if observation.expired {
+			b.reportExpired(observation.serverKey, observation.at, window, 1)
+		} else {
+			b.countLoss(observation.serverKey, observation.at)
+		}
 	}
 }
 
@@ -972,6 +1093,16 @@ func (b *Balancer) SelectTargets(packetType uint8, streamID uint16, requiredCoun
 
 	// 2. Base case: Single target or non-stream packet is ALWAYS dynamic via balancer
 	if requiredCount == 1 || streamID == 0 || !isBalancerStreamDataLike(packetType) {
+		if packetType == Enums.PACKET_PING && streamID == 0 {
+			if idle, ok := b.idleResolverToProbeLocked(time.Now()); ok {
+				if requiredCount == 1 {
+					return []Connection{idle}, nil
+				}
+				// A duplicated poll keeps its first copies where the
+				// strategy puts them and spends the last on the probe.
+				return withIdleProbe(b.getUniqueConnectionsLocked(requiredCount), idle), nil
+			}
+		}
 		selected := b.getUniqueConnectionsLocked(requiredCount)
 		if len(selected) == 0 {
 			return nil, ErrNoValidConnections
@@ -1005,6 +1136,107 @@ func (b *Balancer) SelectTargets(packetType uint8, streamID uint16, requiredCoun
 	}
 
 	return selected, nil
+}
+
+const (
+	// idleResolverProbeEvery bounds how often a poll is spent on a resolver
+	// the strategy has stopped choosing.
+	idleResolverProbeEvery = 500 * time.Millisecond
+	// idleResolverAfter is how long an active resolver may go without a
+	// query before a poll is sent its way, while no downstream data flows.
+	idleResolverAfter = 3 * time.Second
+	// busyResolverProbeAfter is the same while data flows; each probe that
+	// goes unanswered doubles it, up to resolverProbeBackoffMax.
+	busyResolverProbeAfter  = 15 * time.Second
+	resolverProbeBackoffMax = time.Minute
+	// downstreamQuietAfter: no downstream data for this long, and the
+	// server most likely has nothing queued for the client.
+	downstreamQuietAfter = time.Second
+)
+
+// idleResolverToProbeLocked picks the active resolver that has gone longest
+// without a query, among those idle long enough to be probed, when no probe
+// went out in the last idleResolverProbeEvery.
+//
+// 🔑 A score is only ever updated by queries, and the scored strategies stop
+// sending queries to a resolver that scored badly - lossy for a while, or
+// slow. It kept that score for the rest of the session even after it had
+// recovered: a resolver that was silent for ten seconds was never used
+// again. Polls - only polls - now go to it now and then; its answers, or its
+// silence, refresh its score.
+//
+// ⚠️ An answer carries whatever the server has queued, a poll's too. A
+// resolver that forwards queries but drops the answers, as filtering does,
+// loses the packet a probe's answer carried, and the stream stalls until the
+// server resends it: probed every 3 s during a transfer, that was a stall
+// every 3 s (measured). So a resolver is probed every idleResolverAfter only
+// while nothing is coming down, and otherwise after busyResolverProbeAfter,
+// backing off up to resolverProbeBackoffMax while its probes go unanswered.
+func (b *Balancer) idleResolverToProbeLocked(now time.Time) (Connection, bool) {
+	if b.strategy < BalancingLeastLoss || len(b.activeIDs) < 2 {
+		return Connection{}, false
+	}
+	nowNano := now.UnixNano()
+	last := b.lastExploreAt.Load()
+	if nowNano-last < int64(idleResolverProbeEvery) {
+		return Connection{}, false
+	}
+	quiet := b.downstreamQuiet == nil || b.downstreamQuiet(now)
+	idlest, idlestAt := -1, int64(0)
+	for _, idx := range b.activeIDs {
+		if idx < 0 || idx >= len(b.stats) || b.stats[idx] == nil {
+			continue
+		}
+		stats := b.stats[idx]
+		need := int64(idleResolverAfter)
+		if !quiet {
+			need = max64(int64(busyResolverProbeAfter), stats.probeBackoff.Load())
+		}
+		at := stats.lastSentAt.Load()
+		if nowNano-at < need {
+			continue
+		}
+		if idlest < 0 || at < idlestAt {
+			idlest, idlestAt = idx, at
+		}
+	}
+	if idlest < 0 {
+		return Connection{}, false
+	}
+	if !b.lastExploreAt.CompareAndSwap(last, nowNano) {
+		return Connection{}, false
+	}
+	return b.connections[idlest], true
+}
+
+// backOffProbes doubles how long a resolver must sit idle before it is
+// probed while data flows, after a query of it went unanswered.
+func (s *connectionStats) backOffProbes() {
+	for {
+		current := s.probeBackoff.Load()
+		next := max64(2*current, int64(2*busyResolverProbeAfter))
+		if next > int64(resolverProbeBackoffMax) {
+			next = int64(resolverProbeBackoffMax)
+		}
+		if current == next || s.probeBackoff.CompareAndSwap(current, next) {
+			return
+		}
+	}
+}
+
+// withIdleProbe puts the probed resolver in place of the last copy, unless
+// it is one of the copies already.
+func withIdleProbe(selected []Connection, idle Connection) []Connection {
+	for _, conn := range selected {
+		if conn.Key == idle.Key {
+			return selected
+		}
+	}
+	if len(selected) == 0 {
+		return []Connection{idle}
+	}
+	selected[len(selected)-1] = idle
+	return selected
 }
 
 func (b *Balancer) AverageRTT(serverKey string) (time.Duration, bool) {
@@ -1374,6 +1606,15 @@ const (
 	resolverPendingShardCount = 16
 )
 
+// resolverExpireFloor is the least a query must go unanswered before it
+// counts toward disabling its resolver. The request timeout shrinks as the
+// resolver list grows - 2 s at 50 resolvers, 1 s past 75 - and the long
+// lists used where networks are filtered are exactly where resolvers come
+// under load and answer in seconds: a burst of a dozen queries to one of
+// them, unanswered for a second, used to disable it. Switching away does
+// not wait for this: each resolver's loss timeout does that.
+const resolverExpireFloor = 5 * time.Second
+
 func resolverSampleTTL(tunnelPacketTimeout time.Duration) time.Duration {
 	ttl := tunnelPacketTimeout * 3
 	if ttl < 10*time.Second {
@@ -1457,60 +1698,85 @@ func (b *Balancer) prunePendingLocked(pending map[balancerResolverSampleKey]bala
 	}
 
 	absoluteCutoff := now.Add(-ttl)
-	// The grace for a late answer stays on requestTimeout: a resolver that is
+	expiry := requestTimeout
+	if expiry < resolverExpireFloor {
+		expiry = resolverExpireFloor
+	}
+	// The grace for a late answer follows the expiry: a resolver that is
 	// only slow still gets its loss retracted.
-	lateGrace := resolverLateResponseGrace(requestTimeout, ttl)
+	lateGrace := resolverLateResponseGrace(expiry, ttl)
 	var timeoutObservations []balancerTimeoutObservation
 	var nextDue time.Time
 	removedCount := 0
 
+	due := func(at time.Time) {
+		if nextDue.IsZero() || at.Before(nextDue) {
+			nextDue = at
+		}
+	}
 	for key, sample := range pending {
+		changed := false
 		if !sample.timedOut {
 			timeout, ok := timeouts[sample.serverKey]
 			if !ok {
 				timeout = requestTimeout
 			}
 			timeoutAt := sample.sentAt.Add(timeout)
-			if !timeoutAt.After(now) {
+			if timeoutAt.After(now) {
+				due(timeoutAt)
+			} else {
 				sample.timedOut = true
 				sample.timedOutAt = timeoutAt
-				if sample.timedOutAt.After(now) {
-					sample.timedOutAt = now
-				}
 				sample.evictAfter = sample.timedOutAt.Add(lateGrace)
-				pending[key] = sample
+				changed = true
 				if sample.serverKey != "" {
 					timeoutObservations = append(timeoutObservations, balancerTimeoutObservation{
 						serverKey: sample.serverKey,
 						at:        sample.timedOutAt,
 					})
 				}
-			} else if nextDue.IsZero() || timeoutAt.Before(nextDue) {
-				nextDue = timeoutAt
 			}
-			if sample.sentAt.Before(absoluteCutoff) {
-				delete(pending, key)
-				removedCount++
-			}
-			continue
 		}
-
-		if !sample.evictAfter.IsZero() && !sample.evictAfter.After(now) {
+		// ⚠️ Only a query unanswered for the whole request timeout - and
+		// never less than resolverExpireFloor - counts toward disabling
+		// its resolver. The loss timeout above follows the resolver's
+		// usual round trip - 600 ms for a fast one - and a resolver under
+		// load, as on a national network that is throttling, answers
+		// seconds late without being down: with that timeout feeding the
+		// window, a burst of queries all past it before the first late
+		// answer came could disable a resolver that was answering every
+		// one of them.
+		if sample.timedOut && !sample.expired {
+			expireAt := sample.sentAt.Add(expiry)
+			if expireAt.After(now) {
+				due(expireAt)
+			} else {
+				sample.expired = true
+				changed = true
+				if sample.serverKey != "" {
+					timeoutObservations = append(timeoutObservations, balancerTimeoutObservation{
+						serverKey: sample.serverKey,
+						at:        expireAt,
+						expired:   true,
+					})
+				}
+			}
+		}
+		if sample.sentAt.Before(absoluteCutoff) ||
+			(sample.timedOut && !sample.evictAfter.IsZero() && !sample.evictAfter.After(now)) {
 			delete(pending, key)
 			removedCount++
 			continue
 		}
-		if sample.sentAt.Before(absoluteCutoff) {
-			delete(pending, key)
-			removedCount++
-			continue
+		if changed {
+			pending[key] = sample
 		}
-		evictAt := sample.evictAfter
-		if evictAt.IsZero() {
-			evictAt = sample.sentAt.Add(ttl)
-		}
-		if nextDue.IsZero() || evictAt.Before(nextDue) {
-			nextDue = evictAt
+		if sample.timedOut {
+			evictAt := sample.evictAfter
+			if evictAt.IsZero() {
+				evictAt = sample.sentAt.Add(ttl)
+			}
+			due(evictAt)
 		}
 	}
 
@@ -1616,7 +1882,7 @@ func (b *Balancer) getUniqueConnectionsLocked(requiredCount int) []Connection {
 			if len(pool) == 0 {
 				return b.selectRoundRobinLocked(count)
 			}
-			return b.limitConnectionPoolLocked(pool, count, pick)
+			return b.fillUniqueConnectionsLocked(b.limitConnectionPoolLocked(pool, count, pick), count)
 		}
 		scorer, hasSignal := b.strategyScorerLocked()
 		if scorer == nil {
@@ -1629,6 +1895,60 @@ func (b *Balancer) getUniqueConnectionsLocked(requiredCount int) []Connection {
 
 		return b.selectLowestScoreLocked(count, scorer)
 	}
+}
+
+// fillUniqueConnectionsLocked tops selected up to count with the active
+// resolvers not already in it: least loss first, and of equal loss the
+// faster first.
+//
+// 🔑 The pooled strategies (6, 7, 8) took every copy of a duplicated packet
+// from their pool alone - the resolvers within a hair of the best round trip
+// (6), or the top loss tier of two (7, 8). Asked for three copies, strategy 6
+// sent one whenever one resolver was clearly the fastest, and 7 and 8 sent
+// two at most: PACKET_DUPLICATION_COUNT and SETUP_PACKET_DUPLICATION_COUNT,
+// the copies that carry a packet through loss, were quietly cut. The pool
+// still decides the first copies; the rest go where they would under
+// strategy 3, ordered by loss.
+func (b *Balancer) fillUniqueConnectionsLocked(selected []Connection, count int) []Connection {
+	if len(selected) >= count || len(selected) >= len(b.activeIDs) {
+		return selected
+	}
+	type candidate struct {
+		idx     int
+		loss    uint64
+		latency uint64
+	}
+	var scratch [64]candidate
+	candidates := scratch[:0]
+	for _, idx := range b.activeIDs {
+		if idx < 0 || idx >= len(b.connections) {
+			continue
+		}
+		taken := false
+		for i := range selected {
+			if selected[i].Key == b.connections[idx].Key {
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			candidates = append(candidates, candidate{idx: idx, loss: b.lossScoreLocked(idx), latency: b.latencyScoreLocked(idx)})
+		}
+	}
+	out := make([]Connection, len(selected), count)
+	copy(out, selected)
+	for len(out) < count && len(candidates) > 0 {
+		best := 0
+		for j := 1; j < len(candidates); j++ {
+			if candidates[j].loss < candidates[best].loss ||
+				(candidates[j].loss == candidates[best].loss && candidates[j].latency < candidates[best].latency) {
+				best = j
+			}
+		}
+		out = append(out, b.connections[candidates[best].idx])
+		candidates = append(candidates[:best], candidates[best+1:]...)
+	}
+	return out
 }
 
 func (b *Balancer) selectTargetByStrategyLocked() (Connection, bool) {
@@ -1968,11 +2288,7 @@ func (b *Balancer) lossThenLatencyCandidatesLocked(excludeKey string) []Connecti
 		return nil
 	}
 
-	lossTolerance := uint64(25)
-	if bestLoss >= 200 {
-		lossTolerance = 0
-	}
-	lossCutoff := bestLoss + lossTolerance
+	lossCutoff := bestLoss + lossToleranceForBest(bestLoss)
 
 	lossShortlist := candidates[:0]
 	bestLatency := ^uint64(0)
@@ -2023,8 +2339,9 @@ func latencyToleranceForTier(bestLatency uint64) uint64 {
 
 func (b *Balancer) leastLossTopTierCandidatesLocked(excludeKey string) []Connection {
 	type candidate struct {
-		idx  int
-		loss uint64
+		idx     int
+		loss    uint64
+		latency uint64
 	}
 
 	if !b.hasLossSignalLocked() || len(b.activeIDs) == 0 {
@@ -2032,14 +2349,20 @@ func (b *Balancer) leastLossTopTierCandidatesLocked(excludeKey string) []Connect
 	}
 
 	candidates := make([]candidate, 0, len(b.activeIDs))
+	bestLoss := ^uint64(0)
 	for _, idx := range b.activeIDs {
 		if excludeKey != "" && b.connections[idx].Key == excludeKey {
 			continue
 		}
-		candidates = append(candidates, candidate{
-			idx:  idx,
-			loss: b.lossScoreLocked(idx),
-		})
+		c := candidate{
+			idx:     idx,
+			loss:    b.lossScoreLocked(idx),
+			latency: b.latencyScoreLocked(idx),
+		}
+		if c.loss < bestLoss {
+			bestLoss = c.loss
+		}
+		candidates = append(candidates, c)
 	}
 	if len(candidates) == 0 {
 		return nil
@@ -2050,22 +2373,60 @@ func (b *Balancer) leastLossTopTierCandidatesLocked(excludeKey string) []Connect
 		topCount = len(candidates)
 	}
 
+	// ⏱ Within the loss band of the best - the band strategy 6 draws - the
+	// faster ranks first; outside it, the less lossy. The tier was loss
+	// alone, and loss alone could not tell the paths apart: a resolver that
+	// turns slow loses nothing (every answer still comes, late), and one the
+	// strategy left idle answers its few probes cleanly and so beat busy
+	// resolvers carrying traffic through 1% loss - measured, the slowest of
+	// four took half the traffic and a download ran at 60% of its speed.
+	// The tier keeps its size whatever the round trips: when every resolver
+	// slows down at once, as under a throttled national network, nothing is
+	// pushed out and the load stays spread.
+	cutoff := bestLoss + lossToleranceForBest(bestLoss)
+	ahead := func(x, y candidate) bool {
+		xin, yin := x.loss <= cutoff, y.loss <= cutoff
+		if xin != yin {
+			return xin
+		}
+		if xin && x.latency != y.latency {
+			return x.latency < y.latency
+		}
+		if x.loss != y.loss {
+			return x.loss < y.loss
+		}
+		return x.latency < y.latency
+	}
 	for i := 0; i < topCount; i++ {
-		minIdx := i
+		best := i
 		for j := i + 1; j < len(candidates); j++ {
-			if candidates[j].loss < candidates[minIdx].loss {
-				minIdx = j
+			if ahead(candidates[j], candidates[best]) {
+				best = j
 			}
 		}
-		candidates[i], candidates[minIdx] = candidates[minIdx], candidates[i]
+		candidates[i], candidates[best] = candidates[best], candidates[i]
 	}
 
-	selected := make([]Connection, 0, topCount)
+	selected := make([]Connection, topCount)
 	for i := 0; i < topCount; i++ {
-		selected = append(selected, b.connections[candidates[i].idx])
+		selected[i] = b.connections[candidates[i].idx]
 	}
 	return selected
 }
+
+// lossToleranceForBest is how far above the best loss score a resolver may
+// be and still compete on round trip: 2.5 points of loss, none once the
+// best itself loses a fifth of its queries.
+func lossToleranceForBest(bestLoss uint64) uint64 {
+	if bestLoss >= 200 {
+		return 0
+	}
+	return 25
+}
+
+// latencyScoreUnknown is latencyScoreLocked's answer for a resolver with too
+// few round trips to judge.
+const latencyScoreUnknown = 999000
 
 func (b *Balancer) lossScoreLocked(idx int) uint64 {
 	if idx < 0 || idx >= len(b.stats) || b.stats[idx] == nil {
@@ -2084,11 +2445,11 @@ func (b *Balancer) lossScoreLocked(idx int) uint64 {
 
 func (b *Balancer) latencyScoreLocked(idx int) uint64 {
 	if idx < 0 || idx >= len(b.stats) || b.stats[idx] == nil {
-		return 999000
+		return latencyScoreUnknown
 	}
 	count := b.stats[idx].rttCount.Load()
 	if count < 5 {
-		return 999000
+		return latencyScoreUnknown
 	}
 	if recent := b.stats[idx].rttEWMA.Load(); recent > 0 {
 		return uint64(recent)
@@ -2176,7 +2537,7 @@ func (b *Balancer) hybridScoreLocked(idx int) uint64 {
 
 func (b *Balancer) hybridLatencyPenaltyLocked(idx int) uint64 {
 	latencyMicros := b.latencyScoreLocked(idx)
-	if latencyMicros == 999000 {
+	if latencyMicros == latencyScoreUnknown {
 		return 200
 	}
 

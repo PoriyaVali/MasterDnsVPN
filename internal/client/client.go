@@ -61,6 +61,7 @@ type Client struct {
 	mtuProbeCounter                       atomic.Uint32
 	mtuTestRetries                        int
 	mtuTestTimeout                        time.Duration
+	mtuPatientTimeout                     atomic.Int64 // per-probe timeout of a patient scan pass; 0 = mtuTestTimeout
 	mtuSaveToFile                         bool
 	mtuServersFileName                    string
 	mtuServersFileFormat                  string
@@ -450,6 +451,11 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 
 	c.balancer.SetResolverDownConfirmHandler(func(conn *Connection, window time.Duration) bool {
 		return c.confirmResolverDown(conn, window)
+	})
+
+	c.balancer.SetDownstreamQuietCheck(func(now time.Time) bool {
+		pm := c.pingManager
+		return pm != nil && now.UnixNano()-pm.lastNonPongReceivedAt.Load() >= int64(downstreamQuietAfter)
 	})
 
 	c.pingManager = newPingManager(c)

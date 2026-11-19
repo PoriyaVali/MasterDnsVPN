@@ -1,5 +1,71 @@
 # AI work log and handoff
 
+## Active handoff - 2026-11-19 - Claude - client: faster resolver switching that holds up when every resolver is slow
+
+Branch claude/nifty-galileo-23rwag on top of 312e119: bdaf6de, 4cbdff4, 222b66d, 420ae96, bf67605
+(internal/client/balancer.go, mtu.go, session.go, client.go). The owner's brief was faster
+switching between resolvers, and compatibility with every resolver, including poor ones, when a
+throttled national network has them all answering late.
+
+Switching:
+- Strategies 6, 7 and 8 sent only as many copies as their candidate pool held. Strategy 6 sent one
+  copy whenever one resolver was clearly the fastest; 7 and 8 sent two at most.
+  `fillUniqueConnectionsLocked` tops the copies up from the other resolvers, by loss and then by
+  round trip.
+- The 7/8 top tier ranks the faster first within strategy 6's loss band (`lossToleranceForBest`),
+  then by loss. Before, it ranked by loss alone, with ties in list order. The tier keeps its size.
+  bdaf6de's hard latency guard was removed, because it could shrink the tier to one resolver.
+- Idle resolvers are probed with polls: every 3 s while no downstream data has arrived for 1 s,
+  otherwise after 15 s idle, doubling to 60 s per unanswered probe. A duplicated poll spends only
+  its last copy. Probing every 3 s during transfers stalled the stream on resolvers that drop
+  answers (measured), hence the pacing.
+- Old losses fade: after 15 s without a loss, each answer halves the count (at most once a second).
+
+Slow and poor resolvers:
+- A query counts as lost at the resolver's loss timeout, for scoring only. It counts as
+  auto-disable evidence only once it is unanswered past the request timeout, and never sooner than
+  5 s. The request timeout falls to 1 s past 75 resolvers; a burst of a dozen queries to a resolver
+  answering in 2.5 s used to disable it (unit test).
+- Losses are counted with AUTO_DISABLE_TIMEOUT_SERVERS off as well; before, none were.
+- When fewer than 3 resolvers pass the MTU scan, the rest get a patient pass: 3x the probe timeout,
+  4-8 s, stopping once 8 are active. Rechecks wait at least 4 s per probe at any list size. Session
+  init waits at least 6 s per attempt.
+
+Measured with a local harness (not committed): a real node and four resolvers on their own
+loopback addresses at 20/35/50/70 ms one way. "A" is 312e119; medians.
+- Strategy 6 at 3 copies, bulk: 227 -> 436 KiB/s healthy, 14 -> 252 with a slow resolver,
+  155 -> 294 with an answer-dropping resolver.
+- With the busiest resolver going silent: worst 1.11 -> 0.17 s.
+- Clean profile (strategy 8): healthy bulk unchanged (396 -> 385 KiB/s, within spread). Under a
+  dropped-answers failure: worst 1.28 -> 0.54 s (3 runs). SERVFAIL within spread (0.65 vs 0.71 s).
+  After a failure it goes back to the fast resolvers (median 302 -> 143-172 ms).
+- Throttled profile with a slow resolver: excess delay 3.46 -> 0.62 s.
+- Throttled national network (every resolver +600 ms, up to 1.5 s jitter, 8% loss each way; 3 app
+  profiles x 2 runs, also on the pre-#13 code): no resolver disabled by any version, same latency,
+  and this branch keeps all four resolvers in use.
+- server/slow_resolvers_e2e_test.go: all resolvers answering in 3.4 s with MTU_TEST_TIMEOUT 1 s.
+  Connects in about 18 s. Without the patient pass or the session floor it never opened its SOCKS
+  port (90 s).
+
+The first version of this branch (bdaf6de + 4cbdff4) cut clean-profile bulk to 244 KiB/s. Probing
+plus a loss-only tier put the slowest resolver in the tier: an idle resolver with clean probes
+outscored busy ones carrying traffic through 1% loss. The loss-band ranking fixed it.
+
+Tests: balancer_duplication_test.go, balancer_tier_test.go, balancer_probe_test.go,
+balancer_forgive_test.go, slow_resolver_disable_test.go, balancer_autodisable_off_test.go,
+patient_timeouts_test.go and server/slow_resolvers_e2e_test.go. Each fails with its change reverted
+(checked). `go test ./...`, `go vet ./...` and the CI race set pass (go1.25.0, Linux).
+
+Not run: a 100-resolver end-to-end pressure run (the long-list disable is covered by unit tests);
+any real device or network.
+
+Risks:
+- A probe during a transfer still costs one downstream packet when the probed resolver drops
+  answers; the backoff bounds this to one per 15-60 s per such resolver.
+- A resolver up to 2.5 loss points worse but faster can now win a tier slot.
+- Patient MTU passes and the longer floors make startup and rechecks slower only when resolvers
+  are slow.
+
 ## Active handoff - 2026-11-19 - Claude - client: a silent resolver is counted lost by its own round trip
 
 Measured first, with a real node and four resolvers on their own loopback
