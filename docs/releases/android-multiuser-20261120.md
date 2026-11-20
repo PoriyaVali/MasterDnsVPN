@@ -1,10 +1,11 @@
-# android-multiuser-20261120 — faster resolver switching that holds up when every resolver is slow
+# android-multiuser-20261120 — faster resolver switching, and an idle tunnel that goes quiet
 
-Includes `android-multiuser-20261031` and PRs #10 to #14. Most changes are in
+Includes `android-multiuser-20261031` and PRs #10 to #17. Most changes are in
 the client's resolver balancing. The client now leaves a failing resolver
 faster and lets a recovered one back in. It also keeps working when every
 resolver is under load and answers late, as on a throttled national network.
-Claude authored PRs #10 to #14.
+An idle client no longer polls every 100 ms (#17). Claude authored PRs #10 to
+#17.
 
 ## Changes
 
@@ -47,10 +48,26 @@ Claude authored PRs #10 to #14.
 - **Losses are counted with `AUTO_DISABLE_TIMEOUT_SERVERS` off** (#14). The
   setting now only decides whether a resolver may be disabled.
 
+### Client: an idle tunnel goes quiet
+
+- **An idle client no longer polls every 100 ms** (#17). A half-closed stream
+  repeated its last ACK every 2 s for as long as the server kept its side open,
+  which servers do for minutes. Each repeat counted as traffic, so the ping
+  interval stayed at 100 ms: ten DNS queries a second on an idle phone. The
+  repeats now stop 12 s after the stream's last activity, and a packet that
+  only acknowledges data no longer counts as traffic.
+- **Fewer wake-ups while idle** (#17). The dispatcher's 20 ms safety timer
+  backs off to 1 s, the loss sweep's 250 ms tick to 2 s while no query is
+  pending, and the ping loop's 1 s recheck to 4 s. Traffic still wakes each of
+  them at once.
+
 ### Server
 
 - **Requests are queued by pointer** (#10). This ends the request-queue memory
   regression of `android-multiuser-20261031`.
+- **A stream takes no packet after its cleanup** (#16). An ACK queued at that
+  moment stayed on a dead stream, out of the packet pool, until the stream was
+  collected. The same race failed a cleanup test about one run in seventeen.
 
 ## Measured
 
@@ -74,19 +91,36 @@ and all four stayed in use.
 `MTU_TEST_TIMEOUT` set to 1 s. The client connects in about 18 s; before this
 release it never connected.
 
+An idle client (one request, then 40 s of silence; one resolver on loopback),
+before and after #17:
+
+| | Before | After |
+|---|---|---|
+| Context switches | 436/s | 53/s |
+| CPU | 1.60% | 0.23% |
+| DNS queries while idle | 10/s | ~0.3/s |
+
+Loaded latency and throughput did not change. Bytes on the wire per useful
+byte fell from 4.54 to 3.78.
+
 ## Deployment and compatibility
 
 The packet format, encryption and authentication are unchanged. Existing
 servers work with this client, and this server works with existing clients.
 No configuration key was added or removed.
 
-The client behaves differently in three ways:
+The client behaves differently in four ways:
 
 - Auto-disable is more conservative.
 - Idle resolvers get an occasional poll.
 - When resolvers are slow, startup takes longer instead of failing.
+- An idle tunnel polls at its configured tiers instead of every 100 ms: 750 ms
+  for 20 s after traffic, 2 s up to 30 s, 3 s for up to 2 minutes while a
+  connection is open, then 15 s. A message the server holds for an idle
+  client waits for the next poll. Any traffic brings the 100 ms polling back
+  at once.
 
-The server change (#10) needs a server rebuild. Embedded nodes take it when
+The server changes (#10, #16) need a server rebuild. Embedded nodes take it when
 they are rebuilt against this source.
 
 ## فارسی
@@ -99,6 +133,9 @@ they are rebuilt against this source.
   وصل می‌شود.
 - تعداد کپی‌ها همان است که تنظیم شده.
 - ریزولوری که خوب شود دوباره به کار گرفته می‌شود.
+- تونلِ بی‌کار دیگر هر ۱۰۰ میلی‌ثانیه پرس‌وجو نمی‌فرستد. پرس‌وجوهای DNS در
+  حالت بی‌کاری از ۱۰ در ثانیه به حدود ۰٫۳ رسید و مصرف پردازنده از ۱٫۶ به
+  ۰٫۲۳ درصد. با هر ترافیکی، سرعت پاسخ فوراً به حالت قبل برمی‌گردد.
 
 قالب بسته، رمزنگاری و احراز هویت تغییر نکرده‌اند. سرور و کلاینت با نسخه‌های
 قبلی سازگارند.

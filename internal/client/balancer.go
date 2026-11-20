@@ -92,7 +92,10 @@ type Balancer struct {
 	lastExploreAt    atomic.Int64 // UnixNano of the last idle-resolver probe
 	pendingOverflow  atomic.Bool
 	pendingSize      atomic.Int32
-	pendingEvictRR   atomic.Uint32
+	// sweepWake: the first query to become pending while none were wakes the
+	// loss sweep, which backs off while nothing is pending.
+	sweepWake      chan struct{}
+	pendingEvictRR atomic.Uint32
 
 	mu           sync.RWMutex
 	log          *logger.Logger
@@ -145,6 +148,7 @@ func NewBalancer(strategy int, log *logger.Logger) *Balancer {
 		streamRoutes:            make(map[uint16]*balancerStreamRouteState),
 		streamFailoverThreshold: 1,
 		streamFailoverCooldown:  time.Second,
+		sweepWake:               make(chan struct{}, 1),
 	}
 	for i := range b.pendingShards {
 		b.pendingShards[i].pending = make(map[balancerResolverSampleKey]balancerResolverSample)
@@ -709,11 +713,18 @@ func (b *Balancer) TrackResolverSend(
 		serverKey: serverKey,
 		sentAt:    sentAt,
 	}
+	firstPending := false
 	if !exists {
-		b.pendingSize.Add(1)
+		firstPending = b.pendingSize.Add(1) == 1
 	}
 	b.schedulePendingSweepAt(dueAt)
 	shard.mu.Unlock()
+	if firstPending {
+		select {
+		case b.sweepWake <- struct{}{}:
+		default:
+		}
+	}
 
 	b.ReportSend(serverKey)
 	if stats != nil {

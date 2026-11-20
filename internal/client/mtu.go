@@ -507,6 +507,24 @@ func (c *Client) runResolverHealthLoop(ctx context.Context) {
 // counted as lost; a sweep with nothing due returns at once.
 const resolverLossSweepInterval = 250 * time.Millisecond
 
+// resolverLossSweepIdleMax is how far the sweep backs off while no query is
+// pending. The first query sent after that wakes it (Balancer.sweepWake), so
+// a loss is still counted within resolverLossSweepInterval of being due.
+const resolverLossSweepIdleMax = 2 * time.Second
+
+// nextLossSweepWait is the sweep's next wait: the full rate while anything is
+// pending, doubling up to resolverLossSweepIdleMax while nothing is.
+func nextLossSweepWait(current time.Duration, pending bool) time.Duration {
+	if pending || current < resolverLossSweepInterval {
+		return resolverLossSweepInterval
+	}
+	next := current * 2
+	if next > resolverLossSweepIdleMax {
+		next = resolverLossSweepIdleMax
+	}
+	return next
+}
+
 // runResolverLossSweep counts unanswered queries as lost as soon as each is
 // due (lossTimeout). The health loop collected them once per check interval -
 // 5 s with a handful of resolvers - so a resolver that had gone silent kept
@@ -515,15 +533,28 @@ func (c *Client) runResolverLossSweep(ctx context.Context) {
 	if c == nil || c.balancer == nil {
 		return
 	}
-	ticker := time.NewTicker(resolverLossSweepInterval)
-	defer ticker.Stop()
+	// ⚠️ It ticked every 250 ms for the whole session, a wake-up four times a
+	// second on a tunnel with nothing in flight.
+	wait := resolverLossSweepInterval
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			c.balancer.CollectExpiredResolverTimeouts(c.now(), c.tunnelPacketTimeout)
+		case <-timer.C:
+		case <-c.balancer.sweepWake:
 		}
+		c.balancer.CollectExpiredResolverTimeouts(c.now(), c.tunnelPacketTimeout)
+		pending := c.balancer.pendingSize.Load() > 0 || c.balancer.pendingOverflow.Load()
+		wait = nextLossSweepWait(wait, pending)
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(wait)
 	}
 }
 

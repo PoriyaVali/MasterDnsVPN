@@ -28,7 +28,8 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 	var cachedIDs []int32
 	var cachedStreams map[uint16]*Stream_client
 	idlePoll := c.cfg.DispatcherIdlePollInterval()
-	idleTimer := time.NewTimer(idlePoll)
+	idleWait := idlePoll
+	idleTimer := time.NewTimer(idleWait)
 	defer idleTimer.Stop()
 
 	waitForWork := func() bool {
@@ -36,8 +37,15 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 		case <-ctx.Done():
 			return false
 		case <-c.dispatchSignal:
+			idleWait = idlePoll
 		case <-c.plannerQueueSpaceSignal:
+			idleWait = idlePoll
 		case <-idleTimer.C:
+			// Nothing asked for this wake. Everything that queues work signals
+			// (a stream joining the set too), so the timer is only a safety
+			// net, and it backs off while nothing arrives: at 20 ms it woke
+			// the whole process 50 times a second on an idle tunnel.
+			idleWait = nextDispatcherIdleWait(idleWait, idlePoll)
 		}
 		if !idleTimer.Stop() {
 			select {
@@ -45,7 +53,7 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 			default:
 			}
 		}
-		idleTimer.Reset(idlePoll)
+		idleTimer.Reset(idleWait)
 		return true
 	}
 
@@ -213,6 +221,8 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 			continue
 		}
 
+		idleWait = idlePoll
+
 		var item *clientStreamTXPacket
 		var ok bool
 		if selected != nil {
@@ -244,6 +254,8 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 		var finalPacketType uint8
 		var finalPayload []byte
 		wasPacked := false
+		// Whether all this packet carries is data ACKs (see PingManager.noteSent).
+		ackOnly := item.PacketType == Enums.PACKET_STREAM_DATA_ACK
 		maxBlocks := c.maxPackedBlocks
 		if maxBlocks < 1 {
 			maxBlocks = 1
@@ -265,6 +277,7 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 						break
 					}
 					selected.NoteTXPacketDequeued(popped)
+					ackOnly = ackOnly && popped.PacketType == Enums.PACKET_STREAM_DATA_ACK
 					payload = VpnProto.AppendPackedControlBlock(payload, popped.PacketType, selected.StreamID, popped.SequenceNum, popped.FragmentID, popped.TotalFragments)
 					blocks++
 					selected.ReleaseTXPacket(popped)
@@ -279,6 +292,7 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 					if !poppedOK {
 						break
 					}
+					ackOnly = ackOnly && popped.PacketType == Enums.PACKET_STREAM_DATA_ACK
 					payload = VpnProto.AppendPackedControlBlock(payload, popped.PacketType, popped.StreamID, popped.SequenceNum, popped.FragmentID, popped.TotalFragments)
 					blocks++
 				}
@@ -303,6 +317,7 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 							if !poppedOK {
 								break
 							}
+							ackOnly = ackOnly && popped.PacketType == Enums.PACKET_STREAM_DATA_ACK
 							payload = VpnProto.AppendPackedControlBlock(payload, popped.PacketType, popped.StreamID, popped.SequenceNum, popped.FragmentID, popped.TotalFragments)
 							blocks++
 						}
@@ -323,6 +338,7 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 							break
 						}
 						otherStream.NoteTXPacketDequeued(popped)
+						ackOnly = ackOnly && popped.PacketType == Enums.PACKET_STREAM_DATA_ACK
 						payload = VpnProto.AppendPackedControlBlock(payload, popped.PacketType, uint16(otherID), popped.SequenceNum, popped.FragmentID, popped.TotalFragments)
 						blocks++
 						otherStream.ReleaseTXPacket(popped)
@@ -347,7 +363,7 @@ func (c *Client) asyncStreamDispatcher(ctx context.Context) {
 			finalPayload = item.Payload
 		}
 
-		c.NotifyPacket(finalPacketType, false)
+		c.notifySent(finalPacketType, ackOnly)
 
 		opts := VpnProto.BuildOptions{
 			SessionID:     c.sessionID,
@@ -405,4 +421,25 @@ func (c *Client) shouldTransmitQueuedStreamPacket(stream *Stream_client, item *c
 	}
 
 	return arqObj.HasPendingSequence(item.SequenceNum)
+}
+
+// dispatcherIdleWaitMax is the longest the dispatcher's safety timer backs off
+// to while no work arrives.
+const dispatcherIdleWaitMax = time.Second
+
+// nextDispatcherIdleWait doubles the safety timer's wait, from the configured
+// poll interval up to dispatcherIdleWaitMax. A configured poll at or above
+// the cap is kept as it is.
+func nextDispatcherIdleWait(current, base time.Duration) time.Duration {
+	if base >= dispatcherIdleWaitMax {
+		return base
+	}
+	next := current * 2
+	if next < base {
+		next = base
+	}
+	if next > dispatcherIdleWaitMax {
+		next = dispatcherIdleWaitMax
+	}
+	return next
 }

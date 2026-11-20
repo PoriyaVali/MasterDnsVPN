@@ -1,5 +1,74 @@
 # AI work log and handoff
 
+## Active handoff - 2026-11-20 - Claude - client: an idle tunnel goes quiet (no 100 ms polling, far fewer wakeups)
+
+Branch claude/nifty-galileo-23rwag on top of b0c5b82 (internal/arq/arq.go, internal/client/
+{ping_manager.go, client_utils.go, dispatcher.go, balancer.go, mtu.go}, four new test files). The
+owner's brief: the best performance and the least resource use on weak phones, without breaking
+anything or stopping work that has to run.
+
+Measured first: a connected client with nothing to do (one request made, then 40 s idle; the
+balanced profile, 24 workers, one resolver on loopback) woke ~435 times a second, used 1.6% of a
+core, and sent a query every 100 ms. Root causes, in order of size:
+
+1. The final-ACK watchdog (arq.go, upstream c51c8d6) repeats a half-closed stream's last ACK
+   every 2 s once the client has closed its read side and the server acknowledged it - and did so
+   for as long as the server kept its own side open, which servers do for minutes (keep-alive
+   connections the local app has closed). Each repeat is a non-ping packet, and PingManager
+   counted every non-ping send as traffic: the ping interval stayed at its aggressive 100 ms for
+   as long as any such stream existed. On a phone: ten DNS queries a second while idle, the radio
+   never resting. Fixed twice over:
+   - the repeats stop 12 s after the stream's last activity (finalAckRepeatFor; a lost ACK is
+     recovered within a few repeats, and the ARQ's normal retransmit/ACK path covers the rest);
+   - a packet that only carries data ACKs (alone or packed) no longer counts as traffic for the
+     ping pacing (dispatcher computes ackOnly; Client.notifySent / PingManager.noteSent). An ACK
+     answers inbound data, which already counted when it arrived.
+2. The dispatcher's safety timer fired every 20 ms with nothing to do (50 wakes a second). Every
+   producer signals the dispatcher when it queues work, so the timer is only a net; it now doubles
+   up to 1 s while nothing arrives and resets on any signal or found work.
+   - That exposed a race the 20 ms timer had been hiding: a stream starts its loops before it joins
+     the stream set, so its first packet can be queued and signalled while the dispatcher cannot see
+     it. bumpStreamSetVersion now signals the dispatcher.
+3. The loss sweep (PR #13) ticked every 250 ms for the whole session. It backs off to 2 s while no
+   query is pending; the first query to become pending wakes it, so a loss is still counted within
+   250 ms of being due.
+4. The ping loop's recheck while waiting for a far-off ping: 1 s -> 4 s (traffic still wakes it at
+   once; this only paces slow-downs).
+
+Measured (the idle client as its own process against a local node, 40 s settle, 30 s window):
+context switches 436/s -> 53/s, CPU 1.60% -> 0.23%, idle DNS queries 10/s -> ~0.3/s.
+
+Under load, same harnesses on b0c5b82 and this branch (MDNS_PERF=1 TestPerf/TestPerfBulk on a
+60 ms + 20 ms jitter, 2%-loss path; MDNS_TRAFFIC=1 TestTrafficEfficiency):
+- push after 40 s idle p50 2314 -> 2317 ms; connect p50 265 -> 249 ms; chat p50 247 -> 257 ms;
+  parallel 8 x 64 KiB 199 -> 192 KiB/s; bulk trials 428/425/470 -> 376/455/508 KiB/s. All within
+  run-to-run spread. (The single 512 KiB download stalled for 2 min on the b0c5b82 run and took
+  3 s on this branch; one run each, not counted as a gain.)
+- Bytes on the wire per useful byte 4.539 -> 3.776; DNS datagrams for 256 KiB 3518 -> 2892.
+
+Chat latency, checked separately because the first no-loss run looked slower (temporary harness,
+not committed): with the chat run first on a fresh client, p50 258 -> 254 ms, p90 356 -> 306 ms
+(n=30). Run after 40 short connections, b0c5b82 answered faster (p50 177 vs 257 ms) only because
+those closed connections' repeated final ACKs kept it polling every 100 ms - the waste fixed here.
+An idle tunnel now polls at its configured tiers again: 750 ms for 20 s after traffic, 2 s to
+30 s, then 3 s for up to 2 min while a stream is open (PING_STREAM_IDLE_*), then 15 s. A server
+push onto an idle tunnel waits up to that long, as designed; traffic of any kind (including
+inbound data) returns it to 100 ms at once.
+
+Tests (each fails with its change reverted):
+- internal/arq/final_ack_watchdog_test.go: repeated for a while, not forever (296 repeats over
+  ten minutes before the fix).
+- internal/client/ping_ack_test.go: an outgoing ACK does not keep an idle tunnel polling fast.
+- internal/client/dispatcher_idle_test.go: the safety timer's backoff, and a packet queued before
+  its stream joined still going out at once.
+- internal/client/loss_sweep_idle_test.go: the backoff, and a loss still counted on time after a
+  quiet spell.
+
+Validation: go test ./..., go vet ./..., and the CI race set (internal/client, internal/arq,
+internal/udpserver, internal/dnsparser, internal/domainmatcher) pass locally. Client-only: the
+packet format, configuration keys and the server are unchanged. Not tested on a phone or against
+real resolvers; the numbers are from loopback harnesses.
+
 ## Active handoff - 2026-11-19 - Claude - client: faster resolver switching that holds up when every resolver is slow
 
 Branch claude/nifty-galileo-23rwag on top of 312e119: bdaf6de, 4cbdff4, 222b66d, 420ae96, bf67605

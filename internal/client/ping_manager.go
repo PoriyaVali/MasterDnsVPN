@@ -43,7 +43,9 @@ const pingMinWait = 10 * time.Millisecond
 
 // pingMaxWait: tiers depend on how long the tunnel has been quiet, so the
 // loop looks again at least this often even when the next ping is far off.
-const pingMaxWait = time.Second
+// Traffic wakes it at once (wake), so this only paces the slow-downs; at a
+// second it woke an idle tunnel once a second between its 15 s pings.
+const pingMaxWait = 4 * time.Second
 
 func newPingManager(client *Client) *PingManager {
 	now := time.Now().UnixNano()
@@ -102,6 +104,29 @@ func (p *PingManager) NotifyPacket(packetType uint8, isInbound bool) {
 			p.wake(now)
 		}
 	}
+}
+
+// noteSent records a packet the dispatcher sent. ackOnly: it only acknowledges
+// data the server sent, and that data counted as traffic when it came in.
+//
+// ⚠️ A data ACK going out used to count as traffic of its own. A stream whose
+// server keeps its side open repeats its final ACK every couple of seconds,
+// and that alone held the pings at their fastest interval (100 ms) for as
+// long as the stream lasted: an idle tunnel kept the phone's radio busy.
+func (p *PingManager) noteSent(packetType uint8, ackOnly bool) {
+	if p == nil {
+		return
+	}
+	if packetType == Enums.PACKET_PING {
+		p.lastPingSentAt.Store(time.Now().UnixNano())
+		return
+	}
+	if ackOnly {
+		return
+	}
+	now := time.Now().UnixNano()
+	p.lastNonPingSentAt.Store(now)
+	p.wake(now)
 }
 
 func (p *PingManager) wake(now int64) {
