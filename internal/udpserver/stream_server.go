@@ -28,6 +28,9 @@ type Stream_server struct {
 	SessionID uint8
 	ARQ       *arq.ARQ
 	TXQueue   *mlq.MultiLevelQueue[*serverStreamTXPacket]
+	// txClosed: the stream was cleaned up and its queue emptied; nothing is
+	// queued after. Guarded by txQueueMu.
+	txClosed bool
 
 	Status       string
 	CreatedAt    time.Time
@@ -98,6 +101,15 @@ func (s *Stream_server) PushTXPacket(priority int, packetType uint8, sequenceNum
 	pkt.TTL = ttl
 
 	s.txQueueMu.Lock()
+
+	// ⚠️ The ARQ answers on its own goroutine - an ACK for data that came
+	// in just before - and could queue it after the stream was cleaned up,
+	// leaving a packet on a dead stream that nothing would ever send.
+	if s.txClosed {
+		s.txQueueMu.Unlock()
+		putTXPacketToPool(pkt)
+		return false
+	}
 
 	switch packetType {
 	case Enums.PACKET_STREAM_DATA:
@@ -283,7 +295,21 @@ func (s *Stream_server) cleanupResources() {
 	if upstream != nil {
 		_ = upstream.Close()
 	}
-	s.ClearTXQueue()
+	s.closeTXQueue()
+}
+
+// closeTXQueue empties the transmit queue and refuses whatever is queued
+// after: the stream is done.
+func (s *Stream_server) closeTXQueue() {
+	if s == nil || s.TXQueue == nil {
+		return
+	}
+	s.txQueueMu.Lock()
+	s.txClosed = true
+	s.TXQueue.Clear(func(pkt *serverStreamTXPacket) {
+		putTXPacketToPool(pkt)
+	})
+	s.txQueueMu.Unlock()
 }
 
 func (s *Stream_server) finalizeAfterARQClose(reason string) {
