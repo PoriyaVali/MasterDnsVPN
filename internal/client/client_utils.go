@@ -159,6 +159,17 @@ func (c *Client) bumpStreamSetVersion() {
 		return
 	}
 	c.streamSetVersion.Add(1)
+	// A stream starts its loops before it joins the set, so its first
+	// packets can be queued - and signalled - while the dispatcher still
+	// cannot see it; it looked, found nothing and went back to waiting. Wake
+	// it again now that the stream is there: its safety timer backs off to a
+	// second while the tunnel is idle.
+	if c.dispatchSignal != nil {
+		select {
+		case c.dispatchSignal <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (c *Client) SessionReady() bool {
@@ -211,6 +222,17 @@ func (c *Client) NotifyPacket(packetType uint8, isInbound bool) {
 	}
 	if c.pingManager != nil {
 		c.pingManager.NotifyPacket(packetType, isInbound)
+	}
+}
+
+// notifySent is NotifyPacket for a packet the dispatcher sent. ackOnly: it
+// only acknowledges data the server sent (see PingManager.noteSent).
+func (c *Client) notifySent(packetType uint8, ackOnly bool) {
+	if c.awaitingReplySince.Load() == 0 {
+		c.awaitingReplySince.CompareAndSwap(0, time.Now().UnixNano())
+	}
+	if c.pingManager != nil {
+		c.pingManager.noteSent(packetType, ackOnly)
 	}
 }
 

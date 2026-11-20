@@ -1074,8 +1074,17 @@ func (a *ARQ) noteDrainQueueFailure(now time.Time) {
 	a.mu.Unlock()
 }
 
+// finalAckRepeatFor bounds the final-ACK repeats to this long after the
+// stream's last activity: a lost ACK is recovered within a few repeats, and a
+// server that keeps its side open for minutes (a keep-alive connection the
+// local app has closed) is not waiting for one. Unbounded, it went out every
+// 2 s for as long as the server stayed open, and each one counted as
+// traffic, which kept the whole tunnel polling at its fastest rate.
+const finalAckRepeatFor = 12 * time.Second
+
 func (a *ARQ) runFinalAckWatchdog(now time.Time) {
 	a.mu.Lock()
+	silentFor := now.Sub(a.lastActivity)
 	shouldAck := !a.closed &&
 		!a.rstSent &&
 		!a.rstReceived &&
@@ -1091,7 +1100,8 @@ func (a *ARQ) runFinalAckWatchdog(now time.Time) {
 		a.pendingInbound == 0 &&
 		!a.localWritePending &&
 		a.rcvNxt > 0 &&
-		now.Sub(a.lastActivity) >= 2*time.Second &&
+		silentFor >= 2*time.Second &&
+		silentFor < finalAckRepeatFor &&
 		(a.lastDuplicateAckAt.IsZero() || now.Sub(a.lastDuplicateAckAt) >= 2*time.Second)
 	if !shouldAck {
 		a.mu.Unlock()
