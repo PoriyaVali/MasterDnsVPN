@@ -866,3 +866,26 @@ func TestClosedSessionRecordRejectsPostCloseStreamAccess(t *testing.T) {
 		t.Fatal("expected ensureStream0 to no-op after close")
 	}
 }
+
+// The ARQ answers on its own goroutine and could queue an ACK after the
+// stream was cleaned up - the cause of the flake in the test above (about
+// one run in seventeen under -race): nothing is queued on a closed stream.
+func TestNothingIsQueuedOnAStreamAfterItsCleanup(t *testing.T) {
+	record := newTestSessionRecord(9)
+	cfg := arq.Config{WindowSize: 32, RTO: 1.0, MaxRTO: 5.0}
+	stream := record.getOrCreateStream(2, cfg, nil, nil)
+	if !stream.PushTXPacket(Enums.DefaultPacketPriority(Enums.PACKET_STREAM_DATA_ACK), Enums.PACKET_STREAM_DATA_ACK, 1, 0, 0, 0, 0, nil) {
+		t.Fatal("expected a packet to queue on a live stream")
+	}
+
+	stream.finalizeAfterARQClose("test")
+	if got := stream.TXQueue.Size(); got != 0 {
+		t.Fatalf("cleanup left %d packets queued", got)
+	}
+	if stream.PushTXPacket(Enums.DefaultPacketPriority(Enums.PACKET_STREAM_DATA_ACK), Enums.PACKET_STREAM_DATA_ACK, 2, 0, 0, 0, 0, nil) {
+		t.Fatal("a packet was queued on a stream after its cleanup")
+	}
+	if got := stream.TXQueue.Size(); got != 0 {
+		t.Fatalf("%d packets queued on a cleaned-up stream", got)
+	}
+}
